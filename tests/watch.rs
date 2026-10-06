@@ -41,6 +41,418 @@ fn leader_reconciles_edit_without_explicit_request() {
     pinned.finish(()).unwrap();
 }
 
+#[test]
+fn delayed_snapshot_does_not_publish_after_pre_cutoff_edit() {
+    use notify::{Event, EventKind, event::ModifyKind};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function original() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // Drain the initial full wake and establish a known selected baseline.
+    work.reconcile_due(&store, &owner, &options, &cancel, true)
+        .unwrap();
+    let prior = store.status().unwrap().revision;
+    fs::write(&source, "function first() {}\n").unwrap();
+    let admitted = std::cell::Cell::new(false);
+    let published = work
+        .reconcile_due_observed(&store, &owner, &options, &cancel, true, |capture, watch| {
+            assert!(capture.files.iter().any(|file| file.path == "a.js"));
+            admitted.set(true);
+            fs::write(&source, "function second() {}\n").unwrap();
+            watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(source.clone())));
+        })
+        .unwrap();
+    assert!(admitted.get());
+    assert!(
+        !published,
+        "a pre-cutoff hint must reject the delayed snapshot"
+    );
+    assert_eq!(store.status().unwrap().revision, prior);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.status().unwrap().revision == prior && Instant::now() < deadline {
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let final_pin = store.status().unwrap().revision;
+    assert!(final_pin.index_revision > prior.index_revision);
+    let (_, final_source) = store.source_at("a.js", Some(final_pin)).unwrap().unwrap();
+    assert_eq!(final_source.text, "function second() {}\n");
+}
+
+#[test]
+fn post_cutoff_hint_stays_pending_after_first_publication() {
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function first() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let before = store.status().unwrap().revision;
+    fs::write(&source, "function middle() {}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    let accounted = work
+        .reconcile_due_with_cutoffs(
+            &store,
+            &owner,
+            &options,
+            &cancel,
+            true,
+            (
+                |_, _| {},
+                |watch: &baleyg::watch::WatchSignals| {
+                    fs::write(&source, "function last() {}\n").unwrap();
+                    watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                        DataChange::Content,
+                    )))
+                    .add_path(source.clone())));
+                },
+            ),
+        )
+        .unwrap();
+    assert!(
+        !accounted,
+        "post-cutoff hint cannot be acknowledged with first capture"
+    );
+    let middle = store.status().unwrap().revision;
+    assert!(middle.index_revision > before.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(middle))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function middle() {}\n"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.status().unwrap().revision == middle && Instant::now() < deadline {
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let latest = store.status().unwrap().revision;
+    assert!(latest.index_revision > middle.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(latest))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function last() {}\n"
+    );
+}
+
+#[test]
+fn failed_capture_keeps_dirty_generation_for_successful_retry() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function before() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let prior = store.status().unwrap().revision;
+    // Change before watcher registration so the initial full wake is the only
+    // pending signal, with no dependency on notify delivery or event timing.
+    fs::write(&source, "function after() {}\n").unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    let failed =
+        work.reconcile_due_observed(&store, &owner, &options, &cancel, false, |captured, _| {
+            assert_eq!(captured.files[0].path, "a.js");
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        });
+    assert!(failed.unwrap_err().to_string().contains("cancelled"));
+    assert_eq!(
+        store.status().unwrap().revision,
+        prior,
+        "failed capture must not select or acknowledge an unverified snapshot"
+    );
+    cancel.store(false, std::sync::atomic::Ordering::Release);
+    // The scheduler's failure backoff is finite. No extra event or forced
+    // inventory is submitted: only the retained dirty generation can retry.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        work.reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap(),
+        "failed work must leave its dirty full wake pending"
+    );
+    let selected = store.status().unwrap().revision;
+    assert!(selected.index_revision > prior.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(selected))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function after() {}\n"
+    );
+}
+
+#[test]
+fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
+    use notify::{
+        Event, EventKind,
+        event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let source = root.join("a.js");
+    let second = root.join("b.js");
+    let renamed = root.join("c.js");
+    let temporary = root.join("a.js.tmp");
+    fs::write(
+        &source,
+        "function start() { return helper(); }\nfunction helper() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Types.java"),
+        "class Stable { Other ref; }\nclass Other {}\n",
+    )
+    .unwrap();
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // Each action happens while the prior immutable snapshot is delayed. The
+    // injected notify event takes the same bounded ingress as the real watcher.
+    for step in 0..5 {
+        let prior = store.status().unwrap().revision;
+        let admitted = work
+            .reconcile_due_observed(&store, &owner, &options, &cancel, true, |_, watch| {
+                let event = match step {
+                    0 => {
+                        fs::write(
+                            &source,
+                            "function edited() { return helper(); }\nfunction helper() {}\n",
+                        )
+                        .unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Data(
+                            notify::event::DataChange::Content,
+                        )))
+                        .add_path(source.clone())
+                    }
+                    1 => {
+                        fs::write(&second, "function added() {}\n").unwrap();
+                        Event::new(EventKind::Create(CreateKind::File)).add_path(second.clone())
+                    }
+                    2 => {
+                        fs::rename(&second, &renamed).unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                            .add_path(second.clone())
+                            .add_path(renamed.clone())
+                    }
+                    3 => {
+                        fs::write(
+                            &temporary,
+                            "function atomic() { return helper(); }\nfunction helper() {}\n",
+                        )
+                        .unwrap();
+                        fs::rename(&temporary, &source).unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                            .add_path(temporary.clone())
+                            .add_path(source.clone())
+                    }
+                    _ => {
+                        fs::remove_file(&renamed).unwrap();
+                        Event::new(EventKind::Remove(RemoveKind::File)).add_path(renamed.clone())
+                    }
+                };
+                watch.submit_event(Ok(event));
+            })
+            .unwrap();
+        assert!(
+            !admitted,
+            "step {step}: delayed capture cannot account for a new hint"
+        );
+        assert_eq!(store.status().unwrap().revision, prior);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.status().unwrap().revision == prior && Instant::now() < deadline {
+            work.reconcile_due(&store, &owner, &options, &cancel, true)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            store.status().unwrap().revision.index_revision > prior.index_revision,
+            "step {step}: changed workspace must publish"
+        );
+        let cold_state = tempfile::tempdir().unwrap();
+        let cold = Store::open_for_tests(cold_state.path(), root).unwrap();
+        let cold_job = index_coordinator::IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        cold_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(
+            store.graph().unwrap(),
+            cold.graph().unwrap(),
+            "step {step}: selected graph differs from independent cold full"
+        );
+        let selected = store.evidence_response().unwrap();
+        let cold_read = cold.evidence_response().unwrap();
+        for path in ["a.js", "b.js", "c.js"] {
+            let selected_source = selected
+                .source_at(path, None)
+                .unwrap()
+                .map(|(_, source)| source.text);
+            let cold_source = cold_read
+                .source_at(path, None)
+                .unwrap()
+                .map(|(_, source)| source.text);
+            assert_eq!(
+                selected_source, cold_source,
+                "step {step}: {path} source differs"
+            );
+        }
+        // Compare selected typed native and class projections, not only the
+        // graph and source text. IDs of a revision are store-specific; compare
+        // semantic facts and pin each read to its own selected revision.
+        let selected_pin = store.status().unwrap().revision;
+        let cold_pin = cold.status().unwrap().revision;
+        let mut cases = vec![
+            ("Types.java", "java", "Stable"),
+            (
+                "a.js",
+                "javascript",
+                if step < 3 { "edited" } else { "atomic" },
+            ),
+        ];
+        if (1..4).contains(&step) {
+            cases.push((
+                if step == 1 { "b.js" } else { "c.js" },
+                "javascript",
+                "added",
+            ));
+        }
+        for (path, language, lookup) in cases {
+            let selected_declarations = store
+                .native_declarations_at(selected_pin, language, lookup)
+                .unwrap();
+            let cold_declarations = cold
+                .native_declarations_at(cold_pin, language, lookup)
+                .unwrap();
+            assert!(
+                !selected_declarations.is_empty(),
+                "step {step}: {path} declaration missing"
+            );
+            let summarized =
+                |store: &Store, pin, declarations: Vec<baleyg::native_evidence::Declaration>| {
+                    declarations
+                        .into_iter()
+                        .map(|d| {
+                            assert_eq!(d.document.path, path);
+                            let coverage =
+                                store.native_coverage_at(pin, &d.document).unwrap().unwrap();
+                            let calls = store.native_calls_at(pin, &d.syntax_id).unwrap();
+                            serde_json::json!({
+                                "kind": d.kind, "name": d.name, "lookup": d.lookup_key,
+                                "range": d.range, "nameRange": d.name_range, "header": d.header,
+                                "coverage": {
+                                    "state": coverage.state, "requested": coverage.requested,
+                                    "selected": coverage.selected,
+                                    "supported": coverage.supported_roles,
+                                    "observed": coverage.observed_roles,
+                                    "diagnostic": coverage.diagnostic,
+                                },
+                                "calls": calls.into_iter().map(|call| serde_json::json!({
+                                    "ordinal": call.ordinal, "range": call.range,
+                                    "calleeRange": call.callee_range, "spelling": call.spelling,
+                                })).collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+            let measured = summarized(&store, selected_pin, selected_declarations);
+            let expected = summarized(&cold, cold_pin, cold_declarations);
+            assert_eq!(
+                measured, expected,
+                "step {step}: {path} native projections differ"
+            );
+            if path == "a.js" {
+                assert!(
+                    measured.iter().any(|fact| fact["calls"]
+                        .as_array()
+                        .is_some_and(|calls| !calls.is_empty())),
+                    "step {step}: native call comparison must exercise a real call"
+                );
+            }
+        }
+        if step == 4 {
+            let selected_deleted = store
+                .native_declarations_at(selected_pin, "javascript", "added")
+                .unwrap();
+            let cold_deleted = cold
+                .native_declarations_at(cold_pin, "javascript", "added")
+                .unwrap();
+            assert_eq!(
+                selected_deleted, cold_deleted,
+                "deleted c.js native declaration must match independent cold full"
+            );
+            assert!(
+                selected_deleted.is_empty(),
+                "deleted c.js must not leave a stale pinned native declaration"
+            );
+        }
+        let seed = store
+            .graph()
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|symbol| symbol.name == "Stable" && symbol.path == "Types.java")
+            .unwrap()
+            .id;
+        let diagram = |store: &Store, pin| {
+            let mut diagram = serde_json::to_value(
+                store
+                    .class_diagram_at(&baleyg::class_diagram::ClassDiagramRequest {
+                        seed: seed.clone(),
+                        expected_revision: pin,
+                        expanded: vec![],
+                        include_unmatched: false,
+                        include_hierarchy: true,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+            diagram.as_object_mut().unwrap().remove("revision");
+            diagram
+        };
+        let selected_diagram = diagram(&store, selected_pin);
+        assert!(!selected_diagram["nodes"].as_array().unwrap().is_empty());
+        assert_eq!(
+            selected_diagram,
+            diagram(&cold, cold_pin),
+            "step {step}: class projection differs from independent cold full"
+        );
+        selected.finish(()).unwrap();
+        cold_read.finish(()).unwrap();
+    }
+}
+
 fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::process::Command {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_baleyg"));
     child

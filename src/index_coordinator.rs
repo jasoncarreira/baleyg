@@ -9,6 +9,12 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
+struct PublicationAdmission<C> {
+    capture: Option<Capture>,
+    unchanged_fast: bool,
+    cutoff: C,
+}
+
 pub struct IndexJobCoordinator {
     store: Store,
     expected: RecoveryBaseline,
@@ -112,7 +118,18 @@ impl IndexJobCoordinator {
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
     ) -> Result<IndexPin> {
-        self.run_with_capture(options, cancel, progress, observe, false, |_, _| {})
+        self.run_with_capture(
+            options,
+            cancel,
+            progress,
+            observe,
+            |_, _| {},
+            PublicationAdmission {
+                capture: None,
+                unchanged_fast: false,
+                cutoff: || Ok(()),
+            },
+        )
     }
 
     /// A fresh, guarded unchanged capture may reuse selected native versions
@@ -123,7 +140,41 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
     ) -> Result<IndexPin> {
-        self.run_with_capture(options, cancel, progress, |_| {}, true, |_, _| {})
+        self.run_with_capture(
+            options,
+            cancel,
+            progress,
+            |_| {},
+            |_, _| {},
+            PublicationAdmission {
+                capture: None,
+                unchanged_fast: true,
+                cutoff: || Ok(()),
+            },
+        )
+    }
+
+    /// Publish exactly the leader's admitted immutable snapshot. A watch cutoff
+    /// rejects signals observed before publication; later signals stay pending.
+    fn run_captured_serving(
+        self,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        capture: Capture,
+        cutoff: impl FnMut() -> Result<()>,
+    ) -> Result<IndexPin> {
+        self.run_with_capture(
+            options,
+            cancel,
+            |_| {},
+            |_| {},
+            |_, _| {},
+            PublicationAdmission {
+                capture: Some(capture),
+                unchanged_fast: false,
+                cutoff,
+            },
+        )
     }
 
     fn run_with_capture(
@@ -132,12 +183,17 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
-        unchanged_fast: bool,
         native_observe: impl Fn(
             &crate::native_evidence::DocumentKey,
             crate::native_evidence::FullNativeStage,
         ),
+        admission: PublicationAdmission<impl FnMut() -> Result<()>>,
     ) -> Result<IndexPin> {
+        let PublicationAdmission {
+            capture: admitted,
+            unchanged_fast,
+            mut cutoff,
+        } = admission;
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         let mut phase_start = std::time::Instant::now();
         let report = |name: &str, elapsed: std::time::Duration| {
@@ -148,9 +204,15 @@ impl IndexJobCoordinator {
             });
         };
         self.store.begin_leader_publication(&self.session)?;
-        let capture = Capture::admit(options, cancel, &progress)?;
+        let capture = match admitted {
+            Some(capture) => capture,
+            None => Capture::admit(options, cancel, &progress)?,
+        };
         report("capture", phase_start.elapsed());
         phase_start = std::time::Instant::now();
+        if unchanged_fast {
+            cutoff()?;
+        }
         if unchanged_fast
             && let Some(pin) = self.store.publish_unchanged_native_recovery(
                 &capture,
@@ -203,6 +265,7 @@ impl IndexJobCoordinator {
                 self.store.verify_leader_session(&self.session)?;
                 report("attest", phase_start.elapsed());
                 phase_start = std::time::Instant::now();
+                cutoff()?;
                 let pin = self.store.publish_local_native_recovery(
                     &graph,
                     &capture,
@@ -244,6 +307,7 @@ impl IndexJobCoordinator {
         self.store.verify_leader_session(&self.session)?;
         report("attest", phase_start.elapsed());
         phase_start = std::time::Instant::now();
+        cutoff()?;
         let published = self.store.publish_native_recovery(
             &graph,
             &capture,
@@ -259,6 +323,15 @@ impl IndexJobCoordinator {
         Ok(published)
     }
 }
+
+#[derive(Debug)]
+struct CutoffChanged;
+impl std::fmt::Display for CutoffChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("watch hints changed before publication cutoff")
+    }
+}
+impl std::error::Error for CutoffChanged {}
 
 /// The elected owner alone drives the advisory watcher and the durable FIFO.
 /// This is an in-memory scheduler, not a second request queue.
@@ -302,6 +375,38 @@ impl LeaderWork {
         cancel: &CancelFlag,
         force: bool,
     ) -> Result<bool> {
+        self.reconcile_due_observed(store, session, options, cancel, force, |_, _| {})
+    }
+
+    /// The observer runs after immutable admission; it cannot change the admitted bytes.
+    /// The same cutoff applies to production and deterministic race tests.
+    pub fn reconcile_due_observed(
+        &mut self,
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        force: bool,
+        observe: impl FnOnce(&Capture, &crate::watch::WatchSignals),
+    ) -> Result<bool> {
+        self.reconcile_due_with_cutoffs(store, session, options, cancel, force, (observe, |_| {}))
+    }
+
+    /// Test seam for a hint delivered after the publication cutoff but before
+    /// acknowledgment. Such a hint must stay pending for the next inventory.
+    pub fn reconcile_due_with_cutoffs(
+        &mut self,
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        force: bool,
+        cutoffs: (
+            impl FnOnce(&Capture, &crate::watch::WatchSignals),
+            impl FnOnce(&crate::watch::WatchSignals),
+        ),
+    ) -> Result<bool> {
+        let (observe, after_cutoff) = cutoffs;
         store.verify_leader_session(session)?;
         // The takeover FIFO head may have different selected inputs from this
         // daemon's defaults. Keep its watcher until a new watcher has registered
@@ -334,24 +439,39 @@ impl LeaderWork {
         }
         // The first post-registration full inventory closes the takeover/watch gap.
         // An identical selected capture needs no gratuitous new revision.
-        let outcome =
-            (|| {
-                let captured = Capture::admit(options, cancel, &|_| {})?;
-                let baseline = store.recovery_index_baseline()?;
-                if store.selected_capture_unchanged(
-                    &captured,
-                    session.leader_guard()?,
-                    &baseline,
-                    cancel,
-                )? {
-                    return Ok(());
+        let outcome: Result<()> = (|| {
+            let captured = Capture::admit(options, cancel, &|_| {})?;
+            observe(&captured, &self.watch);
+            // Reject a hinted edit before checking the admitted bytes against
+            // the selected head, and check again at the publication cutoff.
+            let mut cutoff = || {
+                let current = self.watch.drain();
+                if current.generation != batch.generation {
+                    return Err(CutoffChanged.into());
                 }
-                IndexJobCoordinator::prepare_with_session(store, None, session.clone())?
-                    .run_serving(options, cancel, |_| {})?;
+                store.verify_leader_session(session)?;
+                store.verify_root()?;
                 Ok(())
-            })();
+            };
+            cutoff()?;
+            let baseline = store.recovery_index_baseline()?;
+            let unchanged = store.selected_capture_unchanged(
+                &captured,
+                session.leader_guard()?,
+                &baseline,
+                cancel,
+            )?;
+            if unchanged {
+                cutoff()?;
+            } else {
+                IndexJobCoordinator::prepare_with_session(store, None, session.clone())?
+                    .run_captured_serving(options, cancel, captured, cutoff)?;
+            }
+            Ok(())
+        })();
         match outcome {
             Ok(_) => {
+                after_cutoff(&self.watch);
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
                     self.last_accounted_generation = Some(batch.generation);
@@ -363,6 +483,11 @@ impl LeaderWork {
                 self.last_inventory = std::time::Instant::now();
                 self.retry_after = None;
                 Ok(accounted)
+            }
+            Err(error) if error.is::<CutoffChanged>() => {
+                self.watch.require_full();
+                self.retry_after = None;
+                Ok(false)
             }
             Err(error) => {
                 self.watch.require_full();
@@ -510,8 +635,12 @@ fn drain_requests_observed_with_cancel(
                 cancel,
                 |p| progress(&request.id, p),
                 |_| {},
-                true,
                 |key, stage| native_observe(&request.id, key, stage),
+                PublicationAdmission {
+                    capture: None,
+                    unchanged_fast: true,
+                    cutoff: || Ok(()),
+                },
             )
         })();
         #[cfg(test)]
