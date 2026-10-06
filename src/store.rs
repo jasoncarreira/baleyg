@@ -732,57 +732,75 @@ fn replace_index_and_release_obsolete(
 pub(crate) fn gc_unlink_sqlite(
     paths: &[(std::path::PathBuf, (u64, u64))],
     exclusive: &topology::UseGuard,
-) -> Result<()> {
+    current: &topology::WorkspaceIdentity,
+    leader: &topology::LeaderGuard,
+    after_first_unlink: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
-    for (path, inode) in paths {
-        ensure!(
-            matches!(
-                path.file_name().and_then(|n| n.to_str()),
-                Some("index.db" | "requests.db")
-            ),
-            "unsafe_index: GC SQLite path"
-        );
-        exclusive.verify_exclusive_path(
-            &path
-                .parent()
-                .context("GC index parent missing")?
-                .with_extension("lock"),
-        )?;
-        let named = std::fs::symlink_metadata(path)?;
-        ensure!(
-            named.is_file()
-                && !named.file_type().is_symlink()
-                && (named.dev(), named.ino()) == *inode
-                && named.nlink() == 1
-                && named.mode() & 0o777 == 0o600,
-            "unsafe_index: GC SQLite inode changed"
-        );
-        ensure!(
-            registry.live.keys().all(|(name, _, _)| name != path),
-            "storage_busy: GC SQLite connection still live"
-        );
-        let files = registry
-            .by_path
-            .get(path)
-            .context("unsafe_index: GC witness missing")?;
-        ensure!(
-            files.len() == 1
-                && files[0]
-                    .metadata()
-                    .is_ok_and(|m| (m.dev(), m.ino()) == *inode)
-                && Arc::strong_count(&files[0]) == 1,
-            "storage_busy: GC SQLite witness borrowed or changed"
-        );
+    let preflight = (|| -> Result<()> {
+        for (path, inode) in paths {
+            ensure!(
+                matches!(
+                    path.file_name().and_then(|n| n.to_str()),
+                    Some("index.db" | "requests.db")
+                ),
+                "unsafe_index: GC SQLite path"
+            );
+            exclusive.verify_exclusive_path(
+                &path
+                    .parent()
+                    .context("GC index parent missing")?
+                    .with_extension("lock"),
+            )?;
+            let named = std::fs::symlink_metadata(path)?;
+            ensure!(
+                named.is_file()
+                    && !named.file_type().is_symlink()
+                    && (named.dev(), named.ino()) == *inode
+                    && named.nlink() == 1
+                    && named.mode() & 0o777 == 0o600,
+                "unsafe_index: GC SQLite inode changed"
+            );
+            ensure!(
+                registry.live.keys().all(|(name, _, _)| name != path),
+                "storage_busy: GC SQLite connection still live"
+            );
+            let files = registry
+                .by_path
+                .get(path)
+                .context("unsafe_index: GC witness missing")?;
+            ensure!(
+                files.len() == 1
+                    && files[0]
+                        .metadata()
+                        .is_ok_and(|m| (m.dev(), m.ino()) == *inode)
+                    && Arc::strong_count(&files[0]) == 1,
+                "storage_busy: GC SQLite witness borrowed or changed"
+            );
+        }
+        Ok(())
+    })();
+    if preflight.is_err() {
+        // Busy, borrowed, replaced and unknown inodes are skips BEFORE any
+        // unlink. The process-wide opener mutex still owns every witness.
+        return Ok(false);
     }
-    for (path, _) in paths {
+    for (number, (path, _)) in paths.iter().enumerate() {
+        // Keep proof current for every unlink, not only the first. Losing
+        // authority after a partial deletion must fail rather than continue.
+        current.verify()?;
+        leader.verify()?;
         exclusive.verify()?;
         std::fs::remove_file(path)?;
         let files = registry.by_path.remove(path).expect("preflight GC witness");
         registry.count -= files.len();
         drop(files);
+        if number == 0 {
+            after_first_unlink()?;
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Called only after GC has unlinked an exact managed SQLite inode while it

@@ -3193,3 +3193,156 @@ fn automatic_gc_refuses_malformed_or_future_attempt_stamp() {
     assert_eq!(fs::read(&stamp).unwrap(), b"broken\n");
     assert!(roots.index_dir(&identity).exists());
 }
+
+#[test]
+fn attempt2_gc_rechecks_current_root_at_final_unlink() {
+    use baleyg::store::topology::GcStage;
+    let (temp, roots) = common::fixture();
+    let current = root(temp.path());
+    let store = common::open_store(temp.path(), &current).unwrap();
+    let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
+    let leader = roots.leader(&current_id).unwrap();
+    let old = temp.path().join("old");
+    fs::create_dir(&old).unwrap();
+    let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
+    drop(common::open_store(temp.path(), &old).unwrap());
+    drop(roots.leader(&old_id).unwrap());
+    let now = 1_800_000_000_i64;
+    let index = roots.index_db(&old_id);
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let before = fs::read(&index).unwrap();
+    let candidate_before = gc_manifest(&roots.index_dir(&old_id));
+    let mut calls = 0;
+    let result = roots.automatic_gc_at_with_hook(&current_id, &leader, now, &mut |stage| {
+        if stage == GcStage::BeforeCandidateUnlink {
+            calls += 1;
+            fs::rename(&current, temp.path().join("moved-current"))?;
+        }
+        Ok(())
+    });
+    assert_eq!(calls, 1, "the barrier must reach the final unlink boundary");
+    assert!(result.is_err(), "lost current root must abort deletion");
+    assert_eq!(fs::read(&index).unwrap(), before);
+    assert_eq!(
+        gc_manifest(&roots.index_dir(&old_id)),
+        candidate_before,
+        "all candidate pathnames and bytes must remain untouched"
+    );
+    assert!(roots.index_use_lock(&old_id).exists());
+    drop(store);
+}
+
+#[test]
+fn attempt2_gc_rechecks_current_leader_at_final_unlink() {
+    use baleyg::store::topology::GcStage;
+    let (temp, roots) = common::fixture();
+    let current = root(temp.path());
+    drop(common::open_store(temp.path(), &current).unwrap());
+    let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
+    let leader = roots.leader(&current_id).unwrap();
+    let old = temp.path().join("old");
+    fs::create_dir(&old).unwrap();
+    let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
+    drop(common::open_store(temp.path(), &old).unwrap());
+    drop(roots.leader(&old_id).unwrap());
+    let now = 1_800_000_000_i64;
+    let index = roots.index_db(&old_id);
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let before = fs::read(&index).unwrap();
+    let candidate_before = gc_manifest(&roots.index_dir(&old_id));
+    let mut calls = 0;
+    let result = roots.automatic_gc_at_with_hook(&current_id, &leader, now, &mut |stage| {
+        if stage == GcStage::BeforeCandidateUnlink {
+            calls += 1;
+            fs::rename(
+                roots.leader_lock(&current_id),
+                temp.path().join("retired-leader"),
+            )?;
+        }
+        Ok(())
+    });
+    assert_eq!(calls, 1);
+    assert!(result.is_err(), "replaced leader path must abort deletion");
+    assert_eq!(fs::read(&index).unwrap(), before);
+    assert_eq!(
+        gc_manifest(&roots.index_dir(&old_id)),
+        candidate_before,
+        "all candidate pathnames and bytes must remain untouched"
+    );
+    assert!(roots.index_use_lock(&old_id).exists());
+}
+
+#[test]
+fn attempt2_gc_existing_empty_stamp_must_not_scan() {
+    let (temp, roots) = common::fixture();
+    let current = root(temp.path());
+    drop(common::open_store(temp.path(), &current).unwrap());
+    let current_id = WorkspaceIdentity::discover(Some(&current), &current).unwrap();
+    let leader = roots.leader(&current_id).unwrap();
+    let old = temp.path().join("old");
+    fs::create_dir(&old).unwrap();
+    let old_id = WorkspaceIdentity::discover(Some(&old), &old).unwrap();
+    drop(common::open_store(temp.path(), &old).unwrap());
+    drop(roots.leader(&old_id).unwrap());
+    let now = 1_800_000_000_i64;
+    let index = roots.index_db(&old_id);
+    rusqlite::Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let stamp = roots.cache.join("gc-last-run");
+    fs::write(&stamp, b"").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stamp, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&index).unwrap();
+    assert!(roots.automatic_gc_at(&current_id, &leader, now).is_err());
+    assert_eq!(fs::read(&index).unwrap(), before);
+}
+
+#[test]
+fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
+    use baleyg::store::topology::GcStage;
+    let (temp, roots) = common::fixture();
+    let work = root(temp.path());
+    drop(common::open_store(temp.path(), &work).unwrap());
+    let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
+    let leader = roots.leader(&id).unwrap();
+    let now = 1_800_000_000_i64;
+    assert_eq!(roots.automatic_gc_at(&id, &leader, now).unwrap(), 0);
+    let stamp = roots.cache.join("gc-last-run");
+    let before = fs::read(&stamp).unwrap();
+    let mut called = false;
+    let error = roots.automatic_gc_at_with_hook(&id, &leader, now + 86_400, &mut |stage| {
+        if stage == GcStage::BeforeStampRename {
+            called = true;
+            anyhow::bail!("injected crash before atomic stamp rename");
+        }
+        Ok(())
+    });
+    assert!(called);
+    assert!(error.is_err());
+    assert_eq!(
+        fs::read(&stamp).unwrap(),
+        before,
+        "crash must retain old daily fence"
+    );
+    assert_eq!(
+        roots.automatic_gc_at(&id, &leader, now + 86_399).unwrap(),
+        0
+    );
+}

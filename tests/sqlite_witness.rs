@@ -297,3 +297,101 @@ fn gc_releases_only_deleted_candidate_witnesses() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
+    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    let state = tempfile::tempdir().unwrap();
+    let current_root = tempfile::tempdir().unwrap();
+    let candidate_root = tempfile::tempdir().unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let current =
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
+    let candidate =
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
+    let store = Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(candidate_root.path().to_owned()), None)
+        .unwrap();
+    drop(store);
+    drop(roots.leader(&candidate).unwrap());
+    let leader = roots.leader(&current).unwrap();
+    let now = 1_800_000_000_i64;
+    let index = roots.index_db(&candidate);
+    Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let requests = roots.requests_db(&candidate);
+    let queue_before = std::fs::read(&requests).unwrap();
+    let mut hit = 0;
+    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+        if stage == GcStage::AfterFirstDbUnlink {
+            hit += 1;
+            assert!(!index.exists(), "first derived unlink must have happened");
+            anyhow::bail!("injected failure after first derived unlink");
+        }
+        Ok(())
+    });
+    assert_eq!(hit, 1);
+    assert!(
+        result.is_err(),
+        "partial deletion must not count as GC success"
+    );
+    assert!(!index.exists());
+    assert_eq!(std::fs::read(&requests).unwrap(), queue_before);
+    assert!(roots.index_dir(&candidate).join("leader.lock").exists());
+    assert!(roots.index_use_lock(&candidate).exists());
+    assert!(roots.index_dir(&current).exists());
+}
+
+#[test]
+fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
+    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    let state = tempfile::tempdir().unwrap();
+    let current_root = tempfile::tempdir().unwrap();
+    let candidate_root = tempfile::tempdir().unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let current =
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
+    let candidate =
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
+    drop(Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
+    drop(roots.leader(&candidate).unwrap());
+    let leader = roots.leader(&current).unwrap();
+    let now = 1_800_000_000_i64;
+    Connection::open(roots.index_db(&candidate))
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let mut hit = 0;
+    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+        if stage == GcStage::AfterParentSync {
+            hit += 1;
+            assert!(!roots.index_dir(&candidate).exists());
+            assert!(roots.index_use_lock(&candidate).exists());
+            anyhow::bail!("injected failure after parent sync");
+        }
+        Ok(())
+    });
+    assert_eq!(hit, 1);
+    assert!(
+        result.is_err(),
+        "post-sync failure must not claim successful GC"
+    );
+    assert!(!roots.index_dir(&candidate).exists());
+    assert!(
+        roots.index_use_lock(&candidate).exists(),
+        "beside-directory use lock is always last"
+    );
+}
