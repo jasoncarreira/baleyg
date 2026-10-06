@@ -15,7 +15,7 @@ Agent clients start a stdio MCP server per session, and subagents share their pa
 - A single Baleyg daemon per user serves every checkout and worktree, enforced by a single-instance lock under Baleyg's private per-user directory.
 - **Start:** on demand when a client attaches and none is running.
 - **Crash recovery:** clients reconnect, or restart it.
-- **Per checkout, as before:** the daemon holds each active checkout's leader lock and runs that checkout's watcher and reconciliation (#16), request queue (#67), retention and GC (Decision 0006). Indexes, pins and revisions stay **per checkout** and are never merged across branches or worktrees. Reuse of extraction work across worktrees comes from #71's path-neutral fact cache.
+- **Per checkout, as before:** the daemon competes for each active checkout's leader lock like any other Baleyg process. If a standalone CLI already holds it, the daemon stays a follower for that checkout and never forces a takeover. As leader, it runs that checkout's watcher and reconciliation (#16), request queue (#67), retention and GC (Decision 0006). Indexes, pins and revisions stay **per checkout** and are never merged across branches or worktrees. Reuse of extraction work across worktrees comes from #71's path-neutral fact cache.
 - **`baleyg mcp` becomes a thin client.** It speaks MCP over stdio to the agent client exactly as #24 specifies, and relays to the daemon over a Unix domain socket in an owner-only directory. Access is protected by file-system permissions (T00).
   - It still exits on stdin end-of-file and still never indexes.
   - "Never daemonizes" applies to the client. The daemon is a separate process the client may start.
