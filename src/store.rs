@@ -71,6 +71,9 @@ pub struct Store {
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     aborted_staged_index: Arc<Mutex<Option<StagedIndex>>>,
     writer_counters: Arc<Mutex<Option<WriterCounters>>>,
+    // This Store's leader may claim FIFO only after its own post-acquisition
+    // selected reconciliation was observed committed under the synced EX.
+    reconciled_leader: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
@@ -86,6 +89,10 @@ pub struct Store {
     test_queue_post_commit_failures: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_publish_commit_busy_once: Arc<AtomicBool>,
+    // Distinct direct typed SQLite BUSY fixture for mandatory H retries.
+    // The older plain-string hook remains unchanged for classifier tests.
+    #[cfg(test)]
+    test_publish_commit_typed_busy_once: Arc<AtomicBool>,
     #[cfg(test)]
     test_publish_post_commit_busy_once: Arc<AtomicBool>,
 }
@@ -1018,15 +1025,20 @@ impl StagedIndex {
 fn validate_cache_shape(db: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(db: &Connection) -> Result<Vec<Object>> {
-        Ok(db
-            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?)
+        // sqlite_master preparation also reads the schema. With journal_mode
+        // DELETE it can meet the owner's write transaction before a follower
+        // has elected or read its accepted request's DONE pin. Only direct
+        // SQLite BUSY/LOCKED is typed for the coordinator's bounded retry.
+        let mut statement = storage_result(
+            db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"),
+        )?;
+        let rows = storage_result(statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }))?;
+        storage_result(rows.collect::<rusqlite::Result<Vec<_>>>())
     }
     let expected = Connection::open_in_memory()?;
-    let version: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
@@ -1161,7 +1173,11 @@ fn has_revision_producer_bindings(db: &Connection) -> Result<bool> {
         [], |r| r.get(0),
     )?)
 }
-fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
+fn open_index_marker_probe(
+    path: &Path,
+    writable: bool,
+    busy_wait: Duration,
+) -> Result<ProtectedSqliteConnection> {
     use rusqlite::OpenFlags;
     reject_sidecars(path, writable)?;
     verify_index_file(path)?;
@@ -1171,7 +1187,7 @@ fn open_index_marker_probe(path: &Path, writable: bool) -> Result<ProtectedSqlit
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = protected_sqlite_open(path, flags)?;
-    storage_result(db.busy_timeout(Duration::ZERO))?;
+    storage_result(db.busy_timeout(busy_wait))?;
     storage_result(db.pragma_update(None, "temp_store", "MEMORY"))?;
     storage_result(db.pragma_update(None, "foreign_keys", "ON"))?;
     if writable {
@@ -1218,7 +1234,10 @@ fn read_index_format_marker(db: &Connection) -> Result<IndexFormatMarker> {
 }
 
 fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> {
-    let db = open_index_marker_probe(path, writable)?;
+    // Request-path schema/read admission waits through a normal writer commit.
+    // The finite busy timeout is per SQLite call; the accepted FIFO request
+    // keeps its durable ID if contention outlives this call.
+    let db = open_index_marker_probe(path, writable, Duration::from_secs(5))?;
     let marker = read_index_format_marker(&db)?;
     if marker.is_obsolete() {
         return Err(ObsoleteIndexFormat(marker).into());
@@ -1291,11 +1310,126 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
 fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
     if recovery_class(&error) != RecoveryClass::Hard
         || error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<SqliteContention>().is_some()
         || error.downcast_ref::<std::io::Error>().is_some()
     {
         error
     } else {
         SelectedIntegrity(format!("{error:#}")).into()
+    }
+}
+
+/// Opt-in, best-effort diagnostic stage; never carries IDs, paths, or pins.
+pub(crate) fn index_diagnostic_stage(stage: &'static str) {
+    if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+        use std::io::Write as _;
+        let stderr = std::io::stderr();
+        let mut locked = stderr.lock();
+        let _ = writeln!(locked, "index-phase {stage}");
+    }
+}
+/// Only direct typed SQLite BUSY/LOCKED from terminal selected status reads.
+/// A wrapped cause can belong to a higher-priority guard and is not retryable.
+pub fn terminal_status_sqlite_contention(error: &anyhow::Error) -> bool {
+    // Inspect only the outermost error. A direct rusqlite::Error may itself
+    // expose a natural ffi::Error source; that is not an external guard context.
+    let Some(direct) = error.chain().next() else {
+        return false;
+    };
+    direct.downcast_ref::<SqliteContention>().is_some()
+        || matches!(
+            direct.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(info, _))
+                if matches!(
+                    info.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        )
+}
+
+#[cfg(test)]
+mod terminal_status_contention_tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn only_direct_sqlite_busy_is_terminal_read_retryable() {
+        let direct: anyhow::Error = SqliteContention(()).into();
+        assert!(terminal_status_sqlite_contention(&direct));
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error: anyhow::Error =
+                rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into();
+            assert!(terminal_status_sqlite_contention(&error));
+            let wrapped = Err::<(), _>(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ))
+            .context("root_changed: publication guard failed")
+            .unwrap_err();
+            assert!(!terminal_status_sqlite_contention(&wrapped));
+        }
+        for guard in [
+            "root_changed",
+            "index_not_ready",
+            "schema_invalid",
+            "pin_mismatch",
+        ] {
+            let nested = Err::<(), _>(SqliteContention(()))
+                .context(guard)
+                .unwrap_err();
+            assert!(!terminal_status_sqlite_contention(&nested), "{guard}");
+        }
+        let selected = Err::<(), _>(SqliteContention(()))
+            .context(SelectedIntegrity(
+                "incompatible_index: selected evidence".into(),
+            ))
+            .unwrap_err();
+        assert!(!terminal_status_sqlite_contention(&selected));
+        let leader: anyhow::Error = topology::StorageBusy.into();
+        assert!(!terminal_status_sqlite_contention(&leader));
+        assert!(!terminal_status_sqlite_contention(&anyhow::anyhow!(
+            "storage_busy: SQLite lock contention"
+        )));
+    }
+
+    #[test]
+    fn cli_read_busy_retry_is_direct_and_expiry_is_typed() {
+        let raw: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into();
+        assert!(cli_read_retryable_contention(&raw));
+        assert!(cli_read_retryable_contention(&SqliteContention(()).into()));
+        assert!(cli_read_retryable_contention(&topology::StorageBusy.into()));
+        for exact in [
+            "storage_busy: index journal sidecar present",
+            "storage_busy: requests.db initialization in progress",
+        ] {
+            assert!(cli_read_retryable_contention(&anyhow::anyhow!(exact)));
+            assert!(!cli_read_retryable_contention(
+                &Err::<(), _>(anyhow::anyhow!(exact))
+                    .context("root_changed: guard failed")
+                    .unwrap_err()
+            ));
+        }
+        assert!(!cli_read_retryable_contention(
+            &Err::<(), _>(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            ))
+            .context("incompatible_index: selected proof failed")
+            .unwrap_err()
+        ));
+        assert!(!cli_read_retryable_contention(&anyhow::anyhow!(
+            "storage_busy: cached claim changed"
+        )));
+        let expiry = cli_read_busy_expired();
+        assert!(expiry.downcast_ref::<CliReadBusy>().is_some());
+        assert_eq!(
+            expiry.to_string(),
+            "storage_busy: CLI read contention wait expired"
+        );
     }
 }
 
@@ -1305,6 +1439,7 @@ fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
 pub(crate) fn transient_storage_contention(error: &anyhow::Error) -> bool {
     if error.chain().any(|cause| {
         cause.downcast_ref::<topology::StorageBusy>().is_some()
+            || cause.downcast_ref::<SqliteContention>().is_some()
             || matches!(cause.downcast_ref::<rusqlite::Error>(),
                 Some(rusqlite::Error::SqliteFailure(info, _))
                     if matches!(info.code,
@@ -1326,6 +1461,53 @@ pub(crate) fn nonterminal_storage_busy(error: &anyhow::Error) -> bool {
     transient_storage_contention(error) || error.to_string().starts_with("storage_busy")
 }
 
+/// A read-only CLI command may retry direct SQLite contention and exact
+/// operational sidecar/initialization contention, but never a wrapped root,
+/// incarnation, pin or selected-integrity guard or an invariant-busy string.
+pub fn cli_read_retryable_contention(error: &anyhow::Error) -> bool {
+    terminal_status_sqlite_contention(error)
+        || error
+            .chain()
+            .next()
+            .is_some_and(|direct| direct.downcast_ref::<topology::StorageBusy>().is_some())
+        || (error.chain().count() == 1
+            && matches!(
+                error.to_string().as_str(),
+                "storage_busy: index journal sidecar present"
+                    | "storage_busy: requests.db initialization in progress"
+            ))
+}
+
+/// A terminal typed error after the CLI read/admission wait expires. It is
+/// distinct from a direct SQLite failure because sidecar contention also waits.
+#[derive(Debug)]
+pub struct CliReadBusy;
+
+impl std::fmt::Display for CliReadBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_busy: CLI read contention wait expired")
+    }
+}
+
+impl std::error::Error for CliReadBusy {}
+
+pub fn cli_read_busy_expired() -> anyhow::Error {
+    CliReadBusy.into()
+}
+
+/// A transient SQLite writer-lock conflict, distinct from invariant-busy
+/// control errors. The private constructor admits only exact SQLite BUSY/LOCKED.
+#[derive(Debug)]
+pub struct SqliteContention(());
+
+impl std::fmt::Display for SqliteContention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("storage_busy: SQLite lock contention")
+    }
+}
+
+impl std::error::Error for SqliteContention {}
+
 fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     match result {
         Err(rusqlite::Error::SqliteFailure(info, _))
@@ -1339,11 +1521,82 @@ fn storage_result<T>(result: rusqlite::Result<T>) -> Result<T> {
                 rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             ) =>
         {
-            anyhow::bail!("storage_busy: SQLite lock contention")
+            Err(SqliteContention(()).into())
         }
         other => Ok(other?),
     }
 }
+#[cfg(test)]
+mod sqlite_contention_type_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_writer_busy_is_typed_without_raw_sqlite_cause_or_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let first = rusqlite::Connection::open(&path).unwrap();
+        first
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let second = rusqlite::Connection::open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+        first.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = storage_result(second.execute_batch("BEGIN IMMEDIATE")).unwrap_err();
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        assert!(
+            !busy
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        );
+        assert!(transient_storage_contention(&busy));
+        let selected = selected_integrity(busy);
+        assert!(selected.downcast_ref::<SqliteContention>().is_some());
+        assert_eq!(recovery_class(&selected), RecoveryClass::Hard);
+        let contextual = selected.context("outer publication context");
+        assert!(transient_storage_contention(&contextual));
+        assert!(!transient_storage_contention(&anyhow::anyhow!(
+            "storage_busy: cached claim changed"
+        )));
+        first.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn schema_admission_busy_is_typed_and_cannot_mark_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE witness(id INTEGER)")
+            .unwrap();
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let busy = validate_cache_shape(&reader).unwrap_err();
+        assert_eq!(busy.to_string(), "storage_busy: SQLite lock contention");
+        assert!(busy.downcast_ref::<SqliteContention>().is_some());
+        assert_eq!(recovery_class(&busy), RecoveryClass::Hard);
+        assert!(
+            !busy
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn ioerr_rdlock_does_not_convert_to_contention() {
+        let error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR_RDLOCK),
+            None,
+        );
+        let reported = storage_result::<()>(Err(error)).unwrap_err();
+        assert!(reported.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(reported.downcast_ref::<SqliteContention>().is_none());
+        assert!(!transient_storage_contention(&reported));
+    }
+}
+
 fn json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
@@ -3950,6 +4203,7 @@ impl Store {
             request_file_witness: Arc::new(Mutex::new(None)),
             aborted_staged_index: Arc::new(Mutex::new(None)),
             writer_counters: Arc::new(Mutex::new(None)),
+            reconciled_leader: Arc::new(Mutex::new(None)),
             retention_clock: Arc::new(Mutex::new(RetentionClock {
                 origin_wall: publication_second()?,
                 origin_mono: 0,
@@ -3970,6 +4224,8 @@ impl Store {
             test_queue_post_commit_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_publish_commit_busy_once: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            test_publish_commit_typed_busy_once: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_publish_post_commit_busy_once: Arc::new(AtomicBool::new(false)),
         })
@@ -4118,7 +4374,27 @@ impl Store {
     }
     #[cfg(test)]
     pub(crate) fn fail_next_live_publish_commit_busy(&self) {
+        assert!(
+            !self
+                .test_publish_commit_typed_busy_once
+                .load(Ordering::Acquire),
+            "only one live pre-commit BUSY fixture may be armed"
+        );
         self.test_publish_commit_busy_once
+            .store(true, Ordering::Release);
+    }
+    /// Direct typed BUSY at the same live pre-COMMIT point. Do not arm this
+    /// alongside the legacy plain-string fixture in one Store.
+    #[cfg(test)]
+    pub(crate) fn fail_next_live_publish_commit_typed_busy(&self) {
+        assert!(
+            !self.test_publish_commit_busy_once.load(Ordering::Acquire)
+                && !self
+                    .test_publish_commit_typed_busy_once
+                    .load(Ordering::Acquire),
+            "only one live pre-commit BUSY fixture may be armed"
+        );
+        self.test_publish_commit_typed_busy_once
             .store(true, Ordering::Release);
     }
     #[cfg(test)]
@@ -4387,7 +4663,7 @@ impl Store {
                         initial_marker.as_ref() == Some(&found.0),
                         "recovery_required: obsolete marker changed since admission"
                     );
-                    let db = open_index_marker_probe(&path, false)?;
+                    let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
                     self.verify_metadata_root(&db)?;
                     ensure!(
                         read_index_format_marker(&db)?.eq(&found.0),
@@ -4429,7 +4705,7 @@ impl Store {
         leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         if let Some(marker) = &obsolete {
             old.verify()?;
-            let db = open_index_marker_probe(&path, false)?;
+            let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
             self.verify_metadata_root(&db)?;
             ensure!(
                 read_index_format_marker(&db)?.eq(marker),
@@ -4506,7 +4782,7 @@ impl Store {
             if let Some(marker) = &obsolete {
                 let recheck = (|| -> Result<()> {
                     old.verify()?;
-                    let db = open_index_marker_probe(&path, false)?;
+                    let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
                     self.verify_metadata_root(&db)?;
                     ensure!(
                         read_index_format_marker(&db)?.eq(marker),
@@ -5061,6 +5337,7 @@ impl Store {
         }
         match self.disposition() {
             RecoveryDisposition::Ready => {
+                index_diagnostic_stage("public_read_latched");
                 Err(topology::IndexNotReady::new("reconciliation required").into())
             }
             RecoveryDisposition::Rebuild => {
@@ -5252,6 +5529,7 @@ impl Store {
             self.status()?.revision == pin,
             "index_not_ready: exceptional recovery pair not admitted"
         );
+        self.attest_post_acquisition_reconciliation(&session, pin)?;
         Ok((pin, session))
     }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
@@ -5262,6 +5540,57 @@ impl Store {
     }
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
         session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
+    }
+    /// Mint a claim proof only from a selected post-COMMIT revision carrying
+    /// this exact synced leader incarnation. Merely acquiring EX cannot mint it.
+    pub(crate) fn attest_post_acquisition_reconciliation(
+        &self,
+        session: &topology::LeaderSession,
+        committed_pin: IndexPin,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        self.attest_post_acquisition_reconciliation_guard(session.leader_guard()?, committed_pin)
+    }
+    /// The public full-native publication API also performs a complete guarded
+    /// capture and COMMIT. Its callers must receive the same claim authority as
+    /// coordinator callers, including an already-held daemon owner.
+    fn attest_post_acquisition_reconciliation_guard(
+        &self,
+        leader: &topology::LeaderGuard,
+        committed_pin: IndexPin,
+    ) -> Result<()> {
+        self.identity.verify()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        let db = self.cache()?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        let (selected, marker) = self.admit_evidence_control(&db)?;
+        ensure!(
+            marker == leader.incarnation && selected.revision == committed_pin,
+            "index_not_ready: mandatory leader reconciliation not committed"
+        );
+        self.identity.verify()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        *self.reconciled_leader.lock().unwrap() = Some(marker);
+        Ok(())
+    }
+    /// The public Store::claim_request entry point must refuse pre-COMMIT
+    /// claims, including the leader's own request and direct API callers.
+    pub(crate) fn verify_reconciled_leader_claim(
+        &self,
+        session: &topology::LeaderSession,
+    ) -> Result<()> {
+        self.verify_leader_session(session)?;
+        if *self.reconciled_leader.lock().unwrap() != Some(session.incarnation()) {
+            return Err(topology::IndexNotReady::new(
+                "mandatory leader reconciliation not committed",
+            )
+            .into());
+        }
+        // A later request's failed publication can leave the selected-read
+        // latch closed until retry, but cannot undo this leader's committed H.
+        // Root/EX/marker verification still fences every claim. The selected
+        // revision itself is attested when the proof is minted after COMMIT.
+        self.verify_leader_session(session)
     }
     fn compose_selected_class_catalog(
         graph: &Graph,
@@ -5326,6 +5655,7 @@ impl Store {
         let schema: u32 =
             storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
+            index_diagnostic_stage("selected_schema_mismatch");
             return Err(topology::IndexNotReady::new("reconciliation required").into());
         }
         let status = self.read_status(db)?;
@@ -5449,7 +5779,7 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_native_expected(
+        let pin = self.publish_native_expected(
             graph,
             capture,
             native,
@@ -5457,7 +5787,9 @@ impl Store {
             ExpectedPublication::Pin(expected_revision),
             cancel,
             false,
-        )
+        )?;
+        self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
+        Ok(pin)
     }
     pub(crate) fn publish_native_recovery(
         &self,
@@ -6029,6 +6361,121 @@ impl Store {
     /// equality: Capture::admit has freshly read and SHA-256 hashed every source,
     /// and selected_source_row_for authenticates the saved bytes of every reused
     /// version before any metadata-only writer transaction starts.
+    /// A leader's final full inventory may avoid a redundant publication only
+    /// when the freshly hashed capture is still exactly the selected head.
+    /// This read-only guard is not an explicit-request completion path.
+    pub(crate) fn selected_capture_unchanged(
+        &self,
+        capture: &crate::capture::Capture,
+        leader: &topology::LeaderGuard,
+        expected: &RecoveryBaseline,
+        cancel: &CancelFlag,
+    ) -> Result<bool> {
+        if !expected.compatible
+            || self.disposition() != RecoveryDisposition::Ready
+            || !expected.pin().is_some_and(|pin| pin.index_revision > 0)
+        {
+            return Ok(false);
+        }
+        check_cancel(cancel)?;
+        ensure!(
+            capture.source_operations.len() == capture.files.len()
+                && capture
+                    .source_operations
+                    .values()
+                    .all(|ops| ops.opens == 1 && ops.complete_reads == 1 && ops.hashes == 1),
+            "native_evidence_required: final inventory must freshly read and hash every admitted source"
+        );
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        self.identity.verify()?;
+        let db = self.cache_write()?;
+        let admitted_version: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        let selected = ReadRevision::current(&db)?;
+        ensure!(
+            expected.pin() == Some(selected.pin),
+            "revision conflict: final inventory selected head changed"
+        );
+        let baseline = self.recovery_baseline(&db)?;
+        ensure!(
+            baseline.compatible
+                && baseline.pin == Some(selected.pin)
+                && baseline.witness == expected.witness,
+            "revision conflict: final inventory baseline changed"
+        );
+        validate_paired_metadata(&db, &self.identity.record_id)?;
+        validate_reconcile_inventory(&db)?;
+        if !has_revision_producer_bindings(&db)? {
+            return Ok(false);
+        }
+        let executable = std::env::current_exe()?;
+        let executing_hash = capture
+            .executable_digest(&executable)
+            .context("native_evidence_required: final inventory executable not hashed")?;
+        if selected_producer_hash(&db, &selected)? != executing_hash {
+            return Ok(false);
+        }
+        let prior_options: String = db.query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if prior_options != json(capture.reconcile_options())? {
+            return Ok(false);
+        }
+        let comparison = compare_capture_snapshot(&db, capture)?;
+        if comparison.examined == 0 || comparison.changed() {
+            return Ok(false);
+        }
+        for source in &capture.files {
+            check_cancel(cancel)?;
+            let stored = self
+                .selected_source_row_for(&db, &source.path, &selected)?
+                .context("incompatible_index: selected final inventory source missing")?;
+            ensure!(
+                stored == *source,
+                "incompatible_index: selected final inventory source differs"
+            );
+            let linked: Option<(String, String, String, String, String)> = db.query_row(
+                "SELECT g.state,c.state,v.extraction_context,v.producer_id,v.producer_version
+                 FROM revision_documents m
+                 JOIN document_versions v ON v.id=m.document_version_id AND v.language=m.language AND v.path=m.path
+                 JOIN graph_projections g ON g.id=m.graph_projection_id AND g.document_version_id=m.document_version_id AND g.language=m.language
+                 JOIN class_projections c ON c.id=m.class_projection_id AND c.graph_projection_id=m.graph_projection_id
+                 WHERE m.revision_id=?1 AND m.path=?2",
+                 params![selected.key, source.path],
+                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional()?;
+            let (graph, class, context, producer, version) = linked
+                .context("incompatible_index: selected final inventory projection missing")?;
+            ensure!(
+                graph == "ready"
+                    && class == "ready"
+                    && producer == crate::native_evidence::PRODUCER
+                    && version == crate::native_evidence::NATIVE_VERSION
+                    && context
+                        == crate::native_evidence::declared_selected_extraction_context(
+                            &producer,
+                            &version,
+                            &source.language
+                        )?,
+                "incompatible_index: selected final inventory producer or projection drift"
+            );
+        }
+        capture.verify(cancel)?;
+        leader.verify()?;
+        self.identity.verify()?;
+        let after: i64 =
+            storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
+        ensure!(
+            admitted_version == after
+                && self.recovery_baseline(&db)?.witness == expected.witness
+                && ReadRevision::current(&db)?.pin == selected.pin,
+            "revision conflict: final inventory changed at cutoff"
+        );
+        Ok(true)
+    }
+
     pub(crate) fn publish_unchanged_native_recovery(
         &self,
         capture: &crate::capture::Capture,
@@ -7443,6 +7890,15 @@ impl Store {
             // Deterministic pre-commit rollback-journal contention: the live
             // transaction drops without publishing any part of this revision.
             anyhow::bail!("storage_busy: SQLite lock contention");
+        }
+        #[cfg(test)]
+        if matches!(target, PublicationTarget::Live)
+            && self
+                .test_publish_commit_typed_busy_once
+                .swap(false, Ordering::AcqRel)
+        {
+            // Same rollback point, but a direct typed SQLite contention.
+            return Err(SqliteContention(()).into());
         }
         storage_result(tx.commit())?;
         #[cfg(test)]

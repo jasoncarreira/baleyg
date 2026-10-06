@@ -166,6 +166,8 @@ impl IndexJobCoordinator {
             });
             report("publish", phase_start.elapsed());
             observe(&capture);
+            self.store
+                .attest_post_acquisition_reconciliation(&self.session, pin)?;
             self.maintain_after_publish();
             return Ok(pin);
         }
@@ -210,6 +212,8 @@ impl IndexJobCoordinator {
                     cancel,
                 )?;
                 report("publish", phase_start.elapsed());
+                self.store
+                    .attest_post_acquisition_reconciliation(&self.session, pin)?;
                 self.maintain_after_publish();
                 return Ok(pin);
             }
@@ -249,8 +253,124 @@ impl IndexJobCoordinator {
             cancel,
         )?;
         report("publish", phase_start.elapsed());
+        self.store
+            .attest_post_acquisition_reconciliation(&self.session, published)?;
         self.maintain_after_publish();
         Ok(published)
+    }
+}
+
+/// The elected owner alone drives the advisory watcher and the durable FIFO.
+/// This is an in-memory scheduler, not a second request queue.
+pub struct LeaderWork {
+    watch: crate::watch::WatchSignals,
+    last_inventory: std::time::Instant,
+    retry_after: Option<std::time::Instant>,
+    last_accounted_generation: Option<u64>,
+    options: IndexOptions,
+}
+
+impl LeaderWork {
+    /// Construct only after the synced incarnation and complete takeover reconcile.
+    pub fn new(
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+    ) -> Result<Self> {
+        store.verify_leader_session(session)?;
+        let watch = crate::watch::WatchSignals::new(
+            options.workspace_root.clone(),
+            options.scip_path.clone(),
+            options.manifest_path.clone(),
+        );
+        Ok(Self {
+            watch,
+            last_inventory: std::time::Instant::now(),
+            retry_after: None,
+            last_accounted_generation: None,
+            options: options.clone(),
+        })
+    }
+
+    /// A full capture always checks root, leader and selected publication fences.
+    /// A failed capture keeps the dirty generation for a later signal or scan.
+    pub fn reconcile_due(
+        &mut self,
+        store: &Store,
+        session: &Arc<LeaderSession>,
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        force: bool,
+    ) -> Result<bool> {
+        store.verify_leader_session(session)?;
+        // The takeover FIFO head may have different selected inputs from this
+        // daemon's defaults. Keep its watcher until a new watcher has registered
+        // for the new options; its full wake then closes the transition gap.
+        if self.options.workspace_root != options.workspace_root
+            || self.options.scip_path != options.scip_path
+            || self.options.manifest_path != options.manifest_path
+            || self.options.max_file_bytes != options.max_file_bytes
+        {
+            let next = crate::watch::WatchSignals::new(
+                options.workspace_root.clone(),
+                options.scip_path.clone(),
+                options.manifest_path.clone(),
+            );
+            self.watch = next;
+            self.options = options.clone();
+            self.last_accounted_generation = None;
+        }
+        let now = std::time::Instant::now();
+        let periodic =
+            now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
+        let batch = self.watch.drain();
+        if !force
+            && !periodic
+            && ((self.watch.degraded() && self.last_accounted_generation == Some(batch.generation))
+                || !self.watch.batch_ready_at(now)
+                || self.retry_after.is_some_and(|deadline| deadline > now))
+        {
+            return Ok(false);
+        }
+        // The first post-registration full inventory closes the takeover/watch gap.
+        // An identical selected capture needs no gratuitous new revision.
+        let outcome =
+            (|| {
+                let captured = Capture::admit(options, cancel, &|_| {})?;
+                let baseline = store.recovery_index_baseline()?;
+                if store.selected_capture_unchanged(
+                    &captured,
+                    session.leader_guard()?,
+                    &baseline,
+                    cancel,
+                )? {
+                    return Ok(());
+                }
+                IndexJobCoordinator::prepare_with_session(store, None, session.clone())?
+                    .run_serving(options, cancel, |_| {})?;
+                Ok(())
+            })();
+        match outcome {
+            Ok(_) => {
+                let accounted = self.watch.acknowledge(&batch);
+                if accounted {
+                    self.last_accounted_generation = Some(batch.generation);
+                } else {
+                    // A concurrent event is not part of this selected capture.
+                    // Keep it dirty for the next tick or successor full takeover.
+                    self.watch.require_full();
+                }
+                self.last_inventory = std::time::Instant::now();
+                self.retry_after = None;
+                Ok(accounted)
+            }
+            Err(error) => {
+                self.watch.require_full();
+                self.retry_after =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                Err(error)
+            }
+        }
     }
 }
 
@@ -307,6 +427,26 @@ pub fn drain_requests_observed_with_native(
         &Arc::new(std::sync::atomic::AtomicBool::new(false)),
         progress,
         native_observe,
+        usize::MAX,
+        None,
+    )
+}
+
+/// Admit one FIFO row so the daemon can fairly interleave watcher inventory
+/// before the next accepted row without introducing another request queue.
+pub fn drain_one_request_observed(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    progress: impl Fn(&str, IndexProgress) + Sync,
+) -> Result<usize> {
+    drain_requests_observed_with_cancel(
+        store,
+        session,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        progress,
+        |_, _, _| {},
+        1,
+        None,
     )
 }
 
@@ -320,6 +460,8 @@ fn drain_requests_observed_with_cancel(
         &crate::native_evidence::DocumentKey,
         crate::native_evidence::FullNativeStage,
     ) + Sync,
+    max_completed: usize,
+    cutoff_seq: Option<i64>,
 ) -> Result<usize> {
     if store.root_path_replaced()? {
         store.fail_changed_root_requests(session)?;
@@ -335,6 +477,13 @@ fn drain_requests_observed_with_cancel(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; inspect the accepted request's durable state"
         );
+        if let Some(cutoff) = cutoff_seq
+            && store
+                .earliest_unfinished_request()?
+                .is_some_and(|row| row.seq > cutoff)
+        {
+            break;
+        }
         let Some(request) = store.claim_request(session)? else {
             break;
         };
@@ -437,6 +586,9 @@ fn drain_requests_observed_with_cancel(
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
         completed += 1;
+        if completed >= max_completed {
+            break;
+        }
     }
     Ok(completed)
 }
@@ -497,9 +649,33 @@ pub fn enqueue_and_wait_observed(
     cancel: &CancelFlag,
     progress: impl Fn(IndexProgress) + Sync,
 ) -> Result<(crate::model::IndexPin, Arc<LeaderSession>)> {
+    let (_, pin, session) = enqueue_and_wait_observed_inner(store, options, cancel, progress)?;
+    Ok((pin, session))
+}
+
+/// Preserve the ID of the one accepted FIFO request for finite CLI reporting.
+pub fn enqueue_and_wait_observed_with_request(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(String, crate::model::IndexPin, Arc<LeaderSession>)> {
+    enqueue_and_wait_observed_inner(store, options, cancel, progress)
+}
+
+fn enqueue_and_wait_observed_inner(
+    store: &Store,
+    options: &IndexOptions,
+    cancel: &CancelFlag,
+    progress: impl Fn(IndexProgress) + Sync,
+) -> Result<(String, crate::model::IndexPin, Arc<LeaderSession>)> {
     let request = store.enqueue_request(options, None)?;
     let mut observed_store = store.clone();
     let mut held: Option<Arc<LeaderSession>> = None;
+    let mut leader_work: Option<LeaderWork> = None;
+    // Only direct typed SQLite admission contention has a finite cumulative
+    // wait. A live owner's leader-lock contention can outlast a cold FULL run.
+    let mut sqlite_busy_since: Option<std::time::Instant> = None;
     loop {
         let store = &observed_store;
         if store.root_path_replaced()? {
@@ -512,6 +688,7 @@ pub fn enqueue_and_wait_observed(
         if let Some(row) = store.request_by_id(&request.id)? {
             match row.state.as_str() {
                 "done" => {
+                    crate::store::index_diagnostic_stage("done_row_seen");
                     let session = match held.take() {
                         Some(session) => session,
                         None => match store.follower_session() {
@@ -540,14 +717,42 @@ pub fn enqueue_and_wait_observed(
                         },
                     };
                     session.verify()?;
+                    crate::store::index_diagnostic_stage("session_verified");
+                    if session.is_leader() {
+                        // A finite owner finishes one bounded inventory/drain at its
+                        // release fence. Later edits remain discoverable by takeover.
+                        if let Some(work) = leader_work.as_mut() {
+                            let cutoff = store.current_request()?.map(|row| row.seq);
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, &session, &selected_options, cancel, true)?;
+                            if let Some(cutoff) = cutoff {
+                                drain_requests_observed_with_cancel(
+                                    store,
+                                    &session,
+                                    cancel,
+                                    |_, phase| progress(phase),
+                                    |_, _, _| {},
+                                    usize::MAX,
+                                    Some(cutoff),
+                                )?;
+                            }
+                            // A bounded second cutoff accounts for signals raised
+                            // while the accepted pre-cutoff FIFO rows were drained.
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, &session, &selected_options, cancel, true)?;
+                        }
+                    }
                     let pin = row.revision.expect("done request has revision");
-                    let current = store.status()?.revision;
-                    ensure!(
-                        pin.index_generation == current.index_generation
-                            && pin.index_revision <= current.index_revision,
-                        "storage_busy: completed request pin is not retained by current publication"
-                    );
-                    return Ok((pin, session));
+                    crate::store::index_diagnostic_stage("selected_proof_start");
+                    let response = store.evidence_response()?;
+                    response.validate_pin(pin)?;
+                    response.finish(())?;
+                    crate::store::index_diagnostic_stage("selected_proof_complete");
+                    return Ok((request.id, pin, session));
                 }
                 "failed" => anyhow::bail!(
                     "{}: queued indexing failed",
@@ -564,6 +769,7 @@ pub fn enqueue_and_wait_observed(
             match store.recreate_pending_leader_session(options, cancel) {
                 Ok((_, session)) => {
                     store.fail_changed_root_requests(&session)?;
+                    leader_work = Some(LeaderWork::new(store, &session, options)?);
                     held = Some(session);
                 }
                 Err(error)
@@ -601,6 +807,7 @@ pub fn enqueue_and_wait_observed(
         if held.is_none() {
             match store.leader_session() {
                 Ok(session) => {
+                    sqlite_busy_since = None;
                     // Reconcile the root before claiming any accepted FIFO row.
                     // This publication cannot acknowledge a request: each claim
                     // must produce its own fresh, guarded revision afterwards.
@@ -620,7 +827,28 @@ pub fn enqueue_and_wait_observed(
                     let startup =
                         IndexJobCoordinator::prepare_with_session(store, None, session.clone())?;
                     startup.run(&reconcile_options, cancel, &progress)?;
+                    leader_work = Some(LeaderWork::new(store, &session, options)?);
                     held = Some(session);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::store::SqliteContention>()
+                        .is_some() =>
+                {
+                    // The same accepted request retains its ID and FIFO place.
+                    // An index writer may still hold SQLite EX after we fail to
+                    // become leader; retry only this direct typed contention.
+                    let first = sqlite_busy_since.get_or_insert_with(std::time::Instant::now);
+                    if first.elapsed() >= std::time::Duration::from_secs(15) {
+                        if store.root_path_replaced()? {
+                            anyhow::bail!("root_changed: captured workspace pathname changed");
+                        }
+                        store.verify_root()?;
+                        return Err(error).context(format!(
+                            "storage_busy: request {} is durable and may already be complete; check job status",
+                            request.id
+                        ));
+                    }
                 }
                 Err(error)
                     if format!("{error:#}").contains("storage_busy")
@@ -642,8 +870,18 @@ pub fn enqueue_and_wait_observed(
                     cancel,
                     |_, phase| progress(phase),
                     |_, _, _| {},
+                    1,
+                    None,
                 ) {
-                    Ok(_) => break,
+                    Ok(_) => {
+                        if let Some(work) = leader_work.as_mut() {
+                            let selected_options = store
+                                .recorded_index_options()?
+                                .unwrap_or_else(|| options.clone());
+                            work.reconcile_due(store, session, &selected_options, cancel, false)?;
+                        }
+                        break;
+                    }
                     Err(error) => {
                         if crate::store::nonterminal_storage_busy(&error)
                             && !store.has_recorded_completion(session)?
@@ -723,6 +961,256 @@ mod tests {
         sync::{Arc, atomic::AtomicBool},
     };
 
+    #[test]
+    fn acquired_leader_cannot_claim_its_own_row_at_precommit_capture_pause() {
+        use crate::store::topology::IndexNotReady;
+        use std::{sync::mpsc, time::Duration};
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
+        let original = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_, old_owner) = reconcile_workspace(&original, &options, &cancel, |_| {}).unwrap();
+        drop(old_owner);
+        fs::write(workspace.path().join("a.js"), "function new() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let own = store.enqueue_request(&options, None).unwrap();
+        let coordinator = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = coordinator.session();
+        let (paused_tx, paused_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let work = scope.spawn(move || {
+                coordinator.run_observed(
+                    &options,
+                    &cancel,
+                    |_| {},
+                    |_| {
+                        paused_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    },
+                )
+            });
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(session.is_leader() && session.verify().is_ok());
+            let precommit = store.claim_request(&session).unwrap_err();
+            assert!(
+                precommit.downcast_ref::<IndexNotReady>().is_some(),
+                "an acquired EX without its own committed H cannot claim: {precommit:#}"
+            );
+            let row = store.request_by_id(&own.id).unwrap().unwrap();
+            assert_eq!(row.state, "queued");
+            assert!(row.claim_incarnation.is_none());
+            release_tx.send(()).unwrap();
+            let committed = work.join().unwrap().unwrap();
+            assert_eq!(store.status().unwrap().revision, committed);
+            let claimed = store.claim_request(&session).unwrap().unwrap();
+            assert_eq!(claimed.id, own.id);
+            assert_eq!(claimed.state, "running");
+            assert_eq!(
+                claimed.claim_incarnation,
+                Some(session.incarnation().to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn takeover_marker_refuses_old_read_then_reconciles_before_fifo_claim() {
+        use crate::store::topology::IndexNotReady;
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (old_pin, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let identity = crate::store::topology::WorkspaceIdentity::discover(
+            Some(workspace.path()),
+            workspace.path(),
+        )
+        .unwrap();
+        let roots = crate::store::topology::TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let lock_path = roots.leader_lock(&identity);
+        let predecessor_marker = fs::read(&lock_path).unwrap();
+        drop(owner);
+        fs::write(workspace.path().join("a.js"), "function new() {}\n").unwrap();
+        let first_capture = AtomicBool::new(false);
+        let first_publish = AtomicBool::new(false);
+        let takeover_pin = std::sync::Mutex::new(None);
+        let (explicit_pin, owner) = enqueue_and_wait_observed(&store, &options, &cancel, |phase| {
+            if phase.phase == "timing:capture" && !first_capture.swap(true, Ordering::AcqRel) {
+                assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
+                use std::os::fd::AsRawFd;
+                let successor_marker = fs::read(&lock_path).unwrap();
+                assert_ne!(predecessor_marker, successor_marker);
+                assert_eq!(successor_marker.len(), 36);
+                uuid::Uuid::parse_str(std::str::from_utf8(&successor_marker).unwrap()).unwrap();
+                let probe = fs::OpenOptions::new().read(true).open(&lock_path).unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                let follower = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+                let error = match follower.evidence_response() {
+                    Ok(_) => panic!("predecessor evidence served after successor marker"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error
+                        .chain()
+                        .any(|cause| cause.downcast_ref::<IndexNotReady>().is_some()),
+                    "post-marker old selected read must refuse: {error:#}"
+                );
+            }
+            if phase.phase == "timing:publish" && !first_publish.swap(true, Ordering::AcqRel) {
+                assert_eq!(
+                    store.current_request().unwrap().unwrap().state,
+                    "queued",
+                    "takeover reconciliation cannot ACK the explicit row"
+                );
+                let selected = store.status().unwrap().revision;
+                assert!(selected.index_revision > old_pin.index_revision);
+                let read = store.evidence_response().unwrap();
+                assert_eq!(
+                    read.source_at("a.js", Some(selected))
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .text,
+                    "function new() {}\n"
+                );
+                read.finish(()).unwrap();
+                *takeover_pin.lock().unwrap() = Some(selected);
+            }
+        })
+        .unwrap();
+        assert!(owner.is_leader());
+        assert!(first_capture.load(Ordering::Acquire) && first_publish.load(Ordering::Acquire));
+        assert!(
+            explicit_pin.index_revision
+                > takeover_pin.into_inner().unwrap().unwrap().index_revision
+        );
+        assert_eq!(
+            store.current_request().unwrap().unwrap().revision,
+            Some(explicit_pin)
+        );
+    }
+
+    #[test]
+    fn cli_final_inventory_keeps_foreign_fifo_head_options_and_both_ack_pins() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let initiating = IndexOptions::new(workspace.path().to_owned());
+        let mut foreign = initiating.clone();
+        foreign.manifest_path = Some(workspace.path().join("absent-manifest.json"));
+        let inserted = std::sync::atomic::AtomicBool::new(false);
+        let foreign_id = std::sync::Mutex::new(None);
+        let initiating_id = std::sync::Mutex::new(None);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (initiating_pin, leader) =
+            enqueue_and_wait_observed(&store, &initiating, &cancel, |phase| {
+                if phase.phase == "timing:capture" && !inserted.swap(true, Ordering::AcqRel) {
+                    *initiating_id.lock().unwrap() =
+                        Some(store.current_request().unwrap().unwrap().id);
+                    *foreign_id.lock().unwrap() =
+                        Some(store.enqueue_request(&foreign, None).unwrap().id);
+                }
+            })
+            .unwrap();
+        assert!(leader.is_leader());
+        let foreign_id = foreign_id.into_inner().unwrap().unwrap();
+        let foreign_row = store.request_by_id(&foreign_id).unwrap().unwrap();
+        let initiating_id = initiating_id.into_inner().unwrap().unwrap();
+        let initiating_row = store.request_by_id(&initiating_id).unwrap().unwrap();
+        assert_eq!(initiating_row.state, "done");
+        assert_eq!(initiating_row.revision, Some(initiating_pin));
+        assert_eq!(foreign_row.state, "done");
+        assert_eq!(store.current_request().unwrap().unwrap().id, foreign_id);
+        let foreign_pin = foreign_row.revision.unwrap();
+        assert!(foreign_pin.index_revision > initiating_pin.index_revision);
+        assert_eq!(
+            store.status().unwrap().revision,
+            foreign_pin,
+            "final CLI inventory cannot revert the selected foreign options"
+        );
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .manifest_path,
+            foreign.manifest_path
+        );
+        let response = store.evidence_response().unwrap();
+        response.validate_pin(initiating_pin).unwrap();
+        response.validate_pin(foreign_pin).unwrap();
+        response.finish(()).unwrap();
+    }
+
+    #[test]
+    fn takeover_watcher_switches_input_options_with_new_full_wake() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let head_options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let owner = establish_serving_session(&store, Some(&head_options), &cancel).unwrap();
+        let mut work = LeaderWork::new(&store, &owner, &head_options).unwrap();
+        let mut daemon_options = head_options.clone();
+        daemon_options.max_file_bytes = 1024;
+        work.reconcile_due(&store, &owner, &daemon_options, &cancel, false)
+            .unwrap();
+        assert_eq!(work.options.max_file_bytes, 1024);
+        assert!(
+            work.last_accounted_generation.is_some(),
+            "new option watcher must finish its first full inventory"
+        );
+        assert_eq!(
+            store
+                .recorded_index_options()
+                .unwrap()
+                .unwrap()
+                .max_file_bytes,
+            1024
+        );
+    }
+
+    #[test]
+    fn degraded_watcher_reconciles_once_then_waits_for_periodic_scan() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let owner = establish_serving_session(&store, Some(&options), &cancel).unwrap();
+        let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+        work.watch
+            .submit_event(Err(notify::Error::generic("watch failed")));
+        assert!(
+            work.reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        let pin = store.status().unwrap().revision;
+        assert!(work.last_accounted_generation.is_some());
+        assert!(
+            !work
+                .reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        assert_eq!(store.status().unwrap().revision, pin);
+        work.last_inventory -= std::time::Duration::from_secs(60);
+        work.reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap();
+    }
+
     /// Per-source (opens, complete reads, hashes), keyed by path.
     type Counts = BTreeMap<String, (usize, usize, usize)>;
 
@@ -751,18 +1239,43 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
         let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-        let options = IndexOptions::new(workspace.path().to_owned());
+        let mut h = IndexOptions::new(workspace.path().canonicalize().unwrap());
+        h.max_file_bytes = 128;
+        let mut a_options = h.clone();
+        a_options.max_file_bytes = 32;
+        let mut b_options = h.clone();
+        b_options.max_file_bytes = 512;
+        let assert_selected_options = |expected: &IndexOptions| {
+            let observed = store.recorded_index_options().unwrap().unwrap();
+            assert_eq!(observed.workspace_root, expected.workspace_root);
+            assert_eq!(
+                crate::indexer::ReconcileOptions::from(&observed),
+                crate::indexer::ReconcileOptions::from(expected),
+            );
+        };
         let cancel = Arc::new(AtomicBool::new(false));
-        let (_, old_owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let (_, old_owner) = reconcile_workspace(&store, &h, &cancel, |_| {}).unwrap();
         drop(old_owner);
-        let mut options = options;
-        options.max_file_bytes = 1024;
-        let browser = store
-            .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
-            .unwrap();
-        let cli = store.enqueue_request(&options, None).unwrap();
-        assert!(browser.seq < cli.seq);
-        let (base, leader) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let browser = store.enqueue_request(&a_options, None).unwrap();
+        let cli = store.enqueue_request(&b_options, None).unwrap();
+        assert!(browser.seq < cli.seq && browser.id != cli.id);
+        let leader = establish_serving_session(&store, None, &cancel).unwrap();
+        let base = store.status().unwrap().revision;
+        assert_selected_options(&h);
+        assert_eq!(
+            store.request_by_id(&browser.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            store.request_by_id(&cli.id).unwrap().unwrap().state,
+            "queued"
+        );
+        let encoded_a =
+            serde_json::to_string(&crate::indexer::ReconcileOptions::from(&a_options)).unwrap();
+        let encoded_b =
+            serde_json::to_string(&crate::indexer::ReconcileOptions::from(&b_options)).unwrap();
+        assert_eq!(browser.options_json, encoded_a);
+        assert_eq!(cli.options_json, encoded_b);
         let injection = AtomicBool::new(false);
         assert_eq!(
             drain_requests_observed(&store, &leader, |id, phase| {
@@ -784,6 +1297,13 @@ mod tests {
         let b = store.request_by_id(&cli.id).unwrap().unwrap();
         assert_eq!(a.state, "done");
         assert_eq!(
+            (a.id.as_str(), a.seq, a.options_json.as_str()),
+            (browser.id.as_str(), browser.seq, encoded_a.as_str())
+        );
+        assert_eq!(b.id, cli.id);
+        assert_eq!(b.options_json, encoded_b);
+        assert_selected_options(&a_options);
+        assert_eq!(
             b.seq, cli.seq,
             "accepted CLI ACK cannot be deleted/re-admitted under a new seq"
         );
@@ -797,6 +1317,11 @@ mod tests {
             base.index_revision + 1,
             "failed commit must leave only the prior Q1 publication"
         );
+        let q1_pin = a.revision.unwrap();
+        // Selected status is fenced until Q2 reconciliation succeeds.
+        // Check Q1's durable DONE/pin and selected A options above; defer
+        // the historical source read until after Q2 publishes and recovers.
+        fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
         assert_eq!(
             drain_requests(&store, &leader).unwrap(),
             1,
@@ -807,7 +1332,36 @@ mod tests {
             b.state, "done",
             "retry must finish the original accepted same-seq Q2"
         );
-        assert!(b.error_code.is_none());
+        assert!(b.finished_at.is_some() && b.error_code.is_none() && b.revision.is_some());
+        assert_eq!(
+            (
+                b.id.as_str(),
+                b.seq,
+                b.options_json.as_str(),
+                b.state.as_str()
+            ),
+            (cli.id.as_str(), cli.seq, encoded_b.as_str(), "done")
+        );
+        let final_q1 = store.request_by_id(&browser.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                final_q1.id.as_str(),
+                final_q1.seq,
+                final_q1.options_json.as_str(),
+                final_q1.state.as_str(),
+                final_q1.revision,
+            ),
+            (
+                browser.id.as_str(),
+                browser.seq,
+                encoded_a.as_str(),
+                "done",
+                Some(q1_pin)
+            ),
+            "Q2 retry cannot move Q1 out of its exact terminal DONE/pin",
+        );
+        assert!(final_q1.finished_at.is_some() && final_q1.error_code.is_none());
+        assert_selected_options(&b_options);
         assert_eq!(a.revision.unwrap().index_generation, base.index_generation);
         assert_eq!(a.revision.unwrap().index_revision, base.index_revision + 1);
         assert_eq!(
@@ -816,6 +1370,27 @@ mod tests {
             "failed commit cannot leave a partially published revision"
         );
         assert_eq!(store.status().unwrap().revision, b.revision.unwrap());
+        let read = store.evidence_response().unwrap();
+        read.validate_pin(base).unwrap();
+        read.validate_pin(q1_pin).unwrap();
+        read.validate_pin(b.revision.unwrap()).unwrap();
+        assert_eq!(
+            read.source_at("a.js", Some(q1_pin))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function a() {}\n"
+        );
+        assert_eq!(
+            read.source_at("a.js", Some(b.revision.unwrap()))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function b() {}\n"
+        );
+        read.finish(()).unwrap();
         assert!(leader.verify().is_ok());
     }
 

@@ -511,7 +511,9 @@ impl Store {
         )
     }
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
-        self.verify_leader_session(session)?;
+        // EX ownership alone is not authority to claim. The same incarnation
+        // must first commit and attest its selected post-acquisition H.
+        self.verify_reconciled_leader_claim(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.verify_leader_session(session)?;
@@ -524,6 +526,7 @@ impl Store {
         {
             return Ok(None);
         }
+        self.verify_reconciled_leader_claim(session)?;
         tx.execute("UPDATE requests SET state='running',claim_incarnation=?1,started_at=?2 WHERE seq=?3 AND state IN ('queued','running')", params![session.incarnation().to_string(),now(),row.seq])?;
         let claimed = tx.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),

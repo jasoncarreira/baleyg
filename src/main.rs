@@ -18,8 +18,31 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
+
+// Finite retry budget between terminal selected-status attempts, not a synchronous
+// SQLite-call wall-clock guarantee or a claim of p99 publication latency.
+const STATUS_RESULT_WAIT: Duration = Duration::from_secs(15);
+
+// Opt-in real-process test barrier. Normal CLI runs never open this socket.
+#[cfg(unix)]
+fn fixture_index_exchange(
+    socket: &mut std::os::unix::net::UnixStream,
+    sent: u8,
+    expected: u8,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    socket
+        .write_all(&[sent])
+        .map_err(|_| anyhow::anyhow!("fixture index IPC send failed"))?;
+    let mut reply = [0u8];
+    socket
+        .read_exact(&mut reply)
+        .map_err(|_| anyhow::anyhow!("fixture index IPC response failed"))?;
+    ensure!(reply[0] == expected, "fixture index IPC response mismatch");
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(
@@ -205,6 +228,79 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+// Retry Store::open before admission, then reuse the admitted Store/session for
+// fresh selected-read snapshots. Guard loss outranks contention and expiry;
+// output destinations are opened only after a complete read succeeds.
+const CLI_READ_WAIT: Duration = Duration::from_secs(5);
+fn cli_read_with_retry<T>(
+    verify: impl Fn() -> Result<()>,
+    attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    cli_read_with_retry_until(Instant::now() + CLI_READ_WAIT, verify, attempt)
+}
+
+fn cli_read_with_retry_until<T>(
+    deadline: Instant,
+    verify: impl Fn() -> Result<()>,
+    mut attempt: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        verify()?;
+        match attempt() {
+            Ok(value) => {
+                verify()?;
+                return Ok(value);
+            }
+            Err(error) => {
+                verify()?;
+                if !baleyg::store::cli_read_retryable_contention(&error) {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(baleyg::store::cli_read_busy_expired());
+                }
+                std::thread::sleep(backoff.min(remaining));
+                backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
+// Do not repeat admission. It can commit H before failing its final attestation,
+// and a retry could elect another leader and publish another incarnation.
+fn cli_read_admit(
+    args: &WorkspaceArgs,
+    identity: &WorkspaceIdentity,
+    deadline: Instant,
+) -> Result<(Store, Arc<baleyg::store::topology::LeaderSession>)> {
+    let store = cli_read_with_retry_until(deadline, || identity.verify(), || args.store())?;
+    identity.verify()?;
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let result = baleyg::index_coordinator::establish_serving_session(&store, None, &cancel);
+    identity.verify()?;
+    let session = match result {
+        Ok(session) => session,
+        Err(error) if baleyg::store::cli_read_retryable_contention(&error) => {
+            // This may be after COMMIT; return typed contention without rerunning it.
+            return Err(baleyg::store::cli_read_busy_expired());
+        }
+        Err(error) => return Err(error),
+    };
+    session.verify()?;
+    Ok((store, session))
+}
+
+// Identity/incarnation loss outranks even direct selected SQLite BUSY.
+fn terminal_status_retryable_after_guard(
+    error: &anyhow::Error,
+    verify: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    verify()?;
+    Ok(baleyg::store::terminal_status_sqlite_contention(error))
+}
+
 fn write_session_json(
     value: &impl Serialize,
     session: &Arc<baleyg::store::topology::LeaderSession>,
@@ -221,6 +317,24 @@ fn write_session_json(
 #[cfg(test)]
 mod session_output_tests {
     use super::*;
+    #[test]
+    fn terminal_busy_cannot_override_post_read_root_guard_loss() {
+        let busy: anyhow::Error = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )
+        .into();
+        let lost = terminal_status_retryable_after_guard(&busy, || {
+            anyhow::bail!("root_changed: original selected root replaced")
+        })
+        .unwrap_err();
+        assert_eq!(
+            lost.to_string(),
+            "root_changed: original selected root replaced"
+        );
+        assert!(terminal_status_retryable_after_guard(&busy, || Ok(())).unwrap());
+    }
+
     use baleyg::store::topology::{LeaderSession, TopologyRoots, WorkspaceIdentity};
     use std::io::Write;
 
@@ -339,6 +453,31 @@ async fn main() -> Result<()> {
             let diagnostics = std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
             let command_start = Instant::now();
             let (store, options, _) = args.resolve()?;
+            // Fixture-only owner barrier: unset for every normal CLI invocation.
+            #[cfg(unix)]
+            let fixture_socket = std::env::var_os("BALEYG_TEST_FINITE_CLI_FD")
+                .map(|fd| -> Result<_> {
+                    use std::os::fd::FromRawFd;
+                    use std::os::unix::net::UnixStream;
+                    use std::time::Duration;
+                    ensure!(
+                        fd.to_str() == Some("3"),
+                        "fixture index IPC descriptor invalid"
+                    );
+                    // Only the opt-in test process passes this Unix socket via dup2.
+                    let socket = unsafe { UnixStream::from_raw_fd(3) };
+                    socket.set_read_timeout(Some(Duration::from_secs(20)))?;
+                    socket.set_write_timeout(Some(Duration::from_secs(20)))?;
+                    Ok(Arc::new(std::sync::Mutex::new(socket)))
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            ensure!(
+                std::env::var_os("BALEYG_TEST_FINITE_CLI_FD").is_none(),
+                "fixture index IPC requires Unix"
+            );
+            let fixture_seen = Arc::new(AtomicBool::new(false));
+            let fixture_failed = Arc::new(AtomicBool::new(false));
             if diagnostics {
                 eprintln!(
                     "index-phase outside_setup_ms={:.3}",
@@ -353,8 +492,13 @@ async fn main() -> Result<()> {
                 flag.store(true, Ordering::Release);
             });
             let queue_start = Instant::now();
+            let fixture_seen_worker = fixture_seen.clone();
+            let fixture_failed_worker = fixture_failed.clone();
+            let fixture_cancel = cancel.clone();
+            #[cfg(unix)]
+            let fixture_socket_worker = fixture_socket.clone();
             let work = tokio::task::spawn_blocking(move || {
-                baleyg::index_coordinator::enqueue_and_wait_observed(
+                baleyg::index_coordinator::enqueue_and_wait_observed_with_request(
                     &worker_store,
                     &options,
                     &cancel,
@@ -369,6 +513,16 @@ async fn main() -> Result<()> {
                                 eprintln!("index-mode {mode}");
                             }
                         }
+                        #[cfg(unix)]
+                        if phase.phase == "timing:publish"
+                            && let Some(socket) = fixture_socket_worker.as_ref()
+                            && !fixture_seen_worker.swap(true, Ordering::AcqRel)
+                            && fixture_index_exchange(&mut socket.lock().unwrap(), b'P', b'G')
+                                .is_err()
+                        {
+                            fixture_failed_worker.store(true, Ordering::Release);
+                            fixture_cancel.store(true, Ordering::Release);
+                        }
                     },
                 )
             })
@@ -381,12 +535,73 @@ async fn main() -> Result<()> {
                 );
             }
             signal.abort();
-            let (revision, session) = work?;
+            ensure!(
+                !fixture_failed.load(Ordering::Acquire),
+                "fixture index IPC failed before FIFO claim"
+            );
+            let (own_request_id, revision, session) = work?;
+            #[cfg(unix)]
+            if let Some(socket) = fixture_socket {
+                ensure!(
+                    fixture_seen.load(Ordering::Acquire),
+                    "fixture index IPC missed first publication"
+                );
+                session.verify()?;
+                ensure!(session.is_leader(), "fixture owner lost leadership");
+                let mut socket = socket.lock().unwrap();
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(45)))?;
+                fixture_index_exchange(&mut socket, b'R', b'D')?;
+                session.verify()?;
+            }
+            if diagnostics {
+                eprintln!("index-phase coordinator_returned");
+            }
             if diagnostics && let Some(diagnostic) = store.last_writer_diagnostic() {
                 eprintln!("{diagnostic}");
             }
             let status_start = Instant::now();
-            let output = serde_json::json!({"publishedRevision":revision,"status":store.status()?});
+            let deadline = status_start + STATUS_RESULT_WAIT;
+            let mut backoff = Duration::from_millis(20);
+            let status = loop {
+                session.verify()?;
+                if diagnostics {
+                    eprintln!("index-phase terminal_status_attempt");
+                }
+                // A single selected snapshot binds our accepted pin to status.
+                let selected = (|| -> Result<_> {
+                    let response = store.evidence_response()?;
+                    let result = response
+                        .validate_pin(revision)
+                        .and_then(|_| response.status());
+                    match result {
+                        Ok(status) => response.finish(status),
+                        Err(error) => {
+                            // Even on failed selected reads, root and follower-marker
+                            // fences outrank SQLite contention and expiry.
+                            response.finish(())?;
+                            Err(error)
+                        }
+                    }
+                })();
+                match selected {
+                    Ok(status) => break status,
+                    Err(error) => {
+                        if !terminal_status_retryable_after_guard(&error, || session.verify())? {
+                            return Err(error);
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            anyhow::bail!(
+                                "storage_busy: request {} is durable and may already be complete; check job status",
+                                own_request_id
+                            );
+                        }
+                        tokio::time::sleep(backoff.min(remaining)).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
+                    }
+                }
+            };
+            let output = serde_json::json!({"publishedRevision":revision,"status":status});
             write_session_json(&output, &session, std::io::stdout().lock())?;
             if diagnostics {
                 eprintln!(
@@ -528,7 +743,14 @@ async fn main() -> Result<()> {
         }
         Command::Status(args) => {
             let (roots, identity) = args.resolve_unattached()?;
-            let status = baleyg::store::Store::status_existing_readonly(roots, identity)?;
+            let identity = identity.attach_existing_marker_readonly()?;
+            let status = cli_read_with_retry(
+                || identity.verify_readonly(),
+                || {
+                    let (_, fresh) = args.resolve_unattached()?;
+                    Store::status_existing_readonly(roots.clone(), fresh)
+                },
+            )?;
             use std::io::Write;
             let mut output = std::io::stdout().lock();
             serde_json::to_writer_pretty(&mut output, &status)?;
@@ -537,11 +759,17 @@ async fn main() -> Result<()> {
         }
         Command::Symbols(args) => {
             ensure!((1..=150).contains(&args.limit), "limit must be 1..150");
-            let store = args.workspace.store()?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let (revision, items) = store.symbols_at(&args.search, args.limit)?;
+            let (_, identity) = args.workspace.resolve()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let (revision, items) = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.symbols_at(&args.search, args.limit),
+            )?;
             write_session_json(
                 &serde_json::json!({"revision":revision,"items":items}),
                 &session,
@@ -558,13 +786,18 @@ async fn main() -> Result<()> {
                 exclude_paths: args.exclude_path,
             };
             query.validate()?;
-            let store = args.workspace.store()?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let view = store
-                .query_view(&query)?
-                .context("seed not found in current index")?;
+            let (_, identity) = args.workspace.resolve()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let view = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.query_view(&query),
+            )?
+            .context("seed not found in current index")?;
             write_session_json(&view, &session, std::io::stdout().lock())?;
         }
         Command::Export(args) => {
@@ -572,11 +805,17 @@ async fn main() -> Result<()> {
             if let Some(path) = args.output.as_ref() {
                 roots.validate_external(&identity, std::slice::from_ref(path))?;
             }
-            let store = Store::open(roots, identity.attach_marker()?)?;
-            let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let session =
-                baleyg::index_coordinator::establish_serving_session(&store, None, &cancel)?;
-            let graph = store.graph()?;
+            let identity = identity.attach_marker()?;
+            let deadline = Instant::now() + CLI_READ_WAIT;
+            let (store, session) = cli_read_admit(&args.workspace, &identity, deadline)?;
+            let graph = cli_read_with_retry_until(
+                deadline,
+                || {
+                    identity.verify()?;
+                    session.verify()
+                },
+                || store.graph(),
+            )?;
             if let Some(path) = args.output {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
