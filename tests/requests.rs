@@ -85,7 +85,13 @@ fn durable_fifo_and_incarnation_fence() {
     assert!(b.seq > a.seq);
     assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
     assert!(store.request_by_id(&a.id).unwrap().is_some());
-    let owner = store.leader_session().unwrap();
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     let first = store.claim_request(&owner).unwrap().unwrap();
     assert_eq!(first.id, a.id);
     assert_eq!(first.state, "running");
@@ -123,7 +129,15 @@ fn published_pin_before_completion_crash_child() {
     let proof = std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
-    let owner = store.leader_session().unwrap();
+    // The parent's committed H belongs to its old incarnation. This child
+    // must commit its own H before it may claim the durable running gap.
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     let claimed = store.claim_request(&owner).unwrap().unwrap();
     assert_eq!(claimed.state, "running");
     let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -508,7 +522,13 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
     let options = IndexOptions::new(root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
-    let owner = store.leader_session().unwrap();
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(store.claim_request(&owner).unwrap().unwrap().id, first.id);
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 2);
