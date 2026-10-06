@@ -295,10 +295,18 @@ async fn jobs_publish_and_cancel() {
     .await
     .unwrap();
     assert_eq!(completed["state"], "done");
-    assert_eq!(store.status().unwrap().revision.index_revision, 1);
+    assert_eq!(
+        store.status().unwrap().revision.index_revision,
+        2,
+        "mandatory H r1 precedes accepted Q r2 DONE"
+    );
     let (_, cancelled) = call(&app, "POST", &format!("/api/jobs/{id}/cancel"), Value::Null).await;
     assert_eq!(cancelled["state"], "done");
-    assert_eq!(store.status().unwrap().revision.index_revision, 1);
+    assert_eq!(
+        store.status().unwrap().revision.index_revision,
+        2,
+        "mandatory H r1 precedes accepted Q r2 DONE"
+    );
     state.cancel_active();
 }
 #[tokio::test]
@@ -429,7 +437,11 @@ async fn active_job_cancellation_does_not_publish() {
     .await
     .unwrap();
     assert_eq!(terminal["state"], "done");
-    assert_eq!(store.index_baseline().unwrap().index_revision, 1);
+    assert_eq!(
+        store.index_baseline().unwrap().index_revision,
+        2,
+        "accepted Q publishes its own r2 after mandatory H r1; cancellation does not add a revision"
+    );
 }
 
 #[tokio::test]
