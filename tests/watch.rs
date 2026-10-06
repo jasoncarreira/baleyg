@@ -41,6 +41,229 @@ fn leader_reconciles_edit_without_explicit_request() {
     pinned.finish(()).unwrap();
 }
 
+#[test]
+fn delayed_snapshot_does_not_publish_after_pre_cutoff_edit() {
+    use notify::{Event, EventKind, event::ModifyKind};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function original() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // Drain the initial full wake and establish a known selected baseline.
+    work.reconcile_due(&store, &owner, &options, &cancel, true)
+        .unwrap();
+    let prior = store.status().unwrap().revision;
+    fs::write(&source, "function first() {}\n").unwrap();
+    let admitted = std::cell::Cell::new(false);
+    let published = work
+        .reconcile_due_observed(&store, &owner, &options, &cancel, true, |capture, watch| {
+            assert!(capture.files.iter().any(|file| file.path == "a.js"));
+            admitted.set(true);
+            fs::write(&source, "function second() {}\n").unwrap();
+            watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(source.clone())));
+        })
+        .unwrap();
+    assert!(admitted.get());
+    assert!(
+        !published,
+        "a pre-cutoff hint must reject the delayed snapshot"
+    );
+    assert_eq!(store.status().unwrap().revision, prior);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.status().unwrap().revision == prior && Instant::now() < deadline {
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let final_pin = store.status().unwrap().revision;
+    assert!(final_pin.index_revision > prior.index_revision);
+    let (_, final_source) = store.source_at("a.js", Some(final_pin)).unwrap().unwrap();
+    assert_eq!(final_source.text, "function second() {}\n");
+}
+
+#[test]
+fn post_cutoff_hint_stays_pending_after_first_publication() {
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join("a.js");
+    fs::write(&source, "function first() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    let before = store.status().unwrap().revision;
+    fs::write(&source, "function middle() {}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    let accounted = work
+        .reconcile_due_with_cutoffs(
+            &store,
+            &owner,
+            &options,
+            &cancel,
+            true,
+            |_, _| {},
+            |watch| {
+                fs::write(&source, "function last() {}\n").unwrap();
+                watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                    DataChange::Content,
+                )))
+                .add_path(source.clone())));
+            },
+        )
+        .unwrap();
+    assert!(
+        !accounted,
+        "post-cutoff hint cannot be acknowledged with first capture"
+    );
+    let middle = store.status().unwrap().revision;
+    assert!(middle.index_revision > before.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(middle))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function middle() {}\n"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.status().unwrap().revision == middle && Instant::now() < deadline {
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let latest = store.status().unwrap().revision;
+    assert!(latest.index_revision > middle.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(latest))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function last() {}\n"
+    );
+}
+
+#[test]
+fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
+    use notify::{
+        Event, EventKind,
+        event::{CreateKind, ModifyKind, RemoveKind, RenameMode},
+    };
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let source = root.join("a.js");
+    let second = root.join("b.js");
+    let renamed = root.join("c.js");
+    let temporary = root.join("a.js.tmp");
+    fs::write(&source, "function start() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    // Each action happens while the prior immutable snapshot is delayed. The
+    // injected notify event takes the same bounded ingress as the real watcher.
+    for step in 0..5 {
+        let prior = store.status().unwrap().revision;
+        let admitted = work
+            .reconcile_due_observed(&store, &owner, &options, &cancel, true, |_, watch| {
+                let event = match step {
+                    0 => {
+                        fs::write(&source, "function edited() {}\n").unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Data(
+                            notify::event::DataChange::Content,
+                        )))
+                        .add_path(source.clone())
+                    }
+                    1 => {
+                        fs::write(&second, "function added() {}\n").unwrap();
+                        Event::new(EventKind::Create(CreateKind::File)).add_path(second.clone())
+                    }
+                    2 => {
+                        fs::rename(&second, &renamed).unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                            .add_path(second.clone())
+                            .add_path(renamed.clone())
+                    }
+                    3 => {
+                        fs::write(&temporary, "function atomic() {}\n").unwrap();
+                        fs::rename(&temporary, &source).unwrap();
+                        Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                            .add_path(temporary.clone())
+                            .add_path(source.clone())
+                    }
+                    _ => {
+                        fs::remove_file(&renamed).unwrap();
+                        Event::new(EventKind::Remove(RemoveKind::File)).add_path(renamed.clone())
+                    }
+                };
+                watch.submit_event(Ok(event));
+            })
+            .unwrap();
+        assert!(
+            !admitted,
+            "step {step}: delayed capture cannot account for a new hint"
+        );
+        assert_eq!(store.status().unwrap().revision, prior);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.status().unwrap().revision == prior && Instant::now() < deadline {
+            work.reconcile_due(&store, &owner, &options, &cancel, true)
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            store.status().unwrap().revision.index_revision > prior.index_revision,
+            "step {step}: changed workspace must publish"
+        );
+        let cold_state = tempfile::tempdir().unwrap();
+        let cold = Store::open_for_tests(cold_state.path(), root).unwrap();
+        let cold_job = index_coordinator::IndexJobCoordinator::prepare(&cold, None).unwrap();
+        let _cold_session = cold_job.session();
+        cold_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(
+            store.graph().unwrap(),
+            cold.graph().unwrap(),
+            "step {step}: selected graph differs from independent cold full"
+        );
+        let selected = store.evidence_response().unwrap();
+        let cold_read = cold.evidence_response().unwrap();
+        for path in ["a.js", "b.js", "c.js"] {
+            let selected_source = selected
+                .source_at(path, None)
+                .unwrap()
+                .map(|(_, source)| source.text);
+            let cold_source = cold_read
+                .source_at(path, None)
+                .unwrap()
+                .map(|(_, source)| source.text);
+            assert_eq!(
+                selected_source, cold_source,
+                "step {step}: {path} source differs"
+            );
+        }
+        selected.finish(()).unwrap();
+        cold_read.finish(()).unwrap();
+    }
+}
+
 fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::process::Command {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_baleyg"));
     child
