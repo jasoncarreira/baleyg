@@ -3319,3 +3319,87 @@ fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
     drop(work);
     drop(owner);
 }
+
+#[test]
+fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() {
+    let state = tempfile::tempdir().unwrap();
+    let roots = tempfile::tempdir().unwrap();
+    let root = roots.path().join("original");
+    let moved = roots.path().join("moved");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function before() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), &root).unwrap();
+    let options = IndexOptions::new(root.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let daemon = baleyg::http::new(
+        store.clone(),
+        options.clone(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    daemon.retain_serving_session(owner.clone());
+    daemon.force_retention_idle_tick_for_tests().unwrap();
+    assert_eq!(daemon.root_loss_retirement_for_tests(), (true, true, false));
+    let row = store.enqueue_request(&options, None).unwrap();
+    let request_path = request_db_under(state.path()).unwrap();
+    let blocker = rusqlite::Connection::open(&request_path).unwrap();
+    blocker.busy_timeout(Duration::ZERO).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    fs::rename(&root, &moved).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.js"), "function replacement() {}\n").unwrap();
+    assert!(
+        daemon.force_retention_idle_tick_for_tests().is_err(),
+        "held requests.db writer must block the root-loss terminal transition"
+    );
+    assert_eq!(
+        daemon.root_loss_retirement_for_tests(),
+        (false, false, true),
+        "old watcher and serving owner retire while EX is kept only for transition retry"
+    );
+    assert!(
+        store.status().is_err(),
+        "old root cannot serve selected evidence"
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    daemon.force_retention_idle_tick_for_tests().unwrap();
+    assert_eq!(
+        daemon.root_loss_retirement_for_tests(),
+        (false, false, false)
+    );
+    // The old Store intentionally rejects normal reads after root loss.
+    // Inspect the durable queue row directly without claiming it or serving it.
+    let (request_state, error, incarnation): (String, Option<String>, Option<String>) = blocker
+        .query_row(
+            "SELECT state,error_code,claim_incarnation FROM requests WHERE id=?1",
+            [&row.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(request_state, "failed");
+    assert_eq!(error.as_deref(), Some("root_changed"));
+    assert_eq!(
+        incarnation.as_deref(),
+        Some(owner.incarnation().to_string().as_str())
+    );
+    let relocated = Store::open_for_tests(state.path(), &moved).unwrap();
+    let next_options = IndexOptions::new(moved);
+    let next =
+        index_coordinator::establish_serving_session(&relocated, Some(&next_options), &cancel)
+            .unwrap();
+    assert!(next.is_leader());
+    assert_ne!(relocated.root_id(), store.root_id());
+    let pin = relocated.status().unwrap().revision;
+    assert_eq!(
+        relocated
+            .source_at("a.js", Some(pin))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function before() {}\n"
+    );
+}

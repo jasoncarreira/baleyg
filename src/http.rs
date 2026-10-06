@@ -122,6 +122,8 @@ impl DependencyIndex {
 pub struct DaemonState {
     store: Store,
     serving_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
+    // Old-root transition authority only: never used by readers or native work.
+    root_loss_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
     options: IndexOptions,
     browser: crate::file_tree::SourceDir,
     rust_sources: Vec<crate::rust_sources::Root>,
@@ -266,6 +268,7 @@ pub fn new_with_dependency_options(
     Ok(Arc::new(DaemonState {
         store,
         serving_session: Mutex::new(None),
+        root_loss_session: Mutex::new(None),
         options: index_options,
         browser: crate::file_tree::SourceDir::open(&browse_root)?,
         rust_sources: crate::rust_sources::open_roots(source_roots)?,
@@ -385,6 +388,16 @@ impl DaemonState {
         self.queue_tick()
     }
 
+    /// Inspect the three mutually exclusive roles at a root-loss tick boundary.
+    #[doc(hidden)]
+    pub fn root_loss_retirement_for_tests(&self) -> (bool, bool, bool) {
+        (
+            self.serving_session.lock().unwrap().is_some(),
+            self.leader_work.lock().unwrap().is_some(),
+            self.root_loss_session.lock().unwrap().is_some(),
+        )
+    }
+
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
         #[cfg(test)]
         self.test_queue_before_stream.run();
@@ -396,13 +409,18 @@ impl DaemonState {
         // leader session; the moved spelling opens independently.
         if self.store.root_path_replaced()? {
             let retained = self.serving_session.lock().unwrap().clone();
-            let transition = retained
-                .as_ref()
-                .filter(|session| session.is_leader())
-                .map(|session| self.store.fail_changed_root_requests(session))
-                .transpose();
+            if let Some(session) = retained.filter(|session| session.is_leader()) {
+                *self.root_loss_session.lock().unwrap() = Some(session);
+            }
+            // Drop the watcher and serving owner before a possibly blocked
+            // requests.db write. Keep only the verified old-root EX authority
+            // for the idempotent queued/running -> root_changed transition.
             self.replace_serving_session(None);
-            transition?;
+            let authority = self.root_loss_session.lock().unwrap().clone();
+            if let Some(session) = authority {
+                self.store.fail_changed_root_requests(&session)?;
+                *self.root_loss_session.lock().unwrap() = None;
+            }
             return Ok(());
         }
         // A real exceptional storage error must not recapture/log every 20 ms.
