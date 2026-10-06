@@ -9,6 +9,12 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
 
+struct PublicationAdmission<C> {
+    capture: Option<Capture>,
+    unchanged_fast: bool,
+    cutoff: C,
+}
+
 pub struct IndexJobCoordinator {
     store: Store,
     expected: RecoveryBaseline,
@@ -117,10 +123,12 @@ impl IndexJobCoordinator {
             cancel,
             progress,
             observe,
-            false,
             |_, _| {},
-            None,
-            || Ok(()),
+            PublicationAdmission {
+                capture: None,
+                unchanged_fast: false,
+                cutoff: || Ok(()),
+            },
         )
     }
 
@@ -137,10 +145,12 @@ impl IndexJobCoordinator {
             cancel,
             progress,
             |_| {},
-            true,
             |_, _| {},
-            None,
-            || Ok(()),
+            PublicationAdmission {
+                capture: None,
+                unchanged_fast: true,
+                cutoff: || Ok(()),
+            },
         )
     }
 
@@ -158,10 +168,12 @@ impl IndexJobCoordinator {
             cancel,
             |_| {},
             |_| {},
-            false,
             |_, _| {},
-            Some(capture),
-            cutoff,
+            PublicationAdmission {
+                capture: Some(capture),
+                unchanged_fast: false,
+                cutoff,
+            },
         )
     }
 
@@ -171,14 +183,17 @@ impl IndexJobCoordinator {
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
         observe: impl FnOnce(&Capture),
-        unchanged_fast: bool,
         native_observe: impl Fn(
             &crate::native_evidence::DocumentKey,
             crate::native_evidence::FullNativeStage,
         ),
-        admitted: Option<Capture>,
-        mut cutoff: impl FnMut() -> Result<()>,
+        admission: PublicationAdmission<impl FnMut() -> Result<()>>,
     ) -> Result<IndexPin> {
+        let PublicationAdmission {
+            capture: admitted,
+            unchanged_fast,
+            mut cutoff,
+        } = admission;
         ensure!(!cancel.load(Ordering::Acquire), "index cancelled");
         let mut phase_start = std::time::Instant::now();
         let report = |name: &str, elapsed: std::time::Duration| {
@@ -374,7 +389,7 @@ impl LeaderWork {
         force: bool,
         observe: impl FnOnce(&Capture, &crate::watch::WatchSignals),
     ) -> Result<bool> {
-        self.reconcile_due_with_cutoffs(store, session, options, cancel, force, observe, |_| {})
+        self.reconcile_due_with_cutoffs(store, session, options, cancel, force, (observe, |_| {}))
     }
 
     /// Test seam for a hint delivered after the publication cutoff but before
@@ -386,9 +401,12 @@ impl LeaderWork {
         options: &IndexOptions,
         cancel: &CancelFlag,
         force: bool,
-        observe: impl FnOnce(&Capture, &crate::watch::WatchSignals),
-        after_cutoff: impl FnOnce(&crate::watch::WatchSignals),
+        cutoffs: (
+            impl FnOnce(&Capture, &crate::watch::WatchSignals),
+            impl FnOnce(&crate::watch::WatchSignals),
+        ),
     ) -> Result<bool> {
+        let (observe, after_cutoff) = cutoffs;
         store.verify_leader_session(session)?;
         // The takeover FIFO head may have different selected inputs from this
         // daemon's defaults. Keep its watcher until a new watcher has registered
@@ -617,10 +635,12 @@ fn drain_requests_observed_with_cancel(
                 cancel,
                 |p| progress(&request.id, p),
                 |_| {},
-                true,
                 |key, stage| native_observe(&request.id, key, stage),
-                None,
-                || Ok(()),
+                PublicationAdmission {
+                    capture: None,
+                    unchanged_fast: true,
+                    cutoff: || Ok(()),
+                },
             )
         })();
         #[cfg(test)]
