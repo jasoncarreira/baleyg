@@ -21,6 +21,8 @@ Agent clients start a stdio MCP server per session, and subagents share their pa
   - "Never daemonizes" applies to the client. The daemon is a separate process the client may start.
 - **CLI commands** use the daemon when it's running. Without it, they keep working standalone under the existing per-checkout leader lock.
 - **The browser** is served by the daemon on one loopback port with the existing token auth.
+  - The page lists the checkouts the daemon knows: active ones, plus any with an existing index.
+  - Every browser API request names its checkout, for example in the URL path. There is no implicit default when more than one exists.
 
 ### 2. Per-call workspace selection (amends #24)
 
@@ -28,16 +30,19 @@ Agent clients start a stdio MCP server per session, and subagents share their pa
 - An evidence tool call may **explicitly** select another workspace, but only a **worktree of the same repository** as the launch workspace (the same git common directory).
 - **Verification:** the daemon verifies the selected path's root identity under the #23 rules before answering. It never falls back to another worktree. A path outside the repository, or one it can't verify, is refused with a typed error.
 - **Attribution:** every result reports which workspace answered.
+- **Attachment:** the first explicit selection of a worktree attaches it to the client's session, and it stays attached while that client is connected. A session may have several worktrees attached.
 - **Contract change:** this replaces #24's rule that "no tool argument selects another workspace". Evidence from two worktrees still never mixes in one result, and nothing is selected implicitly. #107 adds the optional workspace field to the tools' closed input schemas, and the matching result field, with tests. #17's criteria are updated to match.
 
 ### 3. Idle timeouts
 
 Both are policy constants, to be tuned later without a format change.
 - **Checkout release: 15 minutes** after the last client attached to that checkout disconnects, and only with no queued or in-flight work for it.
+  - A checkout's clients are the sessions that launched in it or explicitly selected it (§2).
+  - An open browser counts as a client of its selected checkout while it is **active**, meaning it made a request within the last 15 minutes.
   - While any client is attached, the checkout's watcher keeps running, so evidence stays live for open sessions.
   - On release, the daemon closes the watcher and connections, and releases the leader lock and the retained SQLite check handles (see #16).
   - The next client re-attaches it with a catch-up scan and publication.
-- **Daemon exit: 30 minutes** after the last client of any checkout disconnects, and only with no queued or in-flight work anywhere.
+- **Daemon exit: 30 minutes** after the last client of any checkout disconnects, counting active browsers as above, and only with no queued or in-flight work anywhere.
 
 ## Consequences
 
