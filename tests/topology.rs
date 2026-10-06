@@ -3140,6 +3140,17 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
             "{case}"
         );
         assert!(roots.index_dir(&id).exists(), "{case} must not be deleted");
+        if *case == "unsafe_mode" {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&index).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+            fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+            held_locks.push(
+                UseGuard::acquire_existing(&roots.index_use_lock(&id), false, false).unwrap(),
+            );
+        }
     }
 }
 
