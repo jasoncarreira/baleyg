@@ -73,6 +73,12 @@ impl IndexJobCoordinator {
             // than turning a committed pin into an ambiguous failed request.
             eprintln!("revision maintenance deferred: {error:#}");
         }
+        if let Ok(leader) = self.session.leader_guard()
+            && let Err(error) = self.store.automatic_gc(leader)
+        {
+            // GC is independent of the committed publication and its ACK.
+            eprintln!("derived GC attempt deferred: {error:#}");
+        }
     }
 
     /// A diagnostic decision for two immutable admissions. Publication classifies

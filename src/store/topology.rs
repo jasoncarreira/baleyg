@@ -2041,6 +2041,163 @@ fn inspect_index_with_open_hook(
     }
 }
 
+/// Fault stages are exposed only to deterministic storage integration fixtures.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcStage {
+    BeforeStampRename,
+    BeforeCandidateUnlink,
+    AfterFirstDbUnlink,
+    AfterParentSync,
+}
+
+/// Only the exact current derived layout can reach the unlink boundary.
+/// Validation failures skip the candidate. An unlink/sync failure is returned
+/// as an error, including when an earlier derived file was already removed.
+fn gc_remove_candidate(
+    dir: &Path,
+    key: &str,
+    now: i64,
+    guard: UseGuard,
+    current: &WorkspaceIdentity,
+    leader: &LeaderGuard,
+    hook: &mut dyn FnMut(GcStage) -> Result<()>,
+) -> Result<bool> {
+    let admit = (|| -> Result<Vec<(PathBuf, (u64, u64))>> {
+        guard.verify_exclusive_path(&dir.with_extension("lock"))?;
+        private_dir(dir)?;
+        let mut names = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF8 GC entry"))?;
+            ensure!(
+                matches!(name.as_str(), "index.db" | "requests.db" | "leader.lock"),
+                "unknown derived index entry"
+            );
+            names.push(name);
+        }
+        ensure!(
+            names.iter().any(|n| n == "index.db") && names.iter().any(|n| n == "leader.lock"),
+            "incomplete GC index"
+        );
+        let leader = open_file_readonly(&dir.join("leader.lock"))?;
+        read_incarnation(&leader)?;
+        let mut index = readonly_index_db(&dir.join("index.db"))?;
+        let tx = index.transaction()?;
+        super::validate_cache_shape(&tx)?;
+        super::validate_supersessions(&tx)?;
+        let (generation, revision, stats, diagnostics): (String, i64, String, String) = tx.query_row(
+            "SELECT index_generation,index_revision,stats,diagnostics FROM index_metadata WHERE singleton=1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let uuid = Uuid::parse_str(&generation)?;
+        ensure!(
+            !uuid.is_nil() && uuid.to_string() == generation && revision >= 0,
+            "GC metadata generation or revision unknown"
+        );
+        serde_json::from_str::<serde_json::Value>(&stats)?;
+        serde_json::from_str::<serde_json::Value>(&diagnostics)?;
+        let age: rusqlite::types::Value = tx.query_row(
+            "SELECT last_opened_at FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            matches!(age, rusqlite::types::Value::Integer(value) if value > 0 && value <= now),
+            "GC timestamp unknown or in future"
+        );
+        drop(tx);
+        drop(index);
+        // This inspection is fresh under EX; the historical report shape never
+        // confers deletion authority even when its status is `eligible`.
+        ensure!(
+            inspect_index(dir, key, now)?.0 == "eligible",
+            "GC index is live or unknown"
+        );
+        if names.iter().any(|n| n == "requests.db") {
+            let mut queue = readonly_index_db(&dir.join("requests.db"))?;
+            let tx = queue.transaction()?;
+            let index = readonly_index_db(&dir.join("index.db"))?;
+            let spelling: String = index.query_row(
+                "SELECT root_spelling FROM index_metadata WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            super::requests::validate_gc_queue(&tx, &spelling, key)?;
+            drop(index);
+            drop(tx);
+            drop(queue);
+        }
+        let mut dbs = Vec::new();
+        for name in ["index.db", "requests.db"] {
+            if !names.iter().any(|n| n == name) {
+                continue;
+            }
+            let path = dir.join(name);
+            let file = open_file_readonly(&path)?;
+            let meta = file.metadata()?;
+            dbs.push((path, (meta.dev(), meta.ino())));
+        }
+        private_file(&dir.join("leader.lock"), &leader)?;
+        guard.verify()?;
+        Ok(dbs)
+    })();
+    let Ok(dbs) = admit else { return Ok(false) };
+    // Recheck the *entire* directory inventory after SQLite closes, before the
+    // first unlink. A new hot journal or unknown entry is always a skip.
+    let actual = (|| -> Result<Vec<String>> {
+        private_dir(dir)?;
+        let mut names = fs::read_dir(dir)?
+            .map(|entry| {
+                entry?
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF8 GC entry"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    })();
+    let Ok(actual) = actual else { return Ok(false) };
+    let mut expected = vec!["index.db".to_owned(), "leader.lock".to_owned()];
+    if dbs.len() == 2 {
+        expected.push("requests.db".to_owned());
+    }
+    expected.sort();
+    if actual != expected {
+        return Ok(false);
+    }
+    guard.verify()?;
+    hook(GcStage::BeforeCandidateUnlink)?;
+    current.verify()?;
+    leader.verify()?;
+    guard.verify()?;
+    if !super::gc_unlink_sqlite(&dbs, &guard, current, leader, &mut || {
+        hook(GcStage::AfterFirstDbUnlink)
+    })? {
+        return Ok(false);
+    }
+    // Past this boundary every I/O or authority failure is reported; never
+    // claim a skip after even one derived inode has been removed.
+    current.verify()?;
+    leader.verify()?;
+    fs::remove_file(dir.join("leader.lock"))?;
+    sync_directory(dir)?;
+    current.verify()?;
+    leader.verify()?;
+    fs::remove_dir(dir)?;
+    sync_directory(dir.parent().context("GC parent missing")?)?;
+    hook(GcStage::AfterParentSync)?;
+    current.verify()?;
+    leader.verify()?;
+    // Lock path is the final name removed, after the directory is gone.
+    guard.remove_last()?;
+    Ok(true)
+}
+
 fn ensure_safe_record_contents(dir: &Path) -> Result<()> {
     private_dir(dir)?;
     let mut count = 0;
@@ -2193,6 +2350,130 @@ impl TopologyRoots {
         sync_directory(&parent)?;
         guard.remove_last()?;
         Ok(true)
+    }
+    /// The advisory report is never a deletion permit. A verified leader records
+    /// its bounded daily attempt before opening any candidate. Every candidate
+    /// gets its own nonblocking EX and an independent current-schema inspection.
+    pub fn automatic_gc_at(
+        &self,
+        current: &WorkspaceIdentity,
+        leader: &LeaderGuard,
+        now_secs: i64,
+    ) -> Result<usize> {
+        self.automatic_gc_at_with_hook(current, leader, now_secs, &mut |_| Ok(()))
+    }
+
+    #[doc(hidden)]
+    pub fn automatic_gc_at_with_hook(
+        &self,
+        current: &WorkspaceIdentity,
+        leader: &LeaderGuard,
+        now_secs: i64,
+        hook: &mut dyn FnMut(GcStage) -> Result<()>,
+    ) -> Result<usize> {
+        current.verify()?;
+        leader.verify()?;
+        ensure!(
+            leader.use_guard.path == self.index_use_lock(current)
+                && leader.path == self.leader_lock(current),
+            "unsafe_index: foreign GC leader"
+        );
+        ensure!(
+            now_secs > 0 && now_secs <= MAX_TRUSTED_SECONDS,
+            "invalid GC clock"
+        );
+        private_dir(&self.cache)?;
+        let schedule = UseGuard::acquire(&self.cache.join("gc-schedule.lock"), true, true)?;
+        let stamp = self.cache.join("gc-last-run");
+        let prior = match fs::symlink_metadata(&stamp) {
+            Ok(_) => Some(open_file_readonly(&stamp)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(prior) = &prior {
+            let mut bytes = Vec::new();
+            prior.take(32).read_to_end(&mut bytes)?;
+            ensure!(!bytes.is_empty(), "invalid GC stamp: empty existing marker");
+            let text = std::str::from_utf8(&bytes)?;
+            let last: i64 = text
+                .strip_suffix('\n')
+                .context("invalid GC stamp")?
+                .parse()?;
+            ensure!(
+                last > 0 && last <= now_secs,
+                "invalid GC stamp or clock rollback"
+            );
+            if now_secs - last < 24 * 60 * 60 {
+                return Ok(0);
+            }
+        }
+        // Never truncate the old attempt. A crash before rename leaves its
+        // original inode and 24-hour fence intact; a crash after rename sees
+        // either the old or the fsynced new stamp.
+        let stage = self
+            .cache
+            .join(format!("gc-last-run.tmp-{}", Uuid::new_v4()));
+        let stage_result = (|| -> Result<()> {
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&stage)?;
+            private_file(&stage, &staged)?;
+            staged.write_all(format!("{now_secs}\n").as_bytes())?;
+            staged.sync_all()?;
+            schedule.verify()?;
+            current.verify()?;
+            leader.verify()?;
+            hook(GcStage::BeforeStampRename)?;
+            match &prior {
+                Some(prior) => private_file(&stamp, prior)?,
+                None => ensure!(
+                    fs::symlink_metadata(&stamp)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                    "GC stamp appeared after admission"
+                ),
+            }
+            fs::rename(&stage, &stamp)?;
+            sync_directory(&self.cache)?;
+            Ok(())
+        })();
+        if stage_result.is_err()
+            && let Ok(stage_file) = open_file_readonly(&stage)
+        {
+            drop(stage_file);
+            let _ = fs::remove_file(&stage);
+            let _ = sync_directory(&self.cache);
+        }
+        stage_result?;
+        schedule.verify()?;
+        let Some(parent) = managed_existing(&self.cache, "indexes")? else {
+            return Ok(0);
+        };
+        let mut removed = 0;
+        for entry in fs::read_dir(&parent)? {
+            leader.verify()?;
+            current.verify()?;
+            let entry = entry?;
+            let Ok(key) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !lower_hex(&key, 64) || key == current.root_key {
+                continue;
+            }
+            let path = entry.path();
+            let guard =
+                match UseGuard::acquire_existing(&parent.join(format!("{key}.lock")), true, true) {
+                    Ok(guard) => guard,
+                    Err(_) => continue,
+                };
+            // Refuse unknown and unsafe entries without creating or recovering files.
+            if gc_remove_candidate(&path, &key, now_secs, guard, current, leader, hook)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
     pub fn gc_report(&self) -> Result<GcReport> {
         let now_secs = std::time::SystemTime::now()
@@ -2503,11 +2784,41 @@ mod gc_schema_race_tests {
                 "gc --report wrote v{version} index"
             );
             assert!(path.exists(), "gc --report deleted v{version} index");
+            let other = tempfile::tempdir().unwrap();
+            drop(crate::store::Store::open_for_tests(state.path(), other.path()).unwrap());
+            let current = WorkspaceIdentity::discover(Some(other.path()), other.path()).unwrap();
+            let leader = roots.leader(&current).unwrap();
+            let held =
+                UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true).unwrap();
+            assert!(
+                !gc_remove_candidate(
+                    &dir,
+                    &identity.root_key,
+                    now,
+                    held,
+                    &current,
+                    &leader,
+                    &mut |_| Ok(())
+                )
+                .unwrap(),
+                "report-only v{version}/{marker} shape must never authorize deletion"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let candidate_status = || {
+                roots
+                    .gc_report_at(now)
+                    .unwrap()
+                    .derived
+                    .into_iter()
+                    .find(|entry| entry.root_key == identity.root_key)
+                    .unwrap()
+                    .status
+            };
             if version == 4 {
                 let held = UseGuard::acquire_existing(&roots.index_use_lock(&identity), true, true)
                     .unwrap();
                 assert_ne!(
-                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    candidate_status(),
                     "eligible",
                     "active lock must not yield cleanup eligibility"
                 );
@@ -2515,7 +2826,7 @@ mod gc_schema_race_tests {
                 let journal = path.with_file_name("index.db-journal");
                 fs::write(&journal, b"hot-journal-sentinel").unwrap();
                 assert_eq!(
-                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    candidate_status(),
                     "unknown",
                     "journal must not yield cleanup eligibility"
                 );
@@ -2526,7 +2837,7 @@ mod gc_schema_race_tests {
                     .unwrap();
                 drop(db);
                 assert_eq!(
-                    roots.gc_report_at(now).unwrap().derived[0].status,
+                    candidate_status(),
                     "unknown",
                     "spoofed extra object must not match old schema"
                 );
@@ -2546,10 +2857,7 @@ mod gc_schema_race_tests {
                 .unwrap();
             drop(db);
             assert!(inspect_index(&dir, &identity.root_key, now).is_err());
-            assert_eq!(
-                roots.gc_report_at(now).unwrap().derived[0].status,
-                "unknown"
-            );
+            assert_eq!(candidate_status(), "unknown");
         }
     }
 
@@ -2684,5 +2992,90 @@ mod gc_schema_race_tests {
                 .root_path_replaced_from(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod gc_final_witness_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_and_live_sqlite_witnesses_skip_at_final_unlink_without_close() {
+        let state = tempfile::tempdir().unwrap();
+        let current_root = tempfile::tempdir().unwrap();
+        let candidate_root = tempfile::tempdir().unwrap();
+        let roots = TopologyRoots::isolated_for_tests(
+            state.path().join("cache"),
+            state.path().join("data"),
+        );
+        let current =
+            WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
+        let candidate =
+            WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path())
+                .unwrap();
+        drop(crate::store::Store::open_for_tests(state.path(), current_root.path()).unwrap());
+        drop(crate::store::Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
+        drop(roots.leader(&candidate).unwrap());
+        let leader = roots.leader(&current).unwrap();
+        let now = 1_800_000_000_i64;
+        let path = roots.index_db(&candidate);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE index_metadata SET last_opened_at=?1",
+                [now - 31 * 24 * 60 * 60],
+            )
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut borrowed = None;
+        let mut hit = 0;
+        let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+            if stage == GcStage::BeforeCandidateUnlink {
+                hit += 1;
+                borrowed = Some(crate::store::retained_sqlite_file(
+                    &path, false, false, false,
+                )?);
+            }
+            Ok(())
+        });
+        assert_eq!(hit, 1);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "borrowed witness must skip, not fail or delete"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(borrowed.as_ref().unwrap().metadata().unwrap().nlink() == 1);
+        drop(borrowed);
+
+        let mut live = None;
+        let mut hit = 0;
+        let result =
+            roots.automatic_gc_at_with_hook(&current, &leader, now + 86_400, &mut |stage| {
+                if stage == GcStage::BeforeCandidateUnlink {
+                    hit += 1;
+                    live = Some(crate::store::protected_sqlite_open(
+                        &path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )?);
+                }
+                Ok(())
+            });
+        assert_eq!(hit, 1);
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "live SQLite connection must skip, not delete"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let db = live.as_ref().unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        drop(live);
+        assert!(roots.index_use_lock(&candidate).exists());
     }
 }

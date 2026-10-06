@@ -18,6 +18,42 @@ use uuid::Uuid;
 
 const SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=1";
 
+/// GC must not turn the queue's version pragma into permission to unlink an
+/// unknown schema. Compare every object, including SQLite-generated indexes.
+pub(crate) fn validate_gc_queue(db: &Connection, spelling: &str, key: &str) -> Result<()> {
+    type SchemaObject = (String, String, String, Option<String>);
+    fn objects(db: &Connection) -> Result<Vec<SchemaObject>> {
+        Ok(db
+            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    ensure!(
+        objects(db)? == objects(&expected)?,
+        "incompatible_queue: unknown GC schema"
+    );
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    ensure!(version == 1, "incompatible_queue: GC schema version");
+    let count: i64 = db.query_row("SELECT count(*) FROM queue_identity", [], |row| row.get(0))?;
+    ensure!(count == 1, "incompatible_queue: GC identity cardinality");
+    let identity: (String, String) = db.query_row(
+        "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        identity == (spelling.to_owned(), key.to_owned()),
+        "incompatible_queue: GC identity"
+    );
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    ensure!(integrity == "ok", "incompatible_queue: GC integrity");
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {

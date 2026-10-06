@@ -156,6 +156,7 @@ pub struct DaemonState {
     recovery_retry_after: Mutex<Option<Instant>>,
     empty_takeover_retry: AtomicBool,
     retention_last_run: Mutex<Instant>,
+    gc_last_check: Mutex<Instant>,
     #[cfg(test)]
     test_queue_before_stream: crate::store::TestOneShotHook,
     #[cfg(test)]
@@ -310,6 +311,7 @@ pub fn new_with_dependency_options(
         recovery_retry_after: Mutex::new(None),
         empty_takeover_retry: AtomicBool::new(false),
         retention_last_run: Mutex::new(Instant::now()),
+        gc_last_check: Mutex::new(Instant::now() - Duration::from_secs(3600)),
         #[cfg(test)]
         test_queue_before_stream: crate::store::TestOneShotHook::default(),
         #[cfg(test)]
@@ -575,6 +577,12 @@ impl DaemonState {
             if self.retention_last_run.lock().unwrap().elapsed() >= Duration::from_secs(60) {
                 self.store.maintain_revisions(session.leader_guard()?)?;
                 *self.retention_last_run.lock().unwrap() = Instant::now();
+            }
+            if self.gc_last_check.lock().unwrap().elapsed() >= Duration::from_secs(3600) {
+                *self.gc_last_check.lock().unwrap() = Instant::now();
+                if let Err(error) = self.store.automatic_gc(session.leader_guard()?) {
+                    eprintln!("derived GC attempt failed: {error:#}");
+                }
             }
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();

@@ -202,3 +202,196 @@ fn corrupt_index_recreation_preserves_queue_and_replaces_only_index_inode() {
         String::from_utf8_lossy(&outcome.stderr)
     );
 }
+
+#[test]
+fn gc_releases_only_deleted_candidate_witnesses_child() {
+    if std::env::var_os("BALEYG_GC_WITNESS_CHILD").is_none() {
+        return;
+    }
+    use baleyg::{
+        index_coordinator::reconcile_workspace,
+        store::{
+            retained_sqlite_witness_count_for_tests,
+            topology::{TopologyRoots, WorkspaceIdentity},
+        },
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let old = tempfile::tempdir().unwrap();
+    let current = tempfile::tempdir().unwrap();
+    std::fs::write(
+        old.path().join("a.js"),
+        "function a() {}
+",
+    )
+    .unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let old_id = WorkspaceIdentity::discover(Some(old.path()), old.path()).unwrap();
+    let original = Store::open_for_tests(state.path(), old.path()).unwrap();
+    let queue = original
+        .enqueue_request(&IndexOptions::new(old.path().to_owned()), None)
+        .unwrap();
+    let (pin, old_leader) = reconcile_workspace(
+        &original,
+        &IndexOptions::new(old.path().to_owned()),
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    assert!(roots.requests_db(&old_id).exists());
+    drop(old_leader);
+    drop(original);
+    let live = Store::open_for_tests(state.path(), current.path()).unwrap();
+    let live_id = WorkspaceIdentity::discover(Some(current.path()), current.path()).unwrap();
+    let leader = roots.leader(&live_id).unwrap();
+    let before = retained_sqlite_witness_count_for_tests();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 86_400;
+    Connection::open(roots.index_db(&old_id))
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    assert_eq!(live.automatic_gc_at(&leader, now).unwrap(), 1);
+    assert_eq!(
+        retained_sqlite_witness_count_for_tests(),
+        before - 2,
+        "both deleted SQLite inodes must release their retained handles"
+    );
+    assert!(roots.index_db(&live_id).exists());
+    assert!(!roots.index_dir(&old_id).exists());
+    assert!(!roots.index_use_lock(&old_id).exists());
+    assert_eq!(queue.state, "queued");
+    let replacement = Store::open_for_tests(state.path(), old.path()).unwrap();
+    assert_ne!(
+        replacement.index_baseline().unwrap().index_generation,
+        pin.index_generation
+    );
+    assert!(
+        replacement.saved_views_at(Some(pin)).is_err(),
+        "old generation pins cannot reopen"
+    );
+}
+
+#[test]
+fn gc_releases_only_deleted_candidate_witnesses() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "gc_releases_only_deleted_candidate_witnesses_child",
+            "--nocapture",
+        ])
+        .env("BALEYG_GC_WITNESS_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
+    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    let state = tempfile::tempdir().unwrap();
+    let current_root = tempfile::tempdir().unwrap();
+    let candidate_root = tempfile::tempdir().unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let current =
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
+    let candidate =
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
+    let store = Store::open_for_tests(state.path(), candidate_root.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(candidate_root.path().to_owned()), None)
+        .unwrap();
+    drop(store);
+    drop(roots.leader(&candidate).unwrap());
+    let leader = roots.leader(&current).unwrap();
+    let now = 1_800_000_000_i64;
+    let index = roots.index_db(&candidate);
+    Connection::open(&index)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let requests = roots.requests_db(&candidate);
+    let queue_before = std::fs::read(&requests).unwrap();
+    let mut hit = 0;
+    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+        if stage == GcStage::AfterFirstDbUnlink {
+            hit += 1;
+            assert!(!index.exists(), "first derived unlink must have happened");
+            anyhow::bail!("injected failure after first derived unlink");
+        }
+        Ok(())
+    });
+    assert_eq!(hit, 1);
+    assert!(
+        result.is_err(),
+        "partial deletion must not count as GC success"
+    );
+    assert!(!index.exists());
+    assert_eq!(std::fs::read(&requests).unwrap(), queue_before);
+    assert!(roots.index_dir(&candidate).join("leader.lock").exists());
+    assert!(roots.index_use_lock(&candidate).exists());
+    assert!(roots.index_dir(&current).exists());
+}
+
+#[test]
+fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
+    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    let state = tempfile::tempdir().unwrap();
+    let current_root = tempfile::tempdir().unwrap();
+    let candidate_root = tempfile::tempdir().unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(state.path().join("cache"), state.path().join("data"));
+    let current =
+        WorkspaceIdentity::discover(Some(current_root.path()), current_root.path()).unwrap();
+    let candidate =
+        WorkspaceIdentity::discover(Some(candidate_root.path()), candidate_root.path()).unwrap();
+    drop(Store::open_for_tests(state.path(), current_root.path()).unwrap());
+    drop(Store::open_for_tests(state.path(), candidate_root.path()).unwrap());
+    drop(roots.leader(&candidate).unwrap());
+    let leader = roots.leader(&current).unwrap();
+    let now = 1_800_000_000_i64;
+    Connection::open(roots.index_db(&candidate))
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 24 * 60 * 60],
+        )
+        .unwrap();
+    let mut hit = 0;
+    let result = roots.automatic_gc_at_with_hook(&current, &leader, now, &mut |stage| {
+        if stage == GcStage::AfterParentSync {
+            hit += 1;
+            assert!(!roots.index_dir(&candidate).exists());
+            assert!(roots.index_use_lock(&candidate).exists());
+            anyhow::bail!("injected failure after parent sync");
+        }
+        Ok(())
+    });
+    assert_eq!(hit, 1);
+    assert!(
+        result.is_err(),
+        "post-sync failure must not claim successful GC"
+    );
+    assert!(!roots.index_dir(&candidate).exists());
+    assert!(
+        roots.index_use_lock(&candidate).exists(),
+        "beside-directory use lock is always last"
+    );
+}
