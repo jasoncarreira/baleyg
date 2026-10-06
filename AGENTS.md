@@ -50,11 +50,6 @@ Races between Baleyg's own processes are in scope as ordinary faults. Fix them a
   A failure inside a loop is a defect to report with its log, not something to retry until it passes.
 - **Before submitting,** run `./tools/verify` and `cargo fmt --all -- --check`. Run `cargo clippy --locked --all-targets -- -D warnings` on the CI toolchain (currently Rust 1.99).
 
-## Working style
-
-- Iterate freely within your scope: edit, build, test and debug without per-step approvals.
-- Escalate only real scope, contract or owner decisions, or work that needs files outside your assigned scope.
-
 ## Where decisions live
 
 Owner rulings and contracts live in:
