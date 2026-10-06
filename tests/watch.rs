@@ -530,32 +530,39 @@ impl Drop for Server {
     }
 }
 
-#[test]
-fn killed_leader_reconciles_lost_edits_before_serving() {
-    use std::os::unix::fs::PermissionsExt;
+#[tokio::test]
+async fn killed_leader_reconciles_lost_edits_before_serving() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     let home = temp.path().join("home");
     fs::create_dir(&root).unwrap();
     fs::create_dir(&home).unwrap();
     fs::write(root.join("a.js"), "function before() {}\n").unwrap();
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let token = home.join("token");
-    fs::write(
-        &token,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    )
-    .unwrap();
+    fs::write(&token, TOKEN).unwrap();
     fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
+    let first_log = temp.path().join("first-stderr.log");
+    let first_stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&first_log)
+        .unwrap();
     let server = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(address.to_string())
         .arg("--token-file")
         .arg(&token)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(first_stderr))
         .spawn()
         .unwrap();
     let mut server = Server(server);
@@ -574,8 +581,19 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     }
     assert!(ready, "daemon did not bind");
     let first = cli(&root, &home, "status").output().unwrap();
-    assert!(first.status.success(), "first selected status unavailable");
+    assert!(
+        first.status.success(),
+        "first selected status unavailable; first startup stderr={:?}",
+        String::from_utf8_lossy(&fs::read(&first_log).unwrap())
+    );
     let old: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(
+        old["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "first daemon did not publish a positive baseline; first startup stderr={:?}",
+        String::from_utf8_lossy(&fs::read(&first_log).unwrap())
+    );
     let marker = fs::read(leader_lock_under(&home).unwrap()).unwrap();
     server.0.kill().unwrap();
     server.0.wait().unwrap();
@@ -586,13 +604,22 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let successor_addr = listener.local_addr().unwrap();
     drop(listener);
+    // Capture startup admission errors: TCP bind alone does not prove that
+    // establish_serving_session acquired a reconciled leader session.
+    let successor_log = temp.path().join("successor-stderr.log");
+    let successor_stderr = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&successor_log)
+        .unwrap();
     let successor_process = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(successor_addr.to_string())
         .arg("--token-file")
         .arg(&token)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(successor_stderr))
         .spawn()
         .unwrap();
     let mut successor = Server(successor_process);
@@ -609,6 +636,174 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A bound TCP listener is not an evidence-readiness signal. Only the
+    // authenticated HTTP selected snapshot can prove that this daemon serves
+    // H. A 503 index_not_ready is unserved and may be retried until the fixed
+    // deadline; 200 with the predecessor pin fails immediately.
+    let mut failure_details = |observed: &serde_json::Value| -> String {
+        // Failure-only snapshot. Keep the original strict AC1 assertion:
+        // a later watcher tick or explicit index cannot turn this RED green.
+        let lock_path = leader_lock_under(&home).unwrap();
+        let current_marker = fs::read(&lock_path).unwrap_or_default();
+        let lock_meta = fs::symlink_metadata(&lock_path).ok();
+        let lock_inode = lock_meta.as_ref().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino(), m.mode() & 0o777)
+        });
+        let probe = fs::OpenOptions::new().read(true).open(&lock_path).unwrap();
+        let acquired = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let ex_probe = if acquired == 0 {
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+            "available".to_owned()
+        } else {
+            format!("blocked:{:?}", std::io::Error::last_os_error().kind())
+        };
+        let liveness = successor.0.try_wait().unwrap();
+        let first_stderr = String::from_utf8_lossy(
+            &fs::read(&first_log)
+                .unwrap()
+                .into_iter()
+                .take(8192)
+                .collect::<Vec<_>>(),
+        )
+        .into_owned();
+        let stderr_len = fs::metadata(&successor_log).unwrap().len();
+        let stderr = String::from_utf8_lossy(
+            &fs::read(&successor_log)
+                .unwrap()
+                .into_iter()
+                .take(8192)
+                .collect::<Vec<_>>(),
+        )
+        .into_owned();
+        // A separate bounded selected export distinguishes the stale
+        // status snapshot from an already-reconciled source. It is only
+        // diagnostic: the failed original selected pin remains a RED.
+        let mut export = cli(&root, &home, "export")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let export_deadline = Instant::now() + Duration::from_secs(3);
+        let export_exit = loop {
+            if let Some(status) = export.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= export_deadline {
+                let _ = export.kill();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let export_output = export.wait_with_output().unwrap();
+        let export_json: serde_json::Value =
+            serde_json::from_slice(&export_output.stdout).unwrap_or(serde_json::Value::Null);
+        format!(
+            "old_pin={:?} selected_pin={:?} old_marker={:?} current_marker={:?} lock_inode={lock_inode:?} ex_probe={ex_probe} successor_pid={} successor_exit={liveness:?} first_stderr={first_stderr:?} stderr_len={stderr_len} stderr_head={stderr:?} export_exit={export_exit:?} export_text={:?} export_stderr={:?}",
+            old["revision"],
+            observed["revision"],
+            String::from_utf8_lossy(&marker),
+            String::from_utf8_lossy(&current_marker),
+            successor.0.id(),
+            export_json["files"][0]["text"],
+            String::from_utf8_lossy(&export_output.stderr)
+        )
+    };
+    let http_client = reqwest::Client::new();
+    let ready_deadline = Instant::now() + Duration::from_secs(12);
+    let ready_status: serde_json::Value = loop {
+        let response = http_client
+            .get(format!("http://{successor_addr}/api/status"))
+            .bearer_auth(TOKEN)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "successor HTTP status failed: {error}; {}",
+                    failure_details(&old)
+                )
+            });
+        let code = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or_else(|error| {
+            panic!(
+                "successor HTTP status malformed: {error}; {}",
+                failure_details(&old)
+            )
+        });
+        if code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.pointer("/error/code").and_then(|v| v.as_str()) == Some("index_not_ready")
+        {
+            assert!(
+                Instant::now() < ready_deadline,
+                "successor never reconciled before serving; {}",
+                failure_details(&body)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        assert_eq!(
+            code,
+            reqwest::StatusCode::OK,
+            "unexpected successor HTTP readiness response {code} {body:?}; {}",
+            failure_details(&body)
+        );
+        assert_eq!(
+            body["revision"]["indexGeneration"],
+            old["revision"]["indexGeneration"],
+            "successor HTTP selected generation differs; {}",
+            failure_details(&body)
+        );
+        assert!(
+            body["revision"]["indexRevision"]
+                .as_u64()
+                .is_some_and(|n| n > old["revision"]["indexRevision"].as_u64().unwrap()),
+            "successor served old selected pin before H; {}",
+            failure_details(&body)
+        );
+        break body;
+    };
+    assert_ne!(
+        fs::read(leader_lock_under(&home).unwrap()).unwrap(),
+        marker,
+        "successor HTTP ready under predecessor incarnation"
+    );
+    let revision_text = ready_status["revision"]["indexRevision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let source_response = http_client
+        .get(format!("http://{successor_addr}/api/source"))
+        .bearer_auth(TOKEN)
+        .query(&[
+            ("path", "a.js"),
+            (
+                "indexGeneration",
+                ready_status["revision"]["indexGeneration"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            ("indexRevision", revision_text.as_str()),
+        ])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        source_response.status(),
+        reqwest::StatusCode::OK,
+        "successor pinned source unavailable; {}",
+        failure_details(&ready_status)
+    );
+    let source_body: serde_json::Value = source_response.json().await.unwrap();
+    assert_eq!(
+        source_body["revision"], ready_status["revision"],
+        "successor pinned source changed revision"
+    );
+    assert_eq!(
+        source_body["file"]["text"], "function after() {}\n",
+        "successor served stale selected source before explicit request"
+    );
     let selected = cli(&root, &home, "status").output().unwrap();
     assert!(
         selected.status.success(),
@@ -616,13 +811,18 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
     );
     let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
     assert_eq!(
+        selected["revision"], ready_status["revision"],
+        "CLI selected pin differs from authenticated successor HTTP pin"
+    );
+    assert_eq!(
         selected["revision"]["indexGeneration"],
         old["revision"]["indexGeneration"]
     );
     assert!(
         selected["revision"]["indexRevision"].as_u64().unwrap()
             > old["revision"]["indexRevision"].as_u64().unwrap(),
-        "mandatory takeover must publish before any explicit request"
+        "mandatory takeover must publish before any explicit request; {}",
+        failure_details(&selected)
     );
     assert_ne!(fs::read(leader_lock_under(&home).unwrap()).unwrap(), marker);
     let exported = cli(&root, &home, "export").output().unwrap();
@@ -643,6 +843,132 @@ fn killed_leader_reconciles_lost_edits_before_serving() {
             .as_u64()
             .unwrap()
             > selected["revision"]["indexRevision"].as_u64().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("home");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&home).unwrap();
+    let source = root.join("a.js");
+    fs::write(&source, "function before() {}\n").unwrap();
+    let seed = cli(&root, &home, "index").output().unwrap();
+    assert!(seed.status.success(), "healthy predecessor required");
+    let old: serde_json::Value = cli(&root, &home, "status")
+        .output()
+        .and_then(|out| serde_json::from_slice(&out.stdout).map_err(std::io::Error::other))
+        .unwrap();
+    assert!(
+        old["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    );
+    let leader_lock = leader_lock_under(&home).unwrap();
+    let prior_marker = fs::read(&leader_lock).unwrap();
+    // The selected metadata stays healthy. Only the successor's authenticated
+    // source capture is made impossible; Store::open must complete first.
+    fs::write(&source, "function after() {}\n").unwrap();
+    let token_path = home.join("token");
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    fs::write(&token_path, token).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let stderr_path = temp.path().join("successor-stderr.log");
+    let stderr = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stderr_path)
+        .unwrap();
+    let child = cli(&root, &home, "serve")
+        .arg("--bind")
+        .arg(address.to_string())
+        .arg("--token-file")
+        .arg(&token_path)
+        .arg("--max-file-bytes")
+        .arg("8")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let mut successor = Server(child);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "successor did not bind after startup failure; stderr={:?}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert!(
+            successor.0.try_wait().unwrap().is_none(),
+            "successor exited before binding; stderr={:?}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let new_marker = fs::read(&leader_lock).unwrap();
+    assert_ne!(
+        new_marker, prior_marker,
+        "successor never acquired leader incarnation"
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap();
+    assert!(
+        stderr.contains("Evidence unavailable at startup: unsafe or oversized input"),
+        "capture refusal missing after leader acquisition: {stderr:?}"
+    );
+    // The attempted successor released EX on error. This checks the failure
+    // boundary, not merely a TCP bind or a stale independent CLI status.
+    let probe = fs::OpenOptions::new()
+        .read(true)
+        .open(&leader_lock)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "successor retained EX despite failed H"
+    );
+    assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+    let selected = cli(&root, &home, "status").output().unwrap();
+    assert!(
+        selected.status.success(),
+        "selected status unavailable after capture refusal"
+    );
+    let selected: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+    assert_eq!(
+        selected["revision"], old["revision"],
+        "failure unexpectedly published H"
+    );
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/api/status"))
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    let code = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        successor.0.try_wait().unwrap().is_none(),
+        "successor died after binding"
+    );
+    assert!(
+        code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            && body.pointer("/error/code").and_then(|value| value.as_str())
+                == Some("index_not_ready"),
+        "failed mandatory H must refuse selected evidence with index_not_ready: old_pin={:?} selected_pin={:?} old_marker={:?} new_marker={:?} http_status={code} body={body:?} startup_stderr={stderr:?}",
+        old["revision"],
+        selected["revision"],
+        String::from_utf8_lossy(&prior_marker),
+        String::from_utf8_lossy(&new_marker)
     );
 }
 
