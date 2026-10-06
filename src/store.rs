@@ -5549,14 +5549,27 @@ impl Store {
         committed_pin: IndexPin,
     ) -> Result<()> {
         self.verify_leader_session(session)?;
+        self.attest_post_acquisition_reconciliation_guard(session.leader_guard()?, committed_pin)
+    }
+    /// The public full-native publication API also performs a complete guarded
+    /// capture and COMMIT. Its callers must receive the same claim authority as
+    /// coordinator callers, including an already-held daemon owner.
+    fn attest_post_acquisition_reconciliation_guard(
+        &self,
+        leader: &topology::LeaderGuard,
+        committed_pin: IndexPin,
+    ) -> Result<()> {
+        self.identity.verify()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         let db = self.cache()?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
         let (selected, marker) = self.admit_evidence_control(&db)?;
         ensure!(
-            marker == session.incarnation() && selected.revision == committed_pin,
+            marker == leader.incarnation && selected.revision == committed_pin,
             "index_not_ready: mandatory leader reconciliation not committed"
         );
-        self.verify_leader_session(session)?;
+        self.identity.verify()?;
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         *self.reconciled_leader.lock().unwrap() = Some(marker);
         Ok(())
     }
@@ -5766,7 +5779,7 @@ impl Store {
         expected_revision: IndexPin,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
-        self.publish_native_expected(
+        let pin = self.publish_native_expected(
             graph,
             capture,
             native,
@@ -5774,7 +5787,9 @@ impl Store {
             ExpectedPublication::Pin(expected_revision),
             cancel,
             false,
-        )
+        )?;
+        self.attest_post_acquisition_reconciliation_guard(leader, pin)?;
+        Ok(pin)
     }
     pub(crate) fn publish_native_recovery(
         &self,
