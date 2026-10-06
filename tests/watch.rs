@@ -3168,3 +3168,154 @@ fn empty_checkout_final_inventory_preserves_explicit_pin() {
     assert_eq!(row.state, "done");
     assert_eq!(row.revision, Some(pin));
 }
+
+#[test]
+fn periodic_inventory_recovers_unhinted_source_and_absent_ignore_input() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    let source = root.join("a.js");
+    fs::write(&source, "function before() { return 1; }\n").unwrap();
+    fs::write(root.join("b.js"), "function hidden() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), root).unwrap();
+    let options = IndexOptions::new(root.to_owned());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
+    assert!(
+        work.reconcile_due(&store, &owner, &options, &cancel, true)
+            .unwrap()
+    );
+    let before = store.status().unwrap().revision;
+    work.suppress_watch_signals_for_tests(root.join("never-created-watch-root"));
+    // Source bytes change without a usable watcher callback. A same-length
+    // preserved mtime still has to be discovered by the complete inventory.
+    #[cfg(unix)]
+    let previous_mtime = {
+        use std::os::unix::fs::MetadataExt;
+        let stat = fs::metadata(&source).unwrap();
+        (stat.mtime(), stat.mtime_nsec())
+    };
+    fs::write(&source, "function after_() { return 2; }\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(source.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: previous_mtime.0,
+                tv_nsec: previous_mtime.1,
+            },
+        ];
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+    }
+    fs::write(root.join(".ignore"), "b.js\n").unwrap();
+    assert!(
+        !work
+            .reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap(),
+        "with lost signals an ordinary pre-periodic tick cannot see the edit"
+    );
+    // The full inventory, not a watcher hint, discovers both changes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while store.status().unwrap().revision == before && Instant::now() < deadline {
+        work.force_periodic_inventory_for_tests();
+        work.reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap();
+    }
+    let current = store.status().unwrap().revision;
+    assert!(current.index_revision > before.index_revision);
+    assert_eq!(
+        store
+            .source_at("a.js", Some(current))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function after_() { return 2; }\n"
+    );
+    assert!(store.source_at("b.js", Some(current)).unwrap().is_none());
+    let cold_state = tempfile::tempdir().unwrap();
+    let cold = Store::open_for_tests(cold_state.path(), root).unwrap();
+    let cold_job = index_coordinator::IndexJobCoordinator::prepare(&cold, None).unwrap();
+    let _cold_owner = cold_job.session();
+    cold_job.run(&options, &cancel, |_| {}).unwrap();
+    assert_eq!(store.graph().unwrap(), cold.graph().unwrap());
+    let selected = store.status().unwrap().revision;
+    assert_eq!(store.status().unwrap().revision, selected);
+    let read = store.evidence_response().unwrap();
+    read.source_at("a.js", Some(selected)).unwrap().unwrap();
+    read.finish(()).unwrap();
+    assert_eq!(
+        store.status().unwrap().revision,
+        selected,
+        "status and pinned source reads are not indexing ingress"
+    );
+    // No change: the next 60-second maintenance inventory cannot add a revision.
+    work.force_periodic_inventory_for_tests();
+    assert!(
+        work.reconcile_due(&store, &owner, &options, &cancel, false)
+            .unwrap()
+    );
+    assert_eq!(store.status().unwrap().revision, selected);
+}
+
+#[test]
+fn moved_root_stops_old_work_and_new_spelling_has_distinct_leader() {
+    let state = tempfile::tempdir().unwrap();
+    let roots = tempfile::tempdir().unwrap();
+    let old_root = roots.path().join("old");
+    let moved_root = roots.path().join("moved");
+    fs::create_dir(&old_root).unwrap();
+    fs::write(old_root.join("a.js"), "function original() {}\n").unwrap();
+    let old = Store::open_for_tests(state.path(), &old_root).unwrap();
+    let options = IndexOptions::new(old_root.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let owner =
+        index_coordinator::establish_serving_session(&old, Some(&options), &cancel).unwrap();
+    let mut work = LeaderWork::new(&old, &owner, &options).unwrap();
+    let before = old.status().unwrap().revision;
+    fs::rename(&old_root, &moved_root).unwrap();
+    fs::create_dir(&old_root).unwrap();
+    fs::write(old_root.join("a.js"), "function replacement() {}\n").unwrap();
+    assert!(
+        work.reconcile_due(&old, &owner, &options, &cancel, true)
+            .is_err(),
+        "old owner must refuse even a forced inventory at replaced pathname"
+    );
+    assert!(
+        old.status().is_err(),
+        "old root's selected read cannot serve after the move"
+    );
+    let relocated = Store::open_for_tests(state.path(), &moved_root).unwrap();
+    let relocated_options = IndexOptions::new(moved_root.clone());
+    let successor =
+        index_coordinator::establish_serving_session(&relocated, Some(&relocated_options), &cancel)
+            .unwrap();
+    assert!(successor.is_leader());
+    assert_ne!(relocated.root_id(), old.root_id());
+    let selected = relocated.status().unwrap().revision;
+    assert_eq!(
+        relocated
+            .source_at("a.js", Some(selected))
+            .unwrap()
+            .unwrap()
+            .1
+            .text,
+        "function original() {}\n"
+    );
+    assert_ne!(selected, before);
+    // Root keys are pathname-based. The replacement at the old spelling is
+    // not a new owner of the old index; #101's wrong-root residue is separate.
+    assert!(old.source_at("a.js", Some(before)).is_err());
+    drop(work);
+    drop(owner);
+}

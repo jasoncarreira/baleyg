@@ -391,10 +391,22 @@ impl DaemonState {
         let _stream = self.native_stream.lock().unwrap();
         #[cfg(test)]
         self.test_queue_after_stream.run();
+        // The old pathname must not reach a queue probe, recovery attempt or
+        // capture after its root identity changes. Retire the watcher with its
+        // leader session; the moved spelling opens independently.
+        if self.store.root_path_replaced()? {
+            let retained = self.serving_session.lock().unwrap().clone();
+            let transition = retained
+                .as_ref()
+                .filter(|session| session.is_leader())
+                .map(|session| self.store.fail_changed_root_requests(session))
+                .transpose();
+            self.replace_serving_session(None);
+            transition?;
+            return Ok(());
+        }
         // A real exceptional storage error must not recapture/log every 20 ms.
-        // Root replacement is never delayed by that advisory retry deadline.
         if !self.store.is_root_replaced()
-            && !self.store.root_path_replaced()?
             && self
                 .recovery_retry_after
                 .lock()
