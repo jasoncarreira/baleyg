@@ -50,7 +50,8 @@ fn setup() -> (
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    // Offline snapshot test; the live reconciliation/read race is tracked in #111.
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     let app = http::router(state);
     (dir, store, graph, app, session)
 }

@@ -428,6 +428,15 @@ impl DaemonState {
         self.replace_serving_session(Some(session));
         self.start_queue_tick();
     }
+    /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
+    /// See #111 for the separate read-during-reconciliation product fix.
+    #[doc(hidden)]
+    pub fn retain_serving_session_without_tick_for_tests(
+        self: &Arc<Self>,
+        session: Arc<crate::store::topology::LeaderSession>,
+    ) {
+        self.replace_serving_session(Some(session));
+    }
     /// A failed initial H has no serving capability and no watcher yet. The
     /// empty-queue retry must be armed *before* starting the tick; otherwise an
     /// alive daemon binds HTTP but cannot discover a repaired checkout without

@@ -7091,9 +7091,8 @@ impl Store {
         if !has_revision_producer_bindings(&db)? {
             return Ok(false);
         }
-        let executable = std::env::current_exe()?;
         let executing_hash = capture
-            .executable_digest(&executable)
+            .executable_digest(capture.executable_path())
             .context("native_evidence_required: final inventory executable not hashed")?;
         if selected_producer_hash(&db, &selected)? != executing_hash {
             return Ok(false);
@@ -7216,9 +7215,8 @@ impl Store {
             // which atomically introduces the paired producer-binding extension.
             return Ok(None);
         }
-        let current_executable = std::env::current_exe()?;
         let executing_hash = capture
-            .executable_digest(&current_executable)
+            .executable_digest(capture.executable_path())
             .context("native_evidence_required: executable was not hashed at admission")?;
         if selected_producer_hash(&db, &selected)? != executing_hash {
             // Decision 0005: even identical source bytes cannot reuse native
@@ -7404,8 +7402,7 @@ impl Store {
             // unchanged documents when the executing native producer drifts.
             // Compare the attested selected binding before any local measurement
             // or selected-manifest reuse; the caller then takes the full path.
-            let current_executable = std::env::current_exe()?;
-            let executing_hash = capture.executable_digest(&current_executable)
+            let executing_hash = capture.executable_digest(capture.executable_path())
                 .context("native_evidence_required: executable was not hashed at admission")?;
             if selected_producer_hash(db, &selected)? != executing_hash {
                 return Ok(None);

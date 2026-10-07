@@ -52,7 +52,8 @@ fn setup() -> (
         root,
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    // Offline snapshot test; the live reconciliation/read race is tracked in #111.
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     let app = http::router(state);
     (temp, store, app, session)
 }

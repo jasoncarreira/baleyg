@@ -312,7 +312,9 @@ function helper() {}
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    // This test mutates stored evidence directly; keep the daemon queue tick out.
+    // Read-during-reconciliation behaviour is tracked separately in #111.
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     let app = http::router(state);
     let preview = |seed: &str| {
         let body =
