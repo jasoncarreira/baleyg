@@ -1132,6 +1132,49 @@ fn executable_drift_claim_child() {
     let proof = std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
+    let stage = std::env::var("BALEYG_DRIFT_CLAIM_STAGE").unwrap_or_else(|_| "old".into());
+    if stage == "new" {
+        let previous = store.index_baseline().unwrap();
+        let modes = Mutex::new(Vec::new());
+        let (fresh, _session) = reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |progress| {
+                if progress.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(progress.phase);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.index_generation, previous.index_generation);
+        assert_eq!(fresh.index_revision, previous.index_revision + 1);
+        for path in ["a.js", "b.js"] {
+            assert!(store.source_at(path, Some(previous)).unwrap().is_some());
+            assert!(store.source_at(path, Some(fresh)).unwrap().is_some());
+        }
+        let db =
+            rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+        let id = format!("pin:v1:{}:{}", fresh.index_generation, fresh.index_revision);
+        let (producer_sha, binding_sha): (String, String) = db.query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let manifests: i64 = db
+            .query_row(
+                "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifests, 2);
+        let result = serde_json::json!({"modes":modes.into_inner().unwrap(),
+            "producerSha":producer_sha,"bindingSha":binding_sha,
+            "generation":fresh.index_generation.to_string(),"revision":fresh.index_revision,
+            "selectedDocuments":manifests});
+        fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
+        return;
+    }
+    assert_eq!(stage, "old");
     let (old, owner) =
         reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
     println!("DRIFT_BASELINE_READY");
@@ -1249,6 +1292,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
     .unwrap();
     let binary = state.path().join("native-drift-requests");
     fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    let old_hash = hex::encode(Sha256::digest(fs::read(&binary).unwrap()));
     let proof = state.path().join("drift-proof.json");
     let mut child = Command::new(&binary)
         .arg("--exact")
@@ -1257,6 +1301,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
         .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
         .env("BALEYG_DRIFT_CLAIM_PROOF", &proof)
+        .env("BALEYG_DRIFT_CLAIM_STAGE", "old")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1305,26 +1350,21 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
     let result: serde_json::Value = serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
     assert_eq!(
         result["modes"],
-        serde_json::json!([if drift { "mode:full" } else { "mode:local" }]),
-        "drift must force full extraction; the same body edit without drift is proved local"
-    );
-    let expected_events = if drift {
-        serde_json::json!([
-            [result["requestId"], "a.js", "measured"],
-            [result["requestId"], "b.js", "measured"],
-            [result["requestId"], "a.js", "validated"],
-            [result["requestId"], "b.js", "validated"],
-        ])
-    } else {
-        serde_json::json!([])
-    };
-    assert_eq!(
-        result["nativeEvents"], expected_events,
-        "each admitted source must cross the actual extract_known boundary and successful independent full validation"
+        serde_json::json!([if body_edit {
+            "mode:local"
+        } else {
+            "mode:unchanged"
+        }]),
+        "the old running image remains the producer after its pathname is replaced"
     );
     assert_eq!(
-        result["producerSha"], executing_hash,
-        "selected binding must record the new executable hash"
+        result["nativeEvents"],
+        serde_json::json!([]),
+        "the unchanged running producer must not remeasure both documents"
+    );
+    assert_eq!(
+        result["producerSha"], old_hash,
+        "old-process facts must bind to the old running image, never the replacement pathname"
     );
     assert_eq!(result["bindingSha"].as_str().unwrap().len(), 64);
     assert_eq!(result["revision"], 2);
@@ -1339,6 +1379,34 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         row.revision.unwrap().index_generation.to_string(),
         result["generation"]
     );
+    if drift {
+        assert_ne!(old_hash, executing_hash);
+        let next_proof = state.path().join("drift-proof-new.json");
+        let next = Command::new(&binary)
+            .arg("--exact")
+            .arg("executable_drift_claim_child")
+            .arg("--nocapture")
+            .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
+            .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
+            .env("BALEYG_DRIFT_CLAIM_PROOF", &next_proof)
+            .env("BALEYG_DRIFT_CLAIM_STAGE", "new")
+            .output()
+            .unwrap();
+        assert!(
+            next.status.success(),
+            "new image failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&next.stdout),
+            String::from_utf8_lossy(&next.stderr)
+        );
+        let remeasured: serde_json::Value =
+            serde_json::from_slice(&fs::read(&next_proof).unwrap()).unwrap();
+        assert_eq!(remeasured["modes"], serde_json::json!(["mode:full"]));
+        assert_eq!(remeasured["producerSha"], executing_hash);
+        assert_eq!(remeasured["generation"], result["generation"]);
+        assert_eq!(remeasured["revision"], 3);
+        assert_eq!(remeasured["selectedDocuments"], 2);
+        assert_eq!(remeasured["bindingSha"].as_str().unwrap().len(), 64);
+    }
 }
 
 #[test]

@@ -278,6 +278,42 @@ fn admit_input(
     input_bytes.insert(path, bytes);
     Ok(())
 }
+fn admit_running_executable(
+    image: &RunningExecutable,
+    cancel: &CancelFlag,
+    source_identities: &BTreeSet<(u64, u64)>,
+    identities: &mut BTreeMap<(u64, u64), PathBuf>,
+    inputs: &mut BTreeMap<PathBuf, Option<Stamp>>,
+    input_bytes: &mut BTreeMap<PathBuf, Option<Arc<[u8]>>>,
+) -> Result<()> {
+    let state = image.initial.clone();
+    let key = identity(&state);
+    ensure!(
+        !key.is_some_and(|key| source_identities.contains(&key)),
+        "running executable aliases source"
+    );
+    let bytes = image.verified_bytes(cancel)?;
+    if let Some(previous) = inputs.get(&image.path) {
+        ensure!(
+            previous == &Some(state.clone())
+                && input_bytes.get(&image.path).and_then(Option::as_deref) == Some(bytes.as_ref()),
+            "running executable pathname conflicts with another input"
+        );
+    }
+    if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
+        ensure!(
+            inputs.get(old_path) == Some(&Some(state.clone()))
+                && input_bytes.get(old_path).and_then(Option::as_deref) == Some(bytes.as_ref()),
+            "running executable input alias drift"
+        );
+    }
+    if let Some(key) = key {
+        identities.entry(key).or_insert_with(|| image.path.clone());
+    }
+    inputs.insert(image.path.clone(), Some(state));
+    input_bytes.insert(image.path.clone(), Some(bytes));
+    Ok(())
+}
 fn source(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|x| x.to_str()),
@@ -344,41 +380,130 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
     Ok((inventory, sources))
 }
 
-/// Resolve the live executable pathname after an atomic upgrade on Linux.
-/// `/proc/self/exe` appends ` (deleted)` to an unlinked running inode; that
-/// pseudo-path is not the replacement file that subsequent captures must hash.
-/// Keep a real executable whose literal filename ends in that suffix unchanged.
-pub(crate) fn current_executable_path() -> Result<PathBuf> {
-    let path = std::env::current_exe()?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        if path.as_os_str().as_bytes().ends_with(b" (deleted)") {
-            return linux_executable_path(path, &fs::metadata("/proc/self/exe")?);
-        }
-    }
-    Ok(path)
+/// The running image must be pinned before the executable pathname is replaced.
+/// The CLI calls this at startup; embedders must do the same before indexing.
+/// Library test processes also initialize lazily on their first capture.
+pub fn pin_running_executable() -> Result<()> {
+    running_executable().map(|_| ())
 }
 
-#[cfg(target_os = "linux")]
-fn linux_executable_path(path: PathBuf, running: &fs::Metadata) -> Result<PathBuf> {
-    use std::ffi::OsStr;
-    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-    let Some(live) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
-        return Ok(path);
-    };
-    let reported = match fs::symlink_metadata(&path) {
-        Ok(stat) => Some(stat),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("executable path metadata"),
-    };
-    if reported
-        .as_ref()
-        .is_some_and(|stat| stat.dev() == running.dev() && stat.ino() == running.ino())
-    {
-        return Ok(path);
+struct RunningExecutable {
+    path: PathBuf,
+    file: std::sync::Mutex<fs::File>,
+    initial: Stamp,
+    bytes: Arc<[u8]>,
+    digest: String,
+}
+
+impl RunningExecutable {
+    fn open() -> Result<Self> {
+        let path = std::env::current_exe()?;
+        // procfs opens the executing inode even after an atomic pathname swap.
+        // On macOS retain an open descriptor before any later upgrade.
+        #[cfg(target_os = "linux")]
+        let file = fs::File::open("/proc/self/exe")?;
+        #[cfg(not(target_os = "linux"))]
+        let file = {
+            let mut options = fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            options.open(&path)?
+        };
+        Self::from_file(path, file)
     }
-    Ok(PathBuf::from(OsStr::from_bytes(live)))
+    fn from_file(path: PathBuf, file: fs::File) -> Result<Self> {
+        let initial = stamp(&file.metadata()?);
+        ensure!(
+            initial.kind == 2 && (1..=512 * 1024 * 1024).contains(&initial.len),
+            "unsafe or oversized running executable"
+        );
+        let mut image = Self {
+            path,
+            file: std::sync::Mutex::new(file),
+            initial,
+            bytes: Arc::from(Vec::<u8>::new()),
+            digest: String::new(),
+        };
+        let bytes = image.read_file(&Arc::new(std::sync::atomic::AtomicBool::new(false)))?;
+        image.digest = hash(&bytes);
+        image.bytes = bytes;
+        Ok(image)
+    }
+    fn verified_bytes(&self, cancel: &CancelFlag) -> Result<Arc<[u8]>> {
+        let now = self.read_file(cancel)?;
+        ensure!(
+            now.as_ref() == self.bytes.as_ref(),
+            "running executable contents drift from startup"
+        );
+        Ok(self.bytes.clone())
+    }
+    fn read_file(&self, cancel: &CancelFlag) -> Result<Arc<[u8]>> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("running executable lock poisoned"))?;
+        self.check_file(&file)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            check(cancel)?;
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            ensure!(
+                (bytes.len() as u64) + (n as u64) <= 512 * 1024 * 1024,
+                "running executable exceeded byte limit"
+            );
+            bytes.extend_from_slice(&buffer[..n]);
+        }
+        self.check_file(&file)?;
+        ensure!(
+            bytes.len() as u64 == self.initial.len,
+            "running executable bytes drift"
+        );
+        Ok(Arc::from(bytes))
+    }
+    fn check_file(&self, file: &fs::File) -> Result<()> {
+        let now = stamp(&file.metadata()?);
+        // Unlinking the running inode changes ctime, not the executable bytes.
+        // Preserve the initial input observation while checking stable identity
+        // and content both at admission and at the final cutoff.
+        ensure!(
+            now.kind == self.initial.kind && now.len == self.initial.len,
+            "running executable metadata drift"
+        );
+        #[cfg(unix)]
+        ensure!(
+            now.dev == self.initial.dev
+                && now.ino == self.initial.ino
+                && now.mtime == self.initial.mtime,
+            "running executable inode or mtime drift"
+        );
+        Ok(())
+    }
+}
+
+static RUNNING_EXECUTABLE: std::sync::OnceLock<
+    std::result::Result<Arc<RunningExecutable>, String>,
+> = std::sync::OnceLock::new();
+
+fn running_executable() -> Result<Arc<RunningExecutable>> {
+    RUNNING_EXECUTABLE
+        .get_or_init(|| {
+            RunningExecutable::open()
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|message| anyhow::anyhow!(message.clone()))
 }
 
 /// Bytes and complete admission inventory are retained until the final cutoff.
@@ -398,6 +523,7 @@ pub struct Capture {
     executable_path: PathBuf,
     executable_bytes: Arc<[u8]>,
     executable_digest: String,
+    running_executable: Option<Arc<RunningExecutable>>,
     input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
     reconcile_options: crate::indexer::ReconcileOptions,
 }
@@ -407,14 +533,30 @@ impl Capture {
         cancel: &CancelFlag,
         progress: &impl Fn(IndexProgress),
     ) -> Result<Self> {
-        let exe = current_executable_path()?;
-        Self::admit_with_executable(options, cancel, progress, exe)
+        let running = running_executable()?;
+        Self::admit_with_image(
+            options,
+            cancel,
+            progress,
+            running.path.clone(),
+            Some(running),
+        )
     }
+    #[cfg(test)]
     fn admit_with_executable(
         options: &IndexOptions,
         cancel: &CancelFlag,
         progress: &impl Fn(IndexProgress),
         exe: PathBuf,
+    ) -> Result<Self> {
+        Self::admit_with_image(options, cancel, progress, exe, None)
+    }
+    fn admit_with_image(
+        options: &IndexOptions,
+        cancel: &CancelFlag,
+        progress: &impl Fn(IndexProgress),
+        exe: PathBuf,
+        running_executable: Option<Arc<RunningExecutable>>,
     ) -> Result<Self> {
         check(cancel)?;
         let root_meta = metadata(&options.workspace_root)?.context("workspace root absent")?;
@@ -424,6 +566,10 @@ impl Capture {
         );
         let root = fs::canonicalize(&options.workspace_root)?;
         let (inventory, sources) = walk(&root, cancel)?;
+        ensure!(
+            !running_executable.is_some() || !sources.contains(&exe),
+            "running executable pathname conflicts with source"
+        );
         let mut inputs = BTreeMap::new();
         let mut input_bytes = BTreeMap::new();
         let mut source_identities = BTreeSet::new();
@@ -467,15 +613,26 @@ impl Capture {
             }
         }
         // The linked native extractor is part of the running executable, not ambient PATH.
-        admit_input(
-            exe.clone(),
-            512 * 1024 * 1024,
-            cancel,
-            &source_identities,
-            &mut input_identities,
-            &mut inputs,
-            &mut input_bytes,
-        )?;
+        if let Some(image) = running_executable.as_ref() {
+            admit_running_executable(
+                image,
+                cancel,
+                &source_identities,
+                &mut input_identities,
+                &mut inputs,
+                &mut input_bytes,
+            )?;
+        } else {
+            admit_input(
+                exe.clone(),
+                512 * 1024 * 1024,
+                cancel,
+                &source_identities,
+                &mut input_identities,
+                &mut inputs,
+                &mut input_bytes,
+            )?;
+        }
         let executable_bytes = input_bytes
             .get(&exe)
             .and_then(Option::as_ref)
@@ -483,7 +640,11 @@ impl Capture {
             .cloned()
             .with_context(|| format!("running executable bytes unavailable: {}", exe.display()))?;
         check(cancel)?;
-        let executable_digest = hash(&executable_bytes);
+        let executable_digest = if let Some(image) = running_executable.as_ref() {
+            image.digest.clone()
+        } else {
+            hash(&executable_bytes)
+        };
         check(cancel)?;
         for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
             .into_iter()
@@ -562,6 +723,7 @@ impl Capture {
             executable_path: exe,
             executable_bytes,
             executable_digest,
+            running_executable,
             input_bytes,
             reconcile_options: crate::indexer::ReconcileOptions::from(options),
         };
@@ -589,6 +751,20 @@ impl Capture {
         ensure!(inventory == self.inventory, "workspace inventory drift");
         for (path, expected) in &self.inputs {
             check(cancel)?;
+            if path == &self.executable_path
+                && let Some(image) = self.running_executable.as_ref()
+            {
+                ensure!(
+                    path == &image.path && expected.as_ref() == Some(&image.initial),
+                    "running executable observation drift"
+                );
+                let now = image.verified_bytes(cancel)?;
+                ensure!(
+                    self.input_bytes.get(path).and_then(Option::as_deref) == Some(now.as_ref()),
+                    "running executable contents drift"
+                );
+                continue;
+            }
             ensure!(
                 &metadata(path)? == expected,
                 "input inventory drift: {}",
@@ -622,6 +798,10 @@ impl Capture {
     }
     pub fn bytes(&self, path: &Path) -> Option<&[u8]> {
         self.input_bytes.get(path).and_then(|b| b.as_deref())
+    }
+    /// Stable process-start identity, not the pathname's later replacement.
+    pub(crate) fn executable_path(&self) -> &Path {
+        &self.executable_path
     }
     /// Only the exact admitted executable Arc may use its one cached digest.
     /// A missing or replaced map entry fails closed without hashing again.
@@ -805,32 +985,41 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
-    #[cfg(target_os = "linux")]
     #[test]
-    fn linux_deleted_executable_path_uses_live_replacement_not_a_literal_suffix() {
+    fn pinned_executable_keeps_running_inode_after_path_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("native-bin");
-        let reported = dir.path().join("native-bin (deleted)");
-        fs::write(&live, b"old binary").unwrap();
-        // Keep the old inode open as a running process would. Otherwise Linux
-        // may immediately recycle its inode number after the replacement.
-        let running_file = fs::File::open(&live).unwrap();
-        let running = running_file.metadata().unwrap();
-        fs::hard_link(&live, &reported).unwrap();
+        fs::write(&live, b"old executing binary").unwrap();
+        let file = fs::File::open(&live).unwrap();
+        let image = RunningExecutable::from_file(live.clone(), file).unwrap();
+        let startup_digest = image.digest.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
         assert_eq!(
-            linux_executable_path(reported.clone(), &running).unwrap(),
-            reported
+            image.verified_bytes(&cancel).unwrap().as_ref(),
+            b"old executing binary"
         );
-
-        fs::remove_file(&reported).unwrap();
-        fs::write(dir.path().join("replacement"), b"new binary").unwrap();
+        fs::write(dir.path().join("replacement"), b"new pathname binary").unwrap();
         fs::rename(dir.path().join("replacement"), &live).unwrap();
         assert_eq!(
-            linux_executable_path(reported.clone(), &running).unwrap(),
-            live
+            image.verified_bytes(&cancel).unwrap().as_ref(),
+            b"old executing binary"
         );
-        fs::write(&reported, b"unrelated literal suffix").unwrap();
-        assert_eq!(linux_executable_path(reported, &running).unwrap(), live);
+        assert_eq!(image.digest, startup_digest);
+        assert_eq!(fs::read(&live).unwrap(), b"new pathname binary");
+    }
+    #[test]
+    fn pinned_executable_refuses_in_place_byte_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native-bin");
+        fs::write(&path, b"old executing binary").unwrap();
+        let image =
+            RunningExecutable::from_file(path.clone(), fs::File::open(&path).unwrap()).unwrap();
+        fs::write(&path, b"new executing binary").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert!(
+            image.verified_bytes(&cancel).is_err(),
+            "mutating the pinned inode must fail closed rather than relabel old code"
+        );
     }
     #[test]
     fn missing_executable_refuses_admission() {

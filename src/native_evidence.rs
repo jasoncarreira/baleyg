@@ -550,9 +550,8 @@ fn build_native_header<'a>(
     );
     identity.verify()?;
     let source_set_id = format!("source-set:v1:{root_id}");
-    let exe = crate::capture::current_executable_path()?;
     let executable_hash = capture
-        .executable_digest(&exe)
+        .executable_digest(capture.executable_path())
         .context("native executable not admitted or replaced")?
         .to_owned();
     let producer = Producer {

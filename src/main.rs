@@ -402,6 +402,10 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let command = Cli::parse().command;
+    if matches!(&command, Command::Index(_) | Command::Serve(_)) {
+        baleyg::capture::pin_running_executable()?;
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -409,7 +413,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "baleyg=info".into()),
         )
         .init();
-    match Cli::parse().command {
+    match command {
         Command::Mcp(args) => {
             let (_, identity) = args.resolve()?;
             mcp::run_stdio(mcp::OpenedWorkspace::new(identity))?;
