@@ -344,6 +344,43 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
     Ok((inventory, sources))
 }
 
+/// Resolve the live executable pathname after an atomic upgrade on Linux.
+/// `/proc/self/exe` appends ` (deleted)` to an unlinked running inode; that
+/// pseudo-path is not the replacement file that subsequent captures must hash.
+/// Keep a real executable whose literal filename ends in that suffix unchanged.
+pub(crate) fn current_executable_path() -> Result<PathBuf> {
+    let path = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if path.as_os_str().as_bytes().ends_with(b" (deleted)") {
+            return linux_executable_path(path, &fs::metadata("/proc/self/exe")?);
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_executable_path(path: PathBuf, running: &fs::Metadata) -> Result<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    let Some(live) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+        return Ok(path);
+    };
+    let reported = match fs::symlink_metadata(&path) {
+        Ok(stat) => Some(stat),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("executable path metadata"),
+    };
+    if reported
+        .as_ref()
+        .is_some_and(|stat| stat.dev() == running.dev() && stat.ino() == running.ino())
+    {
+        return Ok(path);
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(live)))
+}
+
 /// Bytes and complete admission inventory are retained until the final cutoff.
 /// No source is physically opened again during validation.
 pub struct Capture {
@@ -370,7 +407,7 @@ impl Capture {
         cancel: &CancelFlag,
         progress: &impl Fn(IndexProgress),
     ) -> Result<Self> {
-        let exe = std::env::current_exe()?;
+        let exe = current_executable_path()?;
         Self::admit_with_executable(options, cancel, progress, exe)
     }
     fn admit_with_executable(
@@ -768,6 +805,30 @@ impl Capture {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicBool};
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_deleted_executable_path_uses_live_replacement_not_a_literal_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("native-bin");
+        let reported = dir.path().join("native-bin (deleted)");
+        fs::write(&live, b"old binary").unwrap();
+        let running = fs::metadata(&live).unwrap();
+        fs::hard_link(&live, &reported).unwrap();
+        assert_eq!(
+            linux_executable_path(reported.clone(), &running).unwrap(),
+            reported
+        );
+
+        fs::remove_file(&reported).unwrap();
+        fs::write(dir.path().join("replacement"), b"new binary").unwrap();
+        fs::rename(dir.path().join("replacement"), &live).unwrap();
+        assert_eq!(
+            linux_executable_path(reported.clone(), &running).unwrap(),
+            live
+        );
+        fs::write(&reported, b"unrelated literal suffix").unwrap();
+        assert_eq!(linux_executable_path(reported, &running).unwrap(), live);
+    }
     #[test]
     fn missing_executable_refuses_admission() {
         let root = tempfile::tempdir().unwrap();
