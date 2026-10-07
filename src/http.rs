@@ -137,6 +137,50 @@ struct MaintenanceTelemetry {
     max_deferred_ms: u128,
     max_deferred_age_s: u64,
 }
+/// One bounded notice per minute, even when a worker fails at every 20 ms tick.
+#[derive(Default)]
+struct MaintenanceErrorLimiter {
+    last_notice: Option<Instant>,
+}
+impl MaintenanceErrorLimiter {
+    fn permit(&mut self, now: Instant) -> bool {
+        if self
+            .last_notice
+            .is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.last_notice = Some(now);
+        true
+    }
+}
+
+/// Never render arbitrary anyhow context, SQLite messages, source, or paths.
+/// SQLite extended result codes and OS errno are numeric, bounded categories.
+fn maintenance_error_class(error: &anyhow::Error) -> (&'static str, i32) {
+    for cause in error.chain() {
+        if let Some(sqlite) = cause.downcast_ref::<rusqlite::Error>() {
+            return match sqlite {
+                rusqlite::Error::SqliteFailure(code, _) => ("sqlite", code.extended_code),
+                _ => ("sqlite", 0),
+            };
+        }
+    }
+    if error.is::<crate::store::SqliteContention>() {
+        return ("sqlite_contention", 0);
+    }
+    if let Some(io) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    {
+        return ("io", io.raw_os_error().unwrap_or(0));
+    }
+    ("other", 0)
+}
+fn maintenance_error_notice(category: &'static str, code: i32) -> String {
+    format!("maintenance tick failed: category={category} code={code}\n")
+}
+
 impl MaintenanceTelemetry {
     fn observe_due_age(&mut self, age: Option<u64>) {
         if let Some(age) = age {
@@ -185,6 +229,7 @@ pub struct DaemonState {
     queue_tick_started: AtomicBool,
     maintenance_tick_started: AtomicBool,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
+    maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
     #[cfg(test)]
     queue_takeover_attempts: AtomicUsize,
     #[cfg(test)]
@@ -347,6 +392,7 @@ pub fn new_with_dependency_options(
         queue_tick_started: AtomicBool::new(false),
         maintenance_tick_started: AtomicBool::new(false),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
+        maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
         #[cfg(test)]
         queue_takeover_attempts: AtomicUsize::new(0),
         #[cfg(test)]
@@ -458,13 +504,22 @@ impl DaemonState {
                     break;
                 };
                 let worker = state.clone();
-                if let Err(error) =
-                    tokio::task::spawn_blocking(move || worker.maintenance_tick()).await
-                {
-                    best_effort_queue_stderr(
-                        std::io::stderr(),
-                        format_args!("maintenance worker failed: {error:#}\n"),
-                    );
+                let failure =
+                    match tokio::task::spawn_blocking(move || worker.maintenance_tick()).await {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(maintenance_error_class(&error)),
+                        Err(_) => Some(("worker_join", 0)),
+                    };
+                if let Some((category, code)) = failure {
+                    let permitted = state
+                        .maintenance_error_limiter
+                        .lock()
+                        .unwrap()
+                        .permit(Instant::now());
+                    if permitted {
+                        let notice = maintenance_error_notice(category, code);
+                        best_effort_queue_stderr(std::io::stderr(), format_args!("{notice}"));
+                    }
                 }
             }
         });
@@ -6523,6 +6578,35 @@ mod dependency_lifecycle_tests {
 #[cfg(test)]
 mod maintenance_telemetry_tests {
     use super::*;
+    #[test]
+    fn maintenance_failures_are_sanitized_and_rate_limited_without_sleep() {
+        let start = Instant::now();
+        let mut limiter = MaintenanceErrorLimiter::default();
+        assert!(limiter.permit(start));
+        assert!(!limiter.permit(start + Duration::from_millis(20)));
+        assert!(!limiter.permit(start + Duration::from_secs(59)));
+        assert!(limiter.permit(start + Duration::from_secs(60)));
+        let sensitive = "workspace/private/path-and-source";
+        let opaque = anyhow::anyhow!("{sensitive}");
+        let (category, code) = maintenance_error_class(&opaque);
+        assert_eq!((category, code), ("other", 0));
+        let notice = maintenance_error_notice(category, code);
+        assert_eq!(notice, "maintenance tick failed: category=other code=0\n");
+        assert!(!notice.contains(sensitive));
+
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite = db
+            .execute("INSERT INTO private_missing_table(id) VALUES (1)", [])
+            .unwrap_err();
+        let wrapped = anyhow::Error::new(sqlite).context(sensitive);
+        let (category, code) = maintenance_error_class(&wrapped);
+        assert_eq!(category, "sqlite");
+        assert_ne!(code, 0);
+        let notice = maintenance_error_notice(category, code);
+        assert!(!notice.contains(sensitive));
+        assert!(!notice.contains("private_missing_table"));
+    }
+
     #[test]
     fn deferred_preemption_busy_and_success_keep_max_age_without_sleep() {
         let now = Instant::now();

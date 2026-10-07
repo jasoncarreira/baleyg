@@ -450,11 +450,20 @@ impl LeaderWork {
     /// the native stream drains the bounded channel. A selected-options change
     /// has not registered a replacement watcher yet, so it is also intent.
     pub fn accepted_watch_intent(&self, options: &IndexOptions) -> bool {
+        let now = std::time::Instant::now();
+        // A sticky degraded/full batch whose generation was already verified
+        // must not starve maintenance during the 60s inventory idle interval.
+        // Once the inventory is due, it gets the same retry eligibility as
+        // reconcile_due and takes priority before maintenance admission.
+        let periodic_ready = now.duration_since(self.last_inventory)
+            >= std::time::Duration::from_secs(60)
+            && !self.retry_after.is_some_and(|deadline| deadline > now);
         self.options.workspace_root != options.workspace_root
             || self.options.scip_path != options.scip_path
             || self.options.manifest_path != options.manifest_path
             || self.options.max_file_bytes != options.max_file_bytes
             || self.watch.accepted_unacked()
+            || periodic_ready
     }
 
     #[doc(hidden)]
@@ -1517,8 +1526,13 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let owner = establish_serving_session(&store, Some(&options), &cancel).unwrap();
         let mut work = LeaderWork::new(&store, &owner, &options).unwrap();
-        work.watch
-            .submit_event(Err(notify::Error::generic("watch failed")));
+        // A registration failure is sticky. It still needs one verified full
+        // inventory, but an accounted idle generation must not veto maintenance.
+        let absent_watch_root = workspace.path().join("absent_watch_root");
+        assert!(!absent_watch_root.exists());
+        work.watch = crate::watch::WatchSignals::new(absent_watch_root, None, None);
+        assert!(work.watch.degraded());
+        assert!(work.accepted_watch_intent(&options));
         assert!(
             work.reconcile_due(&store, &owner, &options, &cancel, false)
                 .unwrap()
@@ -1526,14 +1540,50 @@ mod tests {
         let pin = store.status().unwrap().revision;
         assert!(work.last_accounted_generation.is_some());
         assert!(
+            !work.accepted_watch_intent(&options),
+            "accounted degraded generation must admit maintenance before periodic scan"
+        );
+        assert!(
             !work
                 .reconcile_due(&store, &owner, &options, &cancel, false)
                 .unwrap()
         );
         assert_eq!(store.status().unwrap().revision, pin);
+
+        // New accepted ingress preempts before channel drain or debounce.
+        work.watch
+            .submit_event(Err(notify::Error::generic("watch failed again")));
+        assert!(work.accepted_watch_intent(&options));
+        assert!(
+            work.reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        assert!(!work.accepted_watch_intent(&options));
+        work.watch.require_full();
+        assert!(work.accepted_watch_intent(&options));
+        assert!(
+            work.reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        assert!(!work.accepted_watch_intent(&options));
+
+        // Due periodic inventory is real work, but retry_after prevents its
+        // maintenance veto until the retry deadline has elapsed.
         work.last_inventory -= std::time::Duration::from_secs(60);
-        work.reconcile_due(&store, &owner, &options, &cancel, false)
-            .unwrap();
+        work.retry_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        assert!(!work.accepted_watch_intent(&options));
+        assert!(
+            !work
+                .reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        work.retry_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(work.accepted_watch_intent(&options));
+        assert!(
+            work.reconcile_due(&store, &owner, &options, &cancel, false)
+                .unwrap()
+        );
+        assert!(!work.accepted_watch_intent(&options));
     }
 
     /// Per-source (opens, complete reads, hashes), keyed by path.

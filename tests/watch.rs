@@ -4402,6 +4402,9 @@ fn ingress_filters_only_certain_excluded_noise_before_debounce() {
         fs::write(path, "noise").unwrap();
     }
     let mut watch = WatchSignals::new(root.to_owned(), None, None);
+    // This fixture drives the bounded synthetic ingress only. Do not let a
+    // live notify callback race the exact generation being acknowledged.
+    watch.disable_native_watcher_for_tests();
     let initial = watch.drain();
     assert!(watch.accepted_unacked());
     assert!(watch.acknowledge(&initial));

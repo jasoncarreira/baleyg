@@ -246,10 +246,14 @@ impl WatchSignals {
     /// This is set synchronously at ingress, before debounce or a channel drain.
     /// The initial full inventory and replacement watcher remain unacknowledged.
     pub fn accepted_unacked(&self) -> bool {
-        self.degraded
-            || self.pending.full
-            || self.urgent
-            || self.generation.load(Ordering::SeqCst) != self.acknowledged_generation
+        let unacknowledged = self.generation.load(Ordering::SeqCst) != self.acknowledged_generation;
+        // Failure leaves full/urgent/degraded sticky for periodic fallback, but
+        // a verified capture already accounted for this degraded generation.
+        // Only genuinely new ingress (including require_full) has priority now.
+        if self.degraded {
+            return unacknowledged;
+        }
+        self.pending.full || self.urgent || unacknowledged
     }
 
     pub fn degraded(&self) -> bool {

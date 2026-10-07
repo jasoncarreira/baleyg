@@ -2797,6 +2797,100 @@ fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() 
 }
 
 #[test]
+fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_leaked_handler() {
+    use baleyg::store::MaintenanceOutcome;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let before: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(before > 0);
+    let deleted = Arc::new(AtomicBool::new(false));
+    let triggered = deleted.clone();
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        triggered.store(true, Ordering::Release);
+    });
+    let panics = AtomicUsize::new(0);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || {
+                if deleted.load(Ordering::Acquire) {
+                    panics.fetch_add(1, Ordering::Relaxed);
+                    panic!("test-only maintenance priority panic after first DELETE");
+                }
+                true
+            })
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    assert!(
+        deleted.load(Ordering::Acquire),
+        "the real manifest DELETE ran"
+    );
+    assert!(
+        panics.load(Ordering::Relaxed) > 0,
+        "priority panic was contained"
+    );
+    let snapshot: (String, i64, i64, i64, i64) = db
+        .query_row(
+            "SELECT state,
+                (SELECT count(*) FROM revision_documents WHERE revision_id=?1),
+                (SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1),
+                (SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1
+                    AND input_key='__pending_release:v1'),
+                (SELECT count(*) FROM native_release_candidate_versions WHERE revision_id=?1)
+             FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(snapshot, ("pending".into(), before, 1, 1, 0));
+    assert_eq!(store.status().unwrap().revision, head);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress,
+        "a later statement must not inherit the panic handler"
+    );
+}
+
+#[test]
 fn v9_noop_retention_uses_covering_indexes_and_never_opens_writer() {
     use baleyg::store::MaintenanceOutcome;
     use std::sync::atomic::Ordering;

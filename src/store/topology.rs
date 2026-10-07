@@ -1902,7 +1902,8 @@ fn readonly_db(path: &Path) -> Result<rusqlite::Connection> {
 /// Exact historical sqlite_master inventories made by released v4–v7 and
 /// pre-delta v8 writers. The digest includes table/index DDL and SQLite's
 /// autoindexes; a copied metadata row inside an invented schema is NOT proof.
-/// These allowlisted entries only permit read-only GC eligibility reporting.
+/// Only the exact prior-current v8 digest/marker can pass final deletion;
+/// all other entries permit read-only GC eligibility reporting only.
 fn historical_index_extractor(
     db: &rusqlite::Connection,
     version: i64,
@@ -2061,8 +2062,8 @@ pub enum GcStage {
 }
 
 // Final admission runs under this candidate's nonblocking EX use lock.
-// The current v9 and exact released historical shapes are separate paths;
-// an unknown schema can never borrow the current marker or be deleted.
+// The current v9 and the exact prior-current v8 digest/marker are the only
+// deletion paths. Other known historical shapes remain report-only.
 fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 9 {
@@ -2070,8 +2071,12 @@ fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
         super::validate_supersessions(db)?;
         return Ok(());
     }
-    ensure!((4..=8).contains(&version), "unknown historical GC schema");
+    ensure!(version == 8, "historical GC schema is report-only");
     let marker = historical_index_extractor(db, version)?.context("unknown historical GC shape")?;
+    ensure!(
+        marker == super::EXTRACTOR_VERSION,
+        "historical GC marker is report-only"
+    );
     let (schema, extractor): (i64, String) = db.query_row(
         "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
         [],

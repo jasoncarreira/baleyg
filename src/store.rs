@@ -8,6 +8,7 @@ pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmis
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
     path::Path,
@@ -1303,21 +1304,29 @@ fn publication_second() -> Result<i64> {
 // manifest-row count. The callback never unwinds through SQLite and may query
 // the separate autocommit queue probe (not the index writer connection).
 struct MaintenanceProgress<'a> {
-    allowed: &'a mut dyn FnMut() -> bool,
+    allowed: RefCell<&'a mut dyn FnMut() -> bool>,
     started: Instant,
 }
 impl MaintenanceProgress<'_> {
-    fn check(&mut self) -> bool {
+    fn check(&self) -> bool {
         self.started.elapsed() < Duration::from_millis(150)
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.allowed)()))
-                .unwrap_or(false)
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.allowed
+                    .try_borrow_mut()
+                    .map(|mut allowed| (*allowed)())
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(false)
     }
 }
 unsafe extern "C" fn maintenance_progress_callback(arg: *mut std::ffi::c_void) -> libc::c_int {
-    // SAFETY: the stack context remains pinned in the active maintenance unit
-    // until the progress handler is removed, before its SQLite connection closes.
-    let context = unsafe { &mut *(arg as *mut MaintenanceProgress<'_>) };
-    if context.check() { 0 } else { 1 }
+    // SAFETY: the shared stack context outlives its registered SQLite handler.
+    // RefCell permits only one active FnMut borrow, including reentrant calls.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let context = unsafe { &*(arg as *const MaintenanceProgress<'_>) };
+        if context.check() { 0 } else { 1 }
+    }))
+    .unwrap_or(1)
 }
 struct MaintenanceProgressGuard(*mut rusqlite::ffi::sqlite3);
 impl Drop for MaintenanceProgressGuard {
@@ -1328,7 +1337,7 @@ impl Drop for MaintenanceProgressGuard {
 }
 fn install_maintenance_progress(
     db: &Connection,
-    context: &mut MaintenanceProgress<'_>,
+    context: &MaintenanceProgress<'_>,
 ) -> MaintenanceProgressGuard {
     // SAFETY: SQLite invokes this callback on the current connection's thread;
     // the guard removes it before `context` or `db` may be dropped.
@@ -1338,10 +1347,66 @@ fn install_maintenance_progress(
             handle,
             256,
             Some(maintenance_progress_callback),
-            (context as *mut MaintenanceProgress<'_>).cast(),
+            (context as *const MaintenanceProgress<'_>)
+                .cast_mut()
+                .cast(),
         );
     }
     MaintenanceProgressGuard(handle)
+}
+
+#[cfg(test)]
+mod maintenance_progress_ffi_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn shared_progress_check_then_sqlite_interrupt_contains_panic_and_clears_handler() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE rows(id INTEGER PRIMARY KEY);
+             WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<600)
+             INSERT INTO rows(id) SELECT x FROM n",
+        )
+        .unwrap();
+        let calls = Cell::new(0);
+        let panic_now = Cell::new(false);
+        let mut allowed = || {
+            calls.set(calls.get() + 1);
+            assert!(!panic_now.get(), "test-only progress panic");
+            true
+        };
+        let progress = MaintenanceProgress {
+            allowed: RefCell::new(&mut allowed),
+            started: Instant::now(),
+        };
+        assert!(progress.check(), "direct check precedes the FFI callback");
+        let handler = install_maintenance_progress(&db, &progress);
+        let tx = db.transaction().unwrap();
+        tx.execute("DELETE FROM rows WHERE id<=300", []).unwrap();
+        assert!(
+            calls.get() > 1,
+            "SQLite invoked the installed callback after direct check"
+        );
+        panic_now.set(true);
+        let interrupted = tx.execute("DELETE FROM rows WHERE id>300", []).unwrap_err();
+        assert!(matches!(
+            interrupted,
+            rusqlite::Error::SqliteFailure(info, _)
+                if info.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+        // An error-path transaction rollback can run while the handler remains
+        // registered. Panic containment must also cover this interval.
+        drop(tx);
+        drop(handler);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM rows", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            600
+        );
+        assert_eq!(db.execute("DELETE FROM rows", []).unwrap(), 600);
+        assert!(calls.get() > 1);
+    }
 }
 
 fn maintenance_sqlite_busy(error: &anyhow::Error) -> bool {
@@ -8778,11 +8843,11 @@ impl Store {
             return Ok(MaintenanceOutcome::Deferred);
         }
         let mut allowed = || self.maintenance_priority(permit, probe, &mut priority);
-        let mut progress = MaintenanceProgress {
-            allowed: &mut allowed,
+        let progress = MaintenanceProgress {
+            allowed: RefCell::new(&mut allowed),
             started: Instant::now(),
         };
-        let progress_guard = install_maintenance_progress(&db, &mut progress);
+        let progress_guard = install_maintenance_progress(&db, &progress);
         let work = (|| -> Result<MaintenanceOutcome> {
             if !progress.check() {
                 return Ok(MaintenanceOutcome::Deferred);

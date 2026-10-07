@@ -603,6 +603,13 @@ async fn main() -> Result<()> {
             };
             let output = serde_json::json!({"publishedRevision":revision,"status":status});
             write_session_json(&output, &session, std::io::stdout().lock())?;
+            if diagnostics {
+                eprintln!(
+                    "index-phase outside_status_output_ms={:.3} total_ms={:.3}",
+                    status_start.elapsed().as_secs_f64() * 1e3,
+                    command_start.elapsed().as_secs_f64() * 1e3
+                );
+            }
             // No cleanup can run before the terminal ACK, selected-status proof
             // and explicit JSON flush. This CLI owns no timer after it exits.
             if session.is_leader() {
@@ -615,13 +622,6 @@ async fn main() -> Result<()> {
                         Ok(_) | Err(_) => break, // Durable debt belongs to the next owner.
                     }
                 }
-            }
-            if diagnostics {
-                eprintln!(
-                    "index-phase outside_status_output_ms={:.3} total_ms={:.3}",
-                    status_start.elapsed().as_secs_f64() * 1e3,
-                    command_start.elapsed().as_secs_f64() * 1e3
-                );
             }
         }
         Command::Serve(args) => {
