@@ -1977,20 +1977,17 @@ fn inspect_index_with_open_hook(
     let tx = connection.transaction()?;
     let db = &tx;
     let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let historical_marker = if version == 9 {
-        // Only the exact current disposable v9 schema may be considered for
-        // unlink. Its read-only validator checks sqlite_master object DDL;
-        // a racing VIEW, trigger or changed table shape stays unknown.
-        if super::validate_cache_shape(db).is_err() {
-            return Ok(("unknown", "unknown_index_shape"));
-        }
+    let current_v8 = version == 8
+        && super::has_revision_release_debt(db)?
+        && super::validate_cache_shape(db).is_ok();
+    let historical_marker = if current_v8 {
+        // Only a complete additive-v8 maintenance layout can reach GC unlink.
+        // Earlier v8 layouts keep their prior report-only authority.
         if super::validate_supersessions(db).is_err() {
             return Ok(("unknown", "invalid_supersession_inventory"));
         }
         None
     } else if (4..=8).contains(&version) {
-        // Historical allowlisted shapes are read-only GC candidates, never
-        // served or migrated. Unknown v8 content cannot borrow a v9 marker.
         match historical_index_extractor(db, version)? {
             Some(marker) => Some(marker),
             None => return Ok(("unknown", "unknown_index_shape")),
@@ -2062,31 +2059,17 @@ pub enum GcStage {
 }
 
 // Final admission runs under this candidate's nonblocking EX use lock.
-// The current v9 and the exact prior-current v8 digest/marker are the only
-// deletion paths. Other known historical shapes remain report-only.
+// Historical v8 layouts without the complete maintenance extension remain
+// report-only, even if their extractor marker matches the current binary.
 fn validate_gc_candidate_shape(db: &rusqlite::Connection) -> Result<()> {
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version == 9 {
-        super::validate_cache_shape(db)?;
-        super::validate_supersessions(db)?;
-        return Ok(());
-    }
     ensure!(version == 8, "historical GC schema is report-only");
-    let marker = historical_index_extractor(db, version)?.context("unknown historical GC shape")?;
     ensure!(
-        marker == super::EXTRACTOR_VERSION,
-        "historical GC marker is report-only"
+        super::has_revision_release_debt(db)?,
+        "historical GC schema is report-only"
     );
-    let (schema, extractor): (i64, String) = db.query_row(
-        "SELECT schema_version,extractor_version FROM index_metadata WHERE singleton=1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    ensure!(
-        schema == version && extractor == marker,
-        "unknown historical GC marker"
-    );
-    Ok(())
+    super::validate_cache_shape(db)?;
+    super::validate_supersessions(db)
 }
 
 /// Only the exact current derived layout can reach the unlink boundary.
@@ -2715,7 +2698,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                9,
+                8,
                 "native-v4-delta-v1",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -2930,7 +2913,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn exact_historical_v8_requires_every_final_guard_then_is_collected() {
+    fn exact_historical_v8_remains_report_only_after_every_final_guard() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -3051,19 +3034,18 @@ mod gc_schema_race_tests {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.pragma_update(None, "user_version", 8_i64).unwrap();
         drop(db);
-        assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 1);
-        assert!(
-            !path.exists(),
-            "verified EX historical v8 candidate must be collected"
+        let before = fs::read(&path).unwrap();
+        assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 0);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "historical v8 must stay report-only without current retention layout"
         );
-        assert!(
-            !dir.exists(),
-            "unlink-last removes only the derived candidate directory"
-        );
+        assert!(dir.exists());
     }
 
     #[test]
-    fn exact_v9_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
+    fn exact_v8_gc_candidate_survives_unknown_busy_then_deletes_after_fences_clear() {
         let state = tempfile::tempdir().unwrap();
         let candidate_root = tempfile::tempdir().unwrap();
         let current_root = tempfile::tempdir().unwrap();
@@ -3156,7 +3138,7 @@ mod gc_schema_race_tests {
     }
 
     #[test]
-    fn stale_v9_extractor_marker_is_refused_without_gc_writes_or_deletion() {
+    fn stale_v8_extractor_marker_is_refused_without_gc_writes_or_deletion() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         let identity = WorkspaceIdentity::discover(Some(work.path()), work.path()).unwrap();
@@ -3193,7 +3175,7 @@ mod gc_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                9,
+                8,
                 "native-v4",
                 pin.index_generation.to_string(),
                 pin.index_revision as i64
@@ -3341,7 +3323,7 @@ mod gc_final_witness_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            9
+            8
         );
         drop(live);
         assert!(roots.index_use_lock(&candidate).exists());

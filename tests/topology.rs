@@ -1547,7 +1547,7 @@ fn index_delete_journal_no_wal() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        9
+        8
     );
     drop(db);
     let bytes = fs::read(&index).unwrap();
@@ -2212,7 +2212,7 @@ fn forget_rechecks_sqlite_schema_after_confirmation() {
 }
 
 #[test]
-fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
+fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2235,7 +2235,7 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
         (entry.status, entry.reason)
     };
     assert_eq!(inspect(), ("unknown", "recent_open"));
-    // v9's CHECK forbids spoofing an old extractor on the current layout.
+    // v8's CHECK forbids spoofing an old extractor on the current layout.
     assert!(
         db.execute(
             "UPDATE index_metadata SET extractor_version='native-v1'",
@@ -2259,7 +2259,7 @@ fn gc_classifies_current_schema9_but_refuses_spoofed_shapes() {
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.pragma_update(None, "user_version", 7).unwrap();
     assert_eq!(inspect(), ("unknown", "unknown_index_shape"));
-    db.pragma_update(None, "user_version", 9).unwrap();
+    db.pragma_update(None, "user_version", 8).unwrap();
     assert_eq!(inspect(), ("unknown", "recent_open"));
     db.execute("UPDATE index_metadata SET root_inode='1'", [])
         .unwrap();
@@ -2935,7 +2935,7 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
 }
 
 #[test]
-fn gc_report_accepts_current_v9_supersession_extension_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_v8_retention_extension_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();

@@ -8,7 +8,6 @@ pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmis
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
     path::Path,
@@ -402,11 +401,15 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 UNION ALL
 SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 9;
+const DATABASE_SCHEMA_VERSION: u32 = 8;
 const EXTRACTOR_VERSION: &str = "native-v4-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const SUPERSESSION_SCHEMA_V9: &str = r#"
-CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991),state TEXT NOT NULL CHECK(state IN ('retained','pending','released')));
+// The original v8 supersession extension stays byte-for-byte compatible.
+const SUPERSESSION_SCHEMA_V8: &str = "CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));";
+// Additive v8 maintenance extension: installed under a verified leader's
+// write transaction without replacing existing pins, queues, or index inode.
+const RETENTION_SCHEMA_V8: &str = r#"
+ALTER TABLE native_revision_supersessions ADD COLUMN state TEXT NOT NULL DEFAULT 'retained' CHECK(state IN ('retained','pending','released'));
 CREATE INDEX native_supersessions_clock ON native_revision_supersessions(superseded_at,revision_id);
 CREATE INDEX native_supersessions_due ON native_revision_supersessions(superseded_at,revision_id) WHERE state='retained';
 CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,phase TEXT NOT NULL CHECK(phase='pending'));
@@ -415,8 +418,8 @@ CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCE
 CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
 "#;
 
-const CACHE_SCHEMA_V9: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=9), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
+const CACHE_SCHEMA_V8: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -463,7 +466,7 @@ CREATE TABLE native_version_call_regions(version_id TEXT NOT NULL,call_id TEXT N
 "#;
 // Additive schema8 extension. An existing v8 cache keeps every row, generation,
 // pin, and queue; the first new publication installs these two tables atomically.
-const PRODUCER_BINDING_SCHEMA_V9: &str = r#"
+const PRODUCER_BINDING_SCHEMA_V8: &str = r#"
 CREATE TABLE native_binding_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),index_generation TEXT NOT NULL,first_revision INTEGER NOT NULL CHECK(first_revision BETWEEN 1 AND 9007199254740991));
 CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,producer_sha TEXT NOT NULL CHECK(length(producer_sha)=64),binding_sha TEXT NOT NULL CHECK(length(binding_sha)=64));
 "#;
@@ -1193,54 +1196,8 @@ impl StagedIndex {
 // Aborted stages are explicitly unlinked and unwitnessed under verified EX by
 // Store::cleanup_failed_staged_index. An unexpected drop leaves the temporary
 // file on disk rather than silently creating a retained, deleted inode.
-/// Match every cache schema object, including type, name, owning table, SQL,
-/// and SQLite autoindexes. Unknown views/triggers must never execute on rebaseline.
-/// Rebuild disposable index-owned schema in the same inode and transaction.
-/// The enclosing IMMEDIATE transaction also publishes the new full pair, so a
-/// failed rebuild rolls back all DDL and leaves the old index not-ready.
-fn reset_disposable_schema(
-    tx: &Connection,
-    root: &str,
-    identity: &topology::WorkspaceIdentity,
-) -> Result<()> {
-    tx.pragma_update(None, "defer_foreign_keys", "ON")?;
-    let objects: Vec<(String, String)> = tx
-        .prepare(
-            "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'
-         AND type IN ('view','trigger','table')
-         ORDER BY CASE type WHEN 'view' THEN 0 WHEN 'trigger' THEN 1 ELSE 2 END,name",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (kind, name) in objects {
-        let quoted = name.replace('"', "\"\"");
-        tx.execute_batch(&format!(
-            "DROP {} IF EXISTS \"{}\";",
-            kind.to_uppercase(),
-            quoted
-        ))?;
-    }
-    tx.execute_batch(CACHE_SCHEMA_V9)?;
-    tx.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
-    tx.execute_batch(SUPERSESSION_SCHEMA_V9)?;
-    let age = publication_second()?;
-    tx.execute(
-        "INSERT INTO index_metadata VALUES(1,9,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
-        params![
-            EXTRACTOR_VERSION,
-            root,
-            identity.device.to_string(),
-            identity.inode.to_string(),
-            uuid::Uuid::new_v4().to_string(),
-            age,
-            json(&IndexStats::default())?,
-            json(&Vec::<Diagnostic>::new())?
-        ],
-    )?;
-    tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
-    Ok(())
-}
-
+/// Match every cache object, including type, name, owning table, SQL, and
+/// autoindexes. Unknown views and triggers cannot run during a publication.
 fn validate_cache_shape(db: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(db: &Connection) -> Result<Vec<Object>> {
@@ -1258,26 +1215,38 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     }
     let expected = Connection::open_in_memory()?;
     let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    ensure!(
+        version <= DATABASE_SCHEMA_VERSION,
+        "incompatible_index: unsupported newer schema cannot be rebaselined"
+    );
     control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V9)?;
+    expected.execute_batch(CACHE_SCHEMA_V8)?;
     let actual = objects(db)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
-    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
+    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
-    expected.execute_batch(SUPERSESSION_SCHEMA_V9)?;
+    expected.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
+    expected.execute_batch(RETENTION_SCHEMA_V8)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
     let without_binding = Connection::open_in_memory()?;
-    without_binding.execute_batch(CACHE_SCHEMA_V9)?;
-    without_binding.execute_batch(SUPERSESSION_SCHEMA_V9)?;
+    without_binding.execute_batch(CACHE_SCHEMA_V8)?;
+    without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    if actual == objects(&without_binding)? {
+        return Ok(());
+    }
+    without_binding.execute_batch(RETENTION_SCHEMA_V8)?;
     control_ensure!(
         actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -1291,6 +1260,13 @@ fn has_revision_supersessions(db: &Connection) -> Result<bool> {
     )?)
 }
 
+fn has_revision_release_debt(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt')",
+        [], |r| r.get(0),
+    )?)
+}
+
 fn publication_second() -> Result<i64> {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     ensure!(
@@ -1300,22 +1276,19 @@ fn publication_second() -> Result<i64> {
     Ok(seconds as i64)
 }
 
-// A SQLite progress callback bounds actual statement work, not only nominal
-// manifest-row count. The callback never unwinds through SQLite and may query
-// the separate autocommit queue probe (not the index writer connection).
+// SQLite's progress callback only tests whether a publisher has entered the
+// gate's waiting state. The expensive queue/session probe belongs at unit
+// boundaries, not on every 256 VM operations. Large rows must never be
+// rolled back forever because a fixed wall-clock interval elapsed.
 struct MaintenanceProgress<'a> {
-    allowed: RefCell<&'a mut dyn FnMut() -> bool>,
-    started: Instant,
+    gate: &'a PublicationGate,
 }
 impl MaintenanceProgress<'_> {
     fn check(&self) -> bool {
-        self.started.elapsed() < Duration::from_millis(150)
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.allowed
-                    .try_borrow_mut()
-                    .map(|mut allowed| (*allowed)())
-                    .unwrap_or(false)
-            }))
+        self.gate
+            .state
+            .try_lock()
+            .map(|state| state.waiting == 0)
             .unwrap_or(false)
     }
 }
@@ -1358,10 +1331,8 @@ fn install_maintenance_progress(
 #[cfg(test)]
 mod maintenance_progress_ffi_tests {
     use super::*;
-    use std::cell::Cell;
-
     #[test]
-    fn shared_progress_check_then_sqlite_interrupt_contains_panic_and_clears_handler() {
+    fn publisher_wait_interrupts_sqlite_and_removes_handler() {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE rows(id INTEGER PRIMARY KEY);
@@ -1369,34 +1340,19 @@ mod maintenance_progress_ffi_tests {
              INSERT INTO rows(id) SELECT x FROM n",
         )
         .unwrap();
-        let calls = Cell::new(0);
-        let panic_now = Cell::new(false);
-        let mut allowed = || {
-            calls.set(calls.get() + 1);
-            assert!(!panic_now.get(), "test-only progress panic");
-            true
-        };
-        let progress = MaintenanceProgress {
-            allowed: RefCell::new(&mut allowed),
-            started: Instant::now(),
-        };
-        assert!(progress.check(), "direct check precedes the FFI callback");
+        let gate = PublicationGate::default();
+        let progress = MaintenanceProgress { gate: &gate };
+        assert!(progress.check());
         let handler = install_maintenance_progress(&db, &progress);
         let tx = db.transaction().unwrap();
         tx.execute("DELETE FROM rows WHERE id<=300", []).unwrap();
-        assert!(
-            calls.get() > 1,
-            "SQLite invoked the installed callback after direct check"
-        );
-        panic_now.set(true);
+        gate.state.lock().unwrap().waiting = 1;
         let interrupted = tx.execute("DELETE FROM rows WHERE id>300", []).unwrap_err();
         assert!(matches!(
             interrupted,
             rusqlite::Error::SqliteFailure(info, _)
                 if info.code == rusqlite::ErrorCode::OperationInterrupted
         ));
-        // An error-path transaction rollback can run while the handler remains
-        // registered. Panic containment must also cover this interval.
         drop(tx);
         drop(handler);
         assert_eq!(
@@ -1405,7 +1361,6 @@ mod maintenance_progress_ffi_tests {
             600
         );
         assert_eq!(db.execute("DELETE FROM rows", []).unwrap(), 600);
-        assert!(calls.get() > 1);
     }
 }
 
@@ -1465,63 +1420,86 @@ fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Res
         ),
         _ => unreachable!("fixed cleanup kind"),
     };
-    let candidate_id: Option<String> = tx
-        .query_row(
-            &format!("SELECT id FROM {candidate} WHERE revision_id=?1 ORDER BY id LIMIT 1"),
-            [revision],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(id) = candidate_id else {
-        return Ok(());
-    };
-    let still_referenced: bool = tx.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM revision_documents WHERE {reference}=?1 LIMIT 1)"),
-        [&id],
-        |r| r.get(0),
-    )?;
-    if !still_referenced {
-        // Some projections are not directly in a manifest (for example an
-        // optional class projection). Journal one dependent candidate first;
-        // never orphan it by deleting its graph/version parent prematurely.
-        let dependent = match kind {
-            "graph" => Some((
-                "class_projections",
-                "graph_projection_id",
-                "native_release_candidate_classes",
-            )),
-            "version" => Some((
-                "graph_projections",
-                "document_version_id",
-                "native_release_candidate_graphs",
-            )),
-            _ => None,
+    // A release unit can retire many small candidates. Referenced candidates
+    // need just the indexed EXISTS probe and an un-journal; large child trees
+    // retain the candidate while small committed DELETE batches resume later.
+    for _ in 0..64 {
+        let candidate_id: Option<String> = tx
+            .query_row(
+                &format!("SELECT id FROM {candidate} WHERE revision_id=?1 ORDER BY id LIMIT 1"),
+                [revision],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = candidate_id else {
+            return Ok(());
         };
-        if let Some((table, field, queue)) = dependent {
-            let child: Option<String> = tx
-                .query_row(
-                    &format!("SELECT id FROM {table} WHERE {field}=?1 ORDER BY id LIMIT 1"),
-                    [&id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(child) = child {
-                tx.execute(
-                    &format!("INSERT OR IGNORE INTO {queue}(revision_id,id) VALUES(?1,?2)"),
-                    params![revision, child],
-                )?;
-                return Ok(());
+        let still_referenced: bool = tx.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE {reference}=?1 LIMIT 1)"
+            ),
+            [&id],
+            |r| r.get(0),
+        )?;
+        if !still_referenced {
+            // A projection absent from the manifest may still own another
+            // projection. Journal its dependent before removing the parent.
+            let dependent = match kind {
+                "graph" => Some((
+                    "class_projections",
+                    "graph_projection_id",
+                    "native_release_candidate_classes",
+                )),
+                "version" => Some((
+                    "graph_projections",
+                    "document_version_id",
+                    "native_release_candidate_graphs",
+                )),
+                _ => None,
+            };
+            if let Some((table, field, queue)) = dependent {
+                let child: Option<String> = tx
+                    .query_row(
+                        &format!("SELECT id FROM {table} WHERE {field}=?1 ORDER BY id LIMIT 1"),
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(child) = child {
+                    tx.execute(
+                        &format!("INSERT OR IGNORE INTO {queue}(revision_id,id) VALUES(?1,?2)"),
+                        params![revision, child],
+                    )?;
+                    return Ok(());
+                }
             }
+            for child in children {
+                // Self-referential declarations and control regions must be
+                // removed together: a partial parent DELETE cannot commit with
+                // references from still-present descendants.
+                let self_referential = matches!(
+                    *child,
+                    "native_version_declarations" | "native_version_control_regions"
+                );
+                let changed = if self_referential {
+                    tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [&id])?
+                } else {
+                    tx.execute(
+                        &format!("DELETE FROM {child} WHERE rowid IN (SELECT rowid FROM {child} WHERE {child_key}=?1 LIMIT 256)"),
+                        [&id],
+                    )?
+                };
+                if !self_referential && changed == 256 {
+                    return Ok(());
+                }
+            }
+            tx.execute(&format!("DELETE FROM {parent} WHERE id=?1"), [&id])?;
         }
-        for child in children {
-            tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [&id])?;
-        }
-        tx.execute(&format!("DELETE FROM {parent} WHERE id=?1"), [&id])?;
+        tx.execute(
+            &format!("DELETE FROM {candidate} WHERE revision_id=?1 AND id=?2"),
+            params![revision, id],
+        )?;
     }
-    tx.execute(
-        &format!("DELETE FROM {candidate} WHERE revision_id=?1 AND id=?2"),
-        params![revision, id],
-    )?;
     Ok(())
 }
 
@@ -1557,8 +1535,14 @@ mod retention_clock_tests {
 
 // Called only with the leader's immediate write transaction. Existing pins stay put.
 fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
-    if !has_revision_supersessions(db)? {
-        db.execute_batch(SUPERSESSION_SCHEMA_V9)?;
+    let missing_supersessions = !has_revision_supersessions(db)?;
+    if missing_supersessions {
+        db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    }
+    if !has_revision_release_debt(db)? {
+        db.execute_batch(RETENTION_SCHEMA_V8)?;
+    }
+    if missing_supersessions {
         db.execute(
             "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
              SELECT r.id,?1,'retained' FROM native_revisions r CROSS JOIN index_metadata m
@@ -1682,11 +1666,19 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
     // The finite busy timeout is per SQLite call; the accepted FIFO request
     // keeps its durable ID if contention outlives this call.
     let db = open_index_marker_probe(path, writable, Duration::from_secs(5))?;
+    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
+    ensure!(
+        version <= DATABASE_SCHEMA_VERSION,
+        "incompatible_index: unsupported newer schema cannot be rebaselined"
+    );
     let marker = read_index_format_marker(&db)?;
+    ensure!(
+        marker.schema_version <= i64::from(DATABASE_SCHEMA_VERSION),
+        "incompatible_index: unsupported newer schema cannot be rebaselined"
+    );
     if marker.is_obsolete() {
         return Err(ObsoleteIndexFormat(marker).into());
     }
-    let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
     control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unsupported disposable schema version"
@@ -1722,7 +1714,7 @@ fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
         return RecoveryClass::RecreatePending;
     }
     if error.downcast_ref::<ObsoleteIndexFormat>().is_some() {
-        return RecoveryClass::Rebuild;
+        return RecoveryClass::RecreatePending;
     }
     if error.downcast_ref::<SelectedIntegrity>().is_some()
         || error.downcast_ref::<ControlIntegrity>().is_some()
@@ -3364,7 +3356,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && incarnation.is_none() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V9 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V8 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -3659,70 +3651,96 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
         count == current && first == Some(1) && last == Some(current) && mismatched == 0,
         "incompatible_index: native header pin mismatch"
     );
-    // Validate all states on broad admission/status, never on a private no-op.
-    // Pending retains original inputs while its manifest may be partly drained.
-    let malformed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM native_revisions r
-         CROSS JOIN index_metadata h
-         LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
-         LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
-         WHERE
-           (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
-                AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL))
-           OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
-                AND s.revision_id IS NULL)
-           OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
-           OR (s.state='pending' AND debt.revision_id IS NULL)
-           OR (s.state='retained' AND (debt.revision_id IS NOT NULL
-                OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                  AND i.input_key IN ('__pending_release:v1','__released:v1'))
-                OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                   != json_array_length(r.source_inventory)))
-           OR (s.state='pending' AND (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                     WHERE i.revision_id=r.id AND i.input_key='__pending_release:v1'
-                       AND i.payload='pending_release:v1')
-                OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                    AND i.input_key='__released:v1')
-                OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                   > json_array_length(r.source_inventory)))
-           OR (s.state='released' AND (debt.revision_id IS NOT NULL
-                OR (SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1
-                OR NOT EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                     AND i.input_key='__released:v1' AND i.payload='released:v1')
-                OR EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
-           OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
-                      OR s.state!='pending'))
-                     OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
-                      OR s.state!='released')))))",
-        [],
-        |row| row.get(0),
-    )?;
-    control_ensure!(
-        !malformed,
-        "incompatible_index: retained manifest/release mismatch"
-    );
-    let stray_candidates: bool = db.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM native_release_candidate_versions c
-             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-             WHERE s.state IS NOT 'pending'
-           UNION ALL
-           SELECT 1 FROM native_release_candidate_graphs c
-             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-             WHERE s.state IS NOT 'pending'
-           UNION ALL
-           SELECT 1 FROM native_release_candidate_classes c
-             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
-             WHERE s.state IS NOT 'pending'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    control_ensure!(
-        !stray_candidates,
-        "incompatible_index: release candidates without pending debt"
-    );
+    if !has_revision_release_debt(db)? {
+        // A prior v8 index has no maintenance extension yet. Validate its
+        // complete retained manifests before the first atomic installation.
+        // A release leaves its header as a durable tombstone. Missing manifests
+        // without that exact marker (including an empty legitimate revision) are
+        // never accepted as released. The marker owns no native capture input.
+        let malformed: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_revisions r WHERE
+                (EXISTS(SELECT 1 FROM revision_capture_inputs i
+                    WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
+                  ((SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1 OR
+                   NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                     WHERE i.revision_id=r.id AND i.input_key='__released:v1' AND i.payload='released:v1') OR
+                   EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
+                OR (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                    WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
+                   (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                       != json_array_length(r.source_inventory)))",
+            [], |row| row.get(0),
+        )?;
+        control_ensure!(
+            !malformed,
+            "incompatible_index: retained manifest/release mismatch"
+        );
+    } else {
+        // Validate all states on broad admission/status, never on a private no-op.
+        // Pending retains original inputs while its manifest may be partly drained.
+        let malformed: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_revisions r
+             CROSS JOIN index_metadata h
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
+             LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
+             WHERE
+               (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
+                    AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL))
+               OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
+                    AND s.revision_id IS NULL)
+               OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
+               OR (s.state='pending' AND debt.revision_id IS NULL)
+               OR (s.state='retained' AND (debt.revision_id IS NOT NULL
+                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                      AND i.input_key IN ('__pending_release:v1','__released:v1'))
+                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                       != json_array_length(r.source_inventory)))
+               OR (s.state='pending' AND (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                         WHERE i.revision_id=r.id AND i.input_key='__pending_release:v1'
+                           AND i.payload='pending_release:v1')
+                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                        AND i.input_key='__released:v1')
+                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                       > json_array_length(r.source_inventory)))
+               OR (s.state='released' AND (debt.revision_id IS NOT NULL
+                    OR (SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1
+                    OR NOT EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                         AND i.input_key='__released:v1' AND i.payload='released:v1')
+                    OR EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
+               OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                    AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
+                          OR s.state!='pending'))
+                         OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
+                          OR s.state!='released')))))",
+            [],
+            |row| row.get(0),
+        )?;
+        control_ensure!(
+            !malformed,
+            "incompatible_index: retained manifest/release mismatch"
+        );
+        let stray_candidates: bool = db.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM native_release_candidate_versions c
+                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+                 WHERE s.state IS NOT 'pending'
+               UNION ALL
+               SELECT 1 FROM native_release_candidate_graphs c
+                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+                 WHERE s.state IS NOT 'pending'
+               UNION ALL
+               SELECT 1 FROM native_release_candidate_classes c
+                 LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+                 WHERE s.state IS NOT 'pending'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        control_ensure!(
+            !stray_candidates,
+            "incompatible_index: release candidates without pending debt"
+        );
+    }
     bounded_graph_pair(
         db,
         "SELECT typeof(r.graph_stats),length(CAST(r.graph_stats AS BLOB)),
@@ -4693,7 +4711,8 @@ impl Store {
         Arc::ptr_eq(&self.publication_gate, &permit.gate)
             && waiting == 0
             && probe.check() == MaintenanceQueueState::Clear
-            && priority()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| priority()))
+                .unwrap_or(false)
     }
     pub fn open(
         roots: topology::TopologyRoots,
@@ -4734,6 +4753,9 @@ impl Store {
         match admission {
             Ok(()) => Ok(store),
             Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
+                if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
+                    *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
+                }
                 store.mark_recovery(RecoveryDisposition::RecreatePending);
                 Ok(store)
             }
@@ -5091,11 +5113,13 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V9)?;
+                db.execute_batch(CACHE_SCHEMA_V8)?;
+                db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+                db.execute_batch(RETENTION_SCHEMA_V8)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,9,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,8,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -5776,6 +5800,9 @@ impl Store {
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         self.verify_metadata_root(db)?;
         let witness = self.metadata_witness(db, schema)?;
+        if schema > DATABASE_SCHEMA_VERSION {
+            anyhow::bail!("incompatible_index: unsupported newer schema cannot be rebaselined");
+        }
         if schema != DATABASE_SCHEMA_VERSION {
             self.mark_recovery(RecoveryDisposition::Rebuild);
             return Ok(RecoveryBaseline {
@@ -8212,8 +8239,11 @@ impl Store {
         if let PublicationTarget::Live = target {
             self.ensure_not_recreate_pending()?;
         }
-        let rebaseline = schema != DATABASE_SCHEMA_VERSION
-            || !compatible
+        ensure!(
+            schema == DATABASE_SCHEMA_VERSION,
+            "incompatible_index: unsupported schema cannot be rebaselined"
+        );
+        let rebaseline = !compatible
             || !decoded
             || (matches!(target, PublicationTarget::Live)
                 && self.disposition() == RecoveryDisposition::Rebuild);
@@ -8265,13 +8295,44 @@ impl Store {
             },
         };
         if rebaseline {
-            reset_disposable_schema(&tx, &self.workspace_root, &self.identity)?;
+            if !has_revision_supersessions(&tx)? {
+                tx.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+            }
+            if !has_revision_release_debt(&tx)? {
+                tx.execute_batch(RETENTION_SCHEMA_V8)?;
+            }
         } else {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
         }
         let binding_extension = has_revision_producer_bindings(&tx)?;
+        if rebaseline && binding_extension {
+            tx.execute_batch(
+                "DELETE FROM revision_producer_bindings; DELETE FROM native_binding_epoch;",
+            )?;
+        }
+        if rebaseline {
+            // An incompatible/corrupt generation is explicitly replaced, never served.
+            // Only compatible same-generation publication appends history.
+            tx.execute_batch("DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
+                DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
+                DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
+                DELETE FROM native_version_ancestor_signature_types; DELETE FROM native_version_parameters;
+                DELETE FROM native_version_header_items; DELETE FROM native_version_headers;
+                DELETE FROM native_version_declaration_ancestors; DELETE FROM native_version_declarations;
+                DELETE FROM native_version_coverage_roles; DELETE FROM class_relations; DELETE FROM classes;
+                DELETE FROM class_projections; DELETE FROM graph_calls; DELETE FROM graph_regions;
+                DELETE FROM graph_nodes; DELETE FROM graph_projections; DELETE FROM document_versions;
+                DELETE FROM native_release_candidate_classes; DELETE FROM native_release_candidate_graphs;
+                DELETE FROM native_release_candidate_versions; DELETE FROM native_revision_release_debt;
+                DELETE FROM native_revision_supersessions; DELETE FROM native_revisions; DELETE FROM native_source_set_dependencies;
+                DELETE FROM native_source_set_languages; DELETE FROM native_source_sets;
+                DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
+                DELETE FROM native_producers;")?;
+        }
         if !binding_extension {
-            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
+            // DDL and epoch are committed with the FIRST newly bound revision.
+            // Readers before commit see the original exact v8 shape and old pins.
+            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
         }
         if !binding_extension || rebaseline {
             tx.execute(
@@ -8416,7 +8477,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=9,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=8,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,leader.incarnation.to_string(),json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -8642,6 +8703,10 @@ impl Store {
                 false,
                 Duration::ZERO,
             )?;
+            if !has_revision_release_debt(&db)? {
+                guard.verify()?;
+                return Ok(None);
+            }
             let latest: Option<i64> = db.query_row(
                 "SELECT max(superseded_at) FROM native_revision_supersessions",
                 [],
@@ -8776,6 +8841,10 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
+        if !has_revision_release_debt(&db)? {
+            guard.verify()?;
+            return Ok(MaintenanceOutcome::Idle);
+        }
         let selected_read = (|| -> Result<(IndexPin, i64, Option<String>)> {
             let head = ReadRevision::current(&db)?.pin;
             let max_stamp: Option<i64> = db.query_row(
@@ -8842,10 +8911,8 @@ impl Store {
         if !self.maintenance_priority(permit, probe, &mut priority) {
             return Ok(MaintenanceOutcome::Deferred);
         }
-        let mut allowed = || self.maintenance_priority(permit, probe, &mut priority);
         let progress = MaintenanceProgress {
-            allowed: RefCell::new(&mut allowed),
-            started: Instant::now(),
+            gate: &self.publication_gate,
         };
         let progress_guard = install_maintenance_progress(&db, &progress);
         let work = (|| -> Result<MaintenanceOutcome> {
@@ -8961,7 +9028,7 @@ impl Store {
             leader.verify()?;
             self.identity.verify()?;
             guard.verify()?;
-            if !progress.check() {
+            if !progress.check() || !self.maintenance_priority(permit, probe, &mut priority) {
                 return Ok(MaintenanceOutcome::Deferred);
             }
             tx.commit()?;
@@ -8981,18 +9048,19 @@ impl Store {
 
     /// Explicit leader cleanup for CLI/test callers. Daemon maintenance uses
     /// one `maintenance_step` at a time, never this draining convenience API.
+    /// Explicit release is allowed to finish a revision larger than 4096 units;
+    /// publication priority can still defer any individual unit.
     pub fn maintain_revisions(&self, leader: &topology::LeaderGuard) -> Result<()> {
         let Some(permit) = self.maintenance_try_enter() else {
             return Ok(());
         };
-        for _ in 0..4096 {
+        loop {
             let probe = self.open_maintenance_queue_probe()?;
             match self.maintenance_step(leader, &permit, &probe, || true)? {
                 MaintenanceOutcome::Progress => {}
                 MaintenanceOutcome::Idle | MaintenanceOutcome::Deferred => return Ok(()),
             }
         }
-        Ok(()) // Debt remains durable; the next owner/idle turn resumes it.
     }
 
     /// Public release is due-fenced. Earlier release is never exposed to a
@@ -11769,7 +11837,7 @@ mod rebaseline_fault_tests {
     }
 
     #[test]
-    fn obsolete_metadata_marker_rebuilds_same_inode_and_preserves_requests() {
+    fn obsolete_metadata_marker_recreates_new_file_and_preserves_requests() {
         use std::os::unix::fs::MetadataExt;
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
@@ -11803,27 +11871,20 @@ mod rebaseline_fault_tests {
         drop(db);
         let inode = fs::metadata(&index).unwrap().ino();
         let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
-        assert_eq!(recovering.disposition(), RecoveryDisposition::Rebuild);
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
         assert!(recovering.status().is_err());
-        let session = recovering.leader_session().unwrap();
-        let baseline = recovering.recovery_index_baseline().unwrap();
-        assert!(!baseline.compatible);
-        let (graph, native, capture) =
-            index_workspace_bundle(&options, recovering.root_id(), &cancel, |_| {}).unwrap();
-        let pin = recovering
-            .publish_native_recovery(
-                &graph,
-                &capture,
-                &native,
-                session.leader_guard().unwrap(),
-                baseline,
-                &cancel,
-            )
+        let (pin, session) = recovering
+            .recreate_pending_leader_session(&options, &cancel)
             .unwrap();
-        recovering
-            .attest_post_acquisition_reconciliation_guard(session.leader_guard().unwrap(), pin)
-            .unwrap();
-        assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
+        assert_ne!(
+            fs::metadata(&index).unwrap().ino(),
+            inode,
+            "obsolete index must recreate as a new file"
+        );
+        assert_eq!(recovering.status().unwrap().revision, pin);
         assert_eq!(pin.index_revision, 1);
         assert_ne!(pin.index_generation, original.index_generation);
         let queued = recovering.request_by_id(&request.id).unwrap().unwrap();
@@ -11836,6 +11897,7 @@ mod rebaseline_fault_tests {
                 .to_string()
                 .contains("revision conflict")
         );
+        drop(session);
     }
 
     #[test]
@@ -13712,7 +13774,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                9,
+                8,
                 "native-v4-delta-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
@@ -13721,7 +13783,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            9
+            8
         );
         let forged: i64 = db
             .query_row(
@@ -13862,7 +13924,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                9,
+                8,
                 "native-v4-delta-v1",
                 leader_pin.index_generation.to_string(),
                 leader_pin.index_revision as i64

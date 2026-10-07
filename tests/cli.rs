@@ -4506,7 +4506,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 9, "derived v9 index inspection is separate");
+    assert_eq!(index_version, 8, "derived v8 index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}

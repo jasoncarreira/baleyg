@@ -52,7 +52,7 @@ fn private_stage_build_is_unpublished_and_cleans_only_its_own_inode() {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!((version, metadata_version), (9, 9));
+        assert_eq!((version, metadata_version), (8, 8));
         for name in [
             "document_versions",
             "revision_documents",
@@ -470,11 +470,13 @@ fn incompatible_index_refuses_without_touching_legacy_state() {
     let db = rusqlite::Connection::open(&index).unwrap();
     db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
-    let deferred = Store::open_for_tests(state.path(), work.path()).unwrap();
+    let before = std::fs::read(&index).unwrap();
+    let error = Store::open_for_tests(state.path(), work.path()).unwrap_err();
     assert!(
-        deferred.status().is_err(),
-        "unsupported disposable schema cannot serve"
+        error.to_string().contains("unsupported newer schema"),
+        "{error:#}"
     );
+    assert_eq!(std::fs::read(&index).unwrap(), before);
     assert_eq!(std::fs::read(legacy).unwrap(), b"untouched legacy bytes");
 }
 #[test]
