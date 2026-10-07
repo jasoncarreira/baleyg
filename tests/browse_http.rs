@@ -50,7 +50,16 @@ fn setup() -> (
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session(session.clone());
+    // These offline API tests read a committed snapshot. Start no 20ms queue tick:
+    // a concurrent watcher refresh can put the Store into mandatory reconciliation
+    // between the test's two reads, which is a separate daemon-flow concern.
+    std::thread::spawn({
+        let state = state.clone();
+        let session = session.clone();
+        move || state.retain_serving_session(session)
+    })
+    .join()
+    .unwrap();
     let app = http::router(state);
     (dir, store, graph, app, session)
 }
