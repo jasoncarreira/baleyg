@@ -610,6 +610,19 @@ async fn main() -> Result<()> {
                     command_start.elapsed().as_secs_f64() * 1e3
                 );
             }
+            // No cleanup can run before the terminal ACK, selected-status proof
+            // and explicit JSON flush. This CLI owns no timer after it exits.
+            if session.is_leader() {
+                for _ in 0..2 {
+                    let priority = || session.verify().is_ok() && store.verify_root().is_ok();
+                    match baleyg::index_coordinator::cooperative_maintenance_unit(
+                        &store, &session, priority,
+                    ) {
+                        Ok(baleyg::store::MaintenanceOutcome::Progress) => {}
+                        Ok(_) | Err(_) => break, // Durable debt belongs to the next owner.
+                    }
+                }
+            }
         }
         Command::Serve(args) => {
             ensure!(

@@ -2935,7 +2935,7 @@ fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() 
 }
 
 #[test]
-fn gc_report_accepts_current_v8_supersession_extension_but_rejects_bad_inventory() {
+fn gc_report_accepts_current_v8_retention_extension_but_rejects_bad_inventory() {
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2952,7 +2952,7 @@ fn gc_report_accepts_current_v8_supersession_extension_but_rejects_bad_inventory
     assert_eq!((good.status, good.reason), ("unknown", "recent_open"));
     db.pragma_update(None, "foreign_keys", "OFF").unwrap();
     db.execute(
-        "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES('missing',0)",
+        "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state) VALUES('missing',0,'retained')",
         [],
     )
     .unwrap();
@@ -2964,6 +2964,78 @@ fn gc_report_accepts_current_v8_supersession_extension_but_rejects_bad_inventory
     db.execute("DELETE FROM native_revision_supersessions", [])
         .unwrap();
     assert_eq!(inspect().reason, "recent_open");
+}
+
+#[test]
+fn automatic_gc_reports_but_never_deletes_older_or_alternate_historical_indexes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let (temp, roots) = common::fixture();
+    let now = 1_800_000_000_i64;
+    let mut candidates = Vec::new();
+    for (name, version, marker, ddl) in [
+        (
+            "old-v7",
+            7_i64,
+            "native-paired-v1",
+            include_str!("fixtures/gc-legacy/v7.sql"),
+        ),
+        (
+            "alternate-v8",
+            8_i64,
+            "native-v4-class-compose-v1",
+            include_str!("fixtures/gc-legacy/v8-native-class-late.sql"),
+        ),
+    ] {
+        let workspace = temp.path().join(name);
+        fs::create_dir(&workspace).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&workspace), &workspace).unwrap();
+        // Create the same private use/leader inodes as an actual old candidate,
+        // without opening a v9 Store that would retain the old index.db inode.
+        drop(roots.leader(&identity).unwrap());
+        let path = roots.index_db(&identity);
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(ddl).unwrap();
+        db.pragma_update(None, "user_version", version).unwrap();
+        db.execute(
+            "INSERT INTO index_metadata(singleton,schema_version,extractor_version,root_spelling,root_device,root_inode,index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics) VALUES (1,?1,?2,?3,?4,?5,?6,1,?7,'','{}','[]')",
+            rusqlite::params![version, marker, identity.root.to_str().unwrap(), identity.device.to_string(), identity.inode.to_string(), uuid::Uuid::new_v4().to_string(), now - 31 * 86_400],
+        ).unwrap();
+        drop(db);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let stat = fs::metadata(&path).unwrap();
+        candidates.push((identity, path.clone(), stat.ino(), fs::read(path).unwrap()));
+    }
+    let current_root = temp.path().join("current-gc");
+    fs::create_dir(&current_root).unwrap();
+    drop(common::open_store(temp.path(), &current_root).unwrap());
+    let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
+    let leader = roots.leader(&current).unwrap();
+    for (identity, _, _, _) in &candidates {
+        let entry = roots
+            .gc_report_at(now)
+            .unwrap()
+            .derived
+            .into_iter()
+            .find(|entry| entry.root_key == identity.root_key)
+            .unwrap();
+        assert_eq!((entry.status, entry.reason), ("eligible", "age_30_days"));
+    }
+    assert_eq!(roots.automatic_gc_at(&current, &leader, now).unwrap(), 0);
+    for (identity, path, inode, bytes) in candidates {
+        assert_eq!(
+            fs::metadata(&path).unwrap().ino(),
+            inode,
+            "report-only historical inode must survive: {}",
+            identity.root_key
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "report-only historical bytes must survive: {}",
+            identity.root_key
+        );
+        assert!(roots.index_dir(&identity).exists());
+    }
 }
 
 #[test]

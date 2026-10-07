@@ -10,11 +10,191 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
-    path::Path,
+    os::unix::fs::{FileExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
+
+/// A single maintenance unit's existing-only queue admission. Unknown is a
+/// priority signal: never begin (or commit) maintenance on uncertain queue data.
+pub enum QueueProbeAdmission {
+    AbsentVirgin(MaintenanceQueueProbe),
+    Ready(MaintenanceQueueProbe),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceQueueState {
+    Clear,
+    Pending,
+    Unknown,
+}
+
+/// Keeps the protected SH use lock and one read-only SQLite connection alive
+/// only until the current maintenance unit finishes. No SQLite read transaction
+/// is held between checks; data_version is meaningful only on this connection.
+pub struct MaintenanceQueueProbe {
+    identity: Arc<super::topology::WorkspaceIdentity>,
+    witness: Arc<Mutex<Option<(u64, u64)>>>,
+    path: PathBuf,
+    file: Option<Arc<fs::File>>,
+    db: Option<super::ProtectedSqliteConnection>,
+    _guard: UseGuard,
+    inode: Option<(u64, u64)>,
+    baseline: i64,
+    initial_pending: bool,
+}
+
+impl QueueProbeAdmission {
+    pub fn check(&self) -> MaintenanceQueueState {
+        self.check_with_hook(|| {})
+    }
+
+    /// Deterministic contention fixture: runs after the first pathname and
+    /// sidecar checks, before reading data_version. Never use a blocking hook
+    /// in a live maintenance unit.
+    #[doc(hidden)]
+    pub fn check_with_hook(&self, after_first_guard: impl FnOnce()) -> MaintenanceQueueState {
+        match self {
+            Self::Unknown => MaintenanceQueueState::Unknown,
+            Self::AbsentVirgin(probe) | Self::Ready(probe) => {
+                probe.check_with_barrier(after_first_guard)
+            }
+        }
+    }
+}
+
+impl MaintenanceQueueProbe {
+    fn pathname_unchanged(&self) -> bool {
+        if self.identity.verify_readonly().is_err() || self._guard.verify().is_err() {
+            return false;
+        }
+        let named = match fs::symlink_metadata(&self.path) {
+            Ok(named) => Some(named),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return false,
+        };
+        match (self.inode, named) {
+            (None, None) => self.witness.lock().is_ok_and(|w| w.is_none()),
+            (Some(inode), Some(named)) => {
+                named.is_file()
+                    && !named.file_type().is_symlink()
+                    && (named.dev(), named.ino()) == inode
+                    && self
+                        .witness
+                        .lock()
+                        .is_ok_and(|w| w.is_none_or(|old| old == inode))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn check(&self) -> MaintenanceQueueState {
+        self.check_with_barrier(|| {})
+    }
+
+    fn fence_unchanged(&self, db: Option<&rusqlite::Connection>, version: Option<i64>) -> bool {
+        // Sample the second data_version BEFORE the last filesystem check:
+        // an uncommitted writer can create a rollback journal while SQLite
+        // reads a version that does not change until COMMIT.
+        db.is_none_or(|db| {
+            db.is_autocommit()
+                && version.is_some_and(|version| queue_data_version(db) == Ok(version))
+        }) && self
+            .file
+            .as_ref()
+            .is_none_or(|file| queue_delete_header(file))
+            && self.pathname_unchanged()
+            && !queue_sidecar_exists(&self.path)
+    }
+
+    fn check_with_barrier(&self, after_first_guard: impl FnOnce()) -> MaintenanceQueueState {
+        if !self.pathname_unchanged() || queue_sidecar_exists(&self.path) {
+            return MaintenanceQueueState::Unknown;
+        }
+        let Some(db) = &self.db else {
+            after_first_guard();
+            return if self.fence_unchanged(None, None) {
+                MaintenanceQueueState::Clear
+            } else {
+                MaintenanceQueueState::Unknown
+            };
+        };
+        if !self
+            .file
+            .as_ref()
+            .is_some_and(|file| queue_delete_header(file))
+            || !db.is_autocommit()
+        {
+            return MaintenanceQueueState::Unknown;
+        }
+        after_first_guard();
+        let Ok(version) = queue_data_version(db) else {
+            return MaintenanceQueueState::Unknown;
+        };
+        if version == self.baseline {
+            // An uncommitted rollback writer does not change data_version.
+            // Check journal/identity/header/autocommit AFTER this read too,
+            // then sample data_version once more before returning Clear.
+            return if self.fence_unchanged(Some(db), Some(version)) {
+                if self.initial_pending {
+                    MaintenanceQueueState::Pending
+                } else {
+                    MaintenanceQueueState::Clear
+                }
+            } else {
+                MaintenanceQueueState::Unknown
+            };
+        }
+        let Ok(pending) = unfinished_exists(db) else {
+            return MaintenanceQueueState::Unknown;
+        };
+        if !self.fence_unchanged(Some(db), Some(version)) {
+            return MaintenanceQueueState::Unknown;
+        }
+        if pending {
+            MaintenanceQueueState::Pending
+        } else {
+            MaintenanceQueueState::Clear
+        }
+    }
+}
+
+fn queue_sidecar_exists(path: &Path) -> bool {
+    // A rollback journal may be hot or in use. SQLite can create WAL shared
+    // memory files even when the main database is opened read-only; reject
+    // any WAL/SHM BEFORE opening SQLite, not only after its first query.
+    ["-journal", "-wal", "-shm"].into_iter().any(|suffix| {
+        let sidecar = path.with_file_name(format!(
+            "{}{}",
+            path.file_name().unwrap().to_string_lossy(),
+            suffix
+        ));
+        !matches!(fs::symlink_metadata(sidecar), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn queue_delete_header(file: &fs::File) -> bool {
+    let mut header = [0; 20];
+    matches!(file.read_at(&mut header, 0), Ok(20))
+        && &header[..16] == b"SQLite format 3\0"
+        && header[18] == 1
+        && header[19] == 1
+}
+
+fn queue_data_version(db: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    db.pragma_query_value(None, "data_version", |row| row.get(0))
+}
+
+fn unfinished_exists(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests INDEXED BY requests_state_seq WHERE state IN ('queued','running') LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )
+}
 
 const SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=1";
 
@@ -195,6 +375,119 @@ impl Store {
     }
     pub fn request_db_path(&self) -> std::path::PathBuf {
         self.roots.requests_db(&self.identity)
+    }
+    /// Admit only an existing, known-clean queue for one short maintenance
+    /// unit. Never create the queue, recover its journal, wait three seconds,
+    /// run quick_check, or acquire a SQLite writer lock.
+    pub fn open_maintenance_queue_probe(&self) -> Result<QueueProbeAdmission> {
+        Ok(self
+            .try_open_maintenance_queue_probe()
+            .unwrap_or(QueueProbeAdmission::Unknown))
+    }
+
+    fn try_open_maintenance_queue_probe(&self) -> Result<QueueProbeAdmission> {
+        self.identity.verify_readonly()?;
+        let guard = self.roots.index_use_existing_readonly(&self.identity)?;
+        let path = self.request_db_path();
+        let probe = |file, db, inode, baseline, initial_pending| MaintenanceQueueProbe {
+            identity: self.identity.clone(),
+            witness: self.request_file_witness.clone(),
+            path: path.clone(),
+            file,
+            _guard: guard,
+            db,
+            inode,
+            baseline,
+            initial_pending,
+        };
+        // Even an absent main pathname does not make orphan sidecars benign.
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        let named = match fs::symlink_metadata(&path) {
+            Ok(named) => named,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ensure!(
+                    self.request_file_witness.lock().unwrap().is_none(),
+                    "incompatible_queue: previously observed requests.db disappeared"
+                );
+                let empty = probe(None, None, None, 0, false);
+                return Ok(if empty.pathname_unchanged() {
+                    QueueProbeAdmission::AbsentVirgin(empty)
+                } else {
+                    QueueProbeAdmission::Unknown
+                });
+            }
+            Err(err) => return Err(err.into()),
+        };
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && named.uid() == unsafe { libc::geteuid() }
+                && named.mode() & 0o777 == 0o600
+                && named.nlink() == 1,
+            "unsafe requests.db"
+        );
+        let inode = (named.dev(), named.ino());
+        ensure!(
+            self.request_file_witness
+                .lock()
+                .unwrap()
+                .is_none_or(|old| old == inode),
+            "incompatible_queue: requests.db inode replaced"
+        );
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        // Register a process-lifetime witness before SQLite opens. Never close
+        // another descriptor on an inode while a SQLite connection may hold
+        // POSIX record locks on it.
+        let file = super::retained_sqlite_file(&path, false, false, true)?;
+        let held = file.metadata()?;
+        ensure!(
+            (held.dev(), held.ino()) == inode,
+            "unsafe requests.db changed"
+        );
+        ensure!(
+            queue_delete_header(&file),
+            "storage_busy: queue journal format"
+        );
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        let db = super::protected_sqlite_open(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(std::time::Duration::ZERO)?;
+        ensure!(db.is_autocommit(), "storage_busy: queue snapshot active");
+        let journal_mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        ensure!(
+            journal_mode == "delete",
+            "storage_busy: queue journal format"
+        );
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(version == 1, "storage_busy: unknown or virgin queue schema");
+        let queue_identity: (String, String) = db.query_row(
+            "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(
+            queue_identity == (self.workspace_root.clone(), self.identity.root_key.clone()),
+            "root_key_collision: requests.db belongs to different root"
+        );
+        let baseline = queue_data_version(&db)?;
+        let pending = unfinished_exists(&db)?;
+        ensure!(
+            baseline == queue_data_version(&db)?,
+            "storage_busy: queue changed during maintenance admission"
+        );
+        let opened = probe(Some(file), Some(db), Some(inode), baseline, pending);
+        if !opened.pathname_unchanged()
+            || queue_sidecar_exists(&path)
+            || !opened
+                .file
+                .as_ref()
+                .is_some_and(|file| queue_delete_header(file))
+        {
+            return Ok(QueueProbeAdmission::Unknown);
+        }
+        Ok(QueueProbeAdmission::Ready(opened))
     }
     fn request_connection(&self) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // A replacement-root follower may accept before it owns the leader lock,

@@ -38,9 +38,14 @@ fn submit(
     sender: &SyncSender<Signal>,
     generation: &AtomicU64,
     overflow: &AtomicBool,
+    root: &Path,
+    selected: &BTreeSet<PathBuf>,
+    executable: Option<&Path>,
     event: notify::Result<Event>,
 ) {
-    if event.as_ref().is_ok_and(|event| read_only(event.kind)) {
+    if event.as_ref().is_ok_and(|event| {
+        read_only(event.kind) || certainly_excluded(event, root, selected, executable)
+    }) {
         return;
     }
     generation.fetch_add(1, Ordering::SeqCst);
@@ -53,6 +58,85 @@ fn submit(
     {
         overflow.store(true, Ordering::SeqCst);
     }
+}
+
+/// Discard only paths inside a subtree capture always excludes. A disappeared
+/// endpoint, symlink ancestor, selected input or running executable is uncertain
+/// and must retain its full inventory intent. A mixed rename is never discarded.
+fn certainly_excluded(
+    event: &Event,
+    root: &Path,
+    selected: &BTreeSet<PathBuf>,
+    executable: Option<&Path>,
+) -> bool {
+    if event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other) {
+        return false;
+    }
+    let Some(executable) = executable else {
+        return false;
+    };
+    let Ok(canonical_executable) = fs::canonicalize(executable) else {
+        return false;
+    };
+    event.paths.iter().all(|path| {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            root.join(path)
+        };
+        if selected.contains(&absolute) || executable == absolute {
+            return false;
+        }
+        // For an existing selected input, compare both literal and canonical
+        // spellings; a failed canonicalization is uncertainty, not exclusion.
+        let Ok(canonical) = fs::canonicalize(&absolute) else {
+            return false;
+        };
+        if selected
+            .iter()
+            .any(|path| fs::canonicalize(path).ok().as_ref() == Some(&canonical))
+            || canonical_executable == canonical
+        {
+            return false;
+        }
+        let Ok(relative) = absolute.strip_prefix(root) else {
+            return false;
+        };
+        let mut current = root.to_path_buf();
+        let mut parts = Vec::new();
+        let mut excluded = false;
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                return false;
+            };
+            current.push(part);
+            let Ok(meta) = fs::symlink_metadata(&current) else {
+                return false;
+            };
+            if meta.file_type().is_symlink() {
+                return false;
+            }
+            parts.push(part.to_string_lossy().into_owned());
+            match part.to_str() {
+                Some(".git" | "node_modules" | ".venv" | ".baleyg") => excluded = true,
+                Some("target" | "dist" | "build") => {
+                    // Capture admits Java output subtrees below src/main,
+                    // src/test and src/testFixtures/java. Any uncertain shape
+                    // stays accepted rather than mirroring ignore internals.
+                    let java_output = parts.windows(3).any(|window| {
+                        window[0] == "src"
+                            && matches!(window[1].as_str(), "main" | "test" | "testFixtures")
+                            && window[2] == "java"
+                    });
+                    if !java_output {
+                        excluded = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        excluded
+    })
 }
 
 fn read_only(kind: EventKind) -> bool {
@@ -77,6 +161,8 @@ pub struct WatchSignals {
     generation: Arc<AtomicU64>,
     overflow: Arc<AtomicBool>,
     pending: DirtyBatch,
+    executable: Option<PathBuf>,
+    acknowledged_generation: u64,
     first_signal: Option<Instant>,
     last_signal: Option<Instant>,
     urgent: bool,
@@ -89,25 +175,67 @@ impl WatchSignals {
     /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
     pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(MAX_DIRTY_PATHS);
+        Self::construct(root, scip_path, manifest_path, true)
+    }
+
+    /// Fixture-only ingress with no asynchronous OS backend. Synthetic events
+    /// still exercise the production channel, overflow, and acknowledgment path.
+    #[doc(hidden)]
+    pub fn synthetic_for_tests(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+    ) -> Self {
+        Self::construct(root, scip_path, manifest_path, false)
+    }
+
+    fn construct(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        native: bool,
+    ) -> Self {
+        // Preserve short bursts beyond one bounded drain without treating a
+        // repeated path as lost input. Actual channel overflow still forces full.
+        let (sender, receiver) = mpsc::sync_channel(MAX_DIRTY_PATHS * 4);
         let generation = Arc::new(AtomicU64::new(1));
         let overflow = Arc::new(AtomicBool::new(false));
         let callback_sender = sender.clone();
         let callback_generation = Arc::clone(&generation);
         let callback_overflow = Arc::clone(&overflow);
+        let callback_root = root.clone();
+        let callback_selected = [scip_path.clone(), manifest_path.clone()]
+            .into_iter()
+            .flatten()
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        let callback_executable = std::env::current_exe().ok();
         let callback = move |event| {
             submit(
                 &callback_sender,
                 &callback_generation,
                 &callback_overflow,
+                &callback_root,
+                &callback_selected,
+                callback_executable.as_deref(),
                 event,
             );
         };
-        let watcher = notify::recommended_watcher(callback).and_then(|mut watcher| {
-            watcher.watch(&root, RecursiveMode::Recursive)?;
-            Ok(watcher)
-        });
-        let degraded = watcher.is_err();
+        let watcher = native
+            .then(|| {
+                notify::recommended_watcher(callback).and_then(|mut watcher| {
+                    watcher.watch(&root, RecursiveMode::Recursive)?;
+                    Ok(watcher)
+                })
+            })
+            .and_then(Result::ok);
+        let degraded = native && watcher.is_none();
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -122,11 +250,13 @@ impl WatchSignals {
         Self {
             root,
             captured_inputs,
-            watcher: watcher.ok(),
+            watcher,
             sender,
             receiver,
             generation,
             overflow,
+            executable: std::env::current_exe().ok(),
+            acknowledged_generation: 0,
             pending: DirtyBatch {
                 generation: 1,
                 full: true, // Wake, restart and takeover require a full inventory.
@@ -139,8 +269,28 @@ impl WatchSignals {
         }
     }
 
+    /// This is set synchronously at ingress, before debounce or a channel drain.
+    /// The initial full inventory and replacement watcher remain unacknowledged.
+    pub fn accepted_unacked(&self) -> bool {
+        let unacknowledged = self.generation.load(Ordering::SeqCst) != self.acknowledged_generation;
+        // Failure leaves full/urgent/degraded sticky for periodic fallback, but
+        // a verified capture already accounted for this degraded generation.
+        // Only genuinely new ingress (including require_full) has priority now.
+        if self.degraded {
+            return unacknowledged;
+        }
+        self.pending.full || self.urgent || unacknowledged
+    }
+
     pub fn degraded(&self) -> bool {
         self.degraded
+    }
+
+    /// Fixture-only: suppress asynchronous OS delivery while preserving the
+    /// exact bounded synthetic ingress, generation and acknowledgment logic.
+    #[doc(hidden)]
+    pub fn disable_native_watcher_for_tests(&mut self) {
+        self.watcher = None;
     }
 
     pub fn watching(&self) -> bool {
@@ -157,22 +307,26 @@ impl WatchSignals {
     /// Feed the same bounded ingress used by notify's actual callback. A
     /// runtime error or a dropped signal forces a full inventory.
     pub fn submit_event(&self, event: notify::Result<Event>) {
-        submit(&self.sender, &self.generation, &self.overflow, event);
+        submit(
+            &self.sender,
+            &self.generation,
+            &self.overflow,
+            &self.root,
+            &self.captured_inputs,
+            self.executable.as_deref(),
+            event,
+        );
     }
 
     /// Nonblocking, bounded drain: never wait for a continuously active producer.
     /// The caller must drain again before acting on a batch or checking its cutoff.
     pub fn drain(&mut self) -> DirtyBatch {
-        let mut processed = 0;
         for _ in 0..MAX_DIRTY_PATHS {
             match self.receiver.try_recv() {
-                Ok(Signal { event, received_at }) => {
-                    processed += 1;
-                    match event {
-                        Ok(event) => self.record(&event, received_at),
-                        Err(_) => self.fail(),
-                    }
-                }
+                Ok(Signal { event, received_at }) => match event {
+                    Ok(event) => self.record(&event, received_at),
+                    Err(_) => self.fail(),
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if !self.degraded {
@@ -182,12 +336,8 @@ impl WatchSignals {
                 }
             }
         }
-        // The bounded drain may leave events queued. Until a complete inventory
-        // accounts for them, neither a partial path set nor a generation is proof.
-        if processed == MAX_DIRTY_PATHS {
-            self.pending.full = true;
-            self.urgent = true;
-        }
+        // A bounded drain may leave queued events. Generation checks during
+        // acknowledgment prevent clearing until they are incorporated.
         if self.overflow.swap(false, Ordering::SeqCst) {
             self.pending.full = true;
             self.urgent = true;
@@ -238,6 +388,7 @@ impl WatchSignals {
             self.urgent = true;
             return false;
         }
+        self.acknowledged_generation = batch.generation;
         true
     }
 
@@ -251,7 +402,14 @@ impl WatchSignals {
     /// Direct feed for the leader's wider event loop. The normal notify callback
     /// goes through `submit`; both paths share event classification.
     pub fn observe_event(&mut self, event: &Event) {
-        if read_only(event.kind) {
+        if read_only(event.kind)
+            || certainly_excluded(
+                event,
+                &self.root,
+                &self.captured_inputs,
+                self.executable.as_deref(),
+            )
+        {
             return;
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -347,4 +505,44 @@ fn relevant_input(path: &Path) -> bool {
         && crate::capture::ROOT_INPUTS
             .iter()
             .any(|name| path == Path::new(name))
+}
+#[cfg(test)]
+mod ingress_tests {
+    use super::*;
+    #[test]
+    fn running_executable_inside_excluded_target_forces_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let executable = target.join("baleyg");
+        let other = target.join("scratch.js");
+        fs::write(&executable, "binary").unwrap();
+        fs::write(&other, "noise").unwrap();
+        let event = |path: PathBuf| {
+            Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(path)
+        };
+        assert!(certainly_excluded(
+            &event(other),
+            root.path(),
+            &BTreeSet::new(),
+            Some(&executable)
+        ));
+        assert!(!certainly_excluded(
+            &event(executable.clone()),
+            root.path(),
+            &BTreeSet::new(),
+            Some(&executable)
+        ));
+        let alias = target.join("alias");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        assert!(!certainly_excluded(
+            &event(alias),
+            root.path(),
+            &BTreeSet::new(),
+            Some(&executable)
+        ));
+    }
 }

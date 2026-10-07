@@ -741,6 +741,85 @@ fn publish_bundle(
     store.publish_native(&indexed, &capture, &native, leader, expected, cancel)
 }
 
+// A bounded, fresh, protected RO snapshot of the selected pin's release markers.
+// The use guard and inode witness prevent mistaking a replaced index for this read.
+fn retained_release_snapshot(
+    state: &std::path::Path,
+    root: &std::path::Path,
+    pin: &baleyg::model::IndexPin,
+) -> String {
+    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use std::{os::unix::fs::MetadataExt, time::Duration};
+
+    let observed = (|| -> anyhow::Result<String> {
+        let identity = WorkspaceIdentity::discover(Some(root), root)?;
+        let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+        let guard = roots.index_use_existing_readonly(&identity)?;
+        let path = roots.index_db(&identity);
+        let before = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(before.is_file() && !before.file_type().is_symlink());
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(Duration::ZERO)?;
+        db.pragma_update(None, "query_only", "ON")?;
+        db.execute_batch("BEGIN DEFERRED")?;
+        let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let (state, superseded_at, debt, pending, released, generation, revision): (
+            Option<String>,
+            Option<i64>,
+            i64,
+            i64,
+            i64,
+            String,
+            i64,
+        ) = db.query_row(
+            "SELECT
+                (SELECT state FROM native_revision_supersessions WHERE revision_id=?1),
+                (SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1),
+                (SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1),
+                (SELECT count(*) FROM revision_capture_inputs
+                    WHERE revision_id=?1 AND input_key='__pending_release:v1'),
+                (SELECT count(*) FROM revision_capture_inputs
+                    WHERE revision_id=?1 AND input_key='__released:v1'),
+                index_generation,index_revision
+             FROM index_metadata WHERE singleton=1",
+            [&key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        db.execute_batch("ROLLBACK")?;
+        drop(db);
+        let after = std::fs::symlink_metadata(&path)?;
+        guard.verify()?;
+        anyhow::ensure!(
+            (before.dev(), before.ino()) == (after.dev(), after.ino())
+                && after.is_file()
+                && !after.file_type().is_symlink()
+                && generation.len() <= 36
+                && state
+                    .as_ref()
+                    .is_none_or(|s| matches!(s.as_str(), "retained" | "pending" | "released"))
+        );
+        Ok(format!(
+            "state={state:?},superseded_at={superseded_at:?},debt={debt},pending_marker={pending},released_marker={released},head_generation={generation},head_revision={revision},index_inode={}:{}",
+            after.dev(),
+            after.ino()
+        ))
+    })();
+    observed.unwrap_or_else(|_| "snapshot=unknown".to_owned())
+}
+
 #[tokio::test]
 async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest() {
     let (temp, store, graph, app, seed, session) = fixture();
@@ -772,6 +851,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
     assert_eq!(attached_note["attachment"]["result"]["status"], "attached");
     std::fs::write(root.join("a.js"), "function replacement() {}\n").unwrap();
     let updated = index_workspace(&IndexOptions::new(root.clone()), &cancel, |_| {}).unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
     let r2 = publish_bundle(
         &store,
         &updated,
@@ -806,24 +886,76 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
         current_views[0]["attachment"]["result"]["status"],
         "attached"
     );
-    store
-        .release_revision(r1, session.leader_guard().unwrap())
-        .unwrap();
-    assert_eq!(
-        call(
-            &app,
-            "GET",
-            &pinned("/api/views/old-view", &r1),
-            Value::Null
-        )
-        .await
-        .0,
-        409
+    store.set_retention_clock_for_tests(1_900, 900);
+    let release_before = retained_release_snapshot(&temp.path().join("state"), &root, &r1);
+    let maintenance_busy_before = store.maintenance_sqlite_busy_attempts();
+    let release_started = std::time::Instant::now();
+    let release_deadline = std::time::Duration::from_secs(5);
+    let mut release_deferred = Vec::new();
+    let mut release_attempts = 0;
+    let mut released = false;
+    for attempt in 1..=32 {
+        if release_started.elapsed() >= release_deadline {
+            break;
+        }
+        release_attempts = attempt;
+        match store.release_revision(r1, session.leader_guard().unwrap()) {
+            Ok(()) => {
+                released = true;
+                break;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<baleyg::store::SqliteContention>()
+                    .is_some() =>
+            {
+                release_deferred.push(format!(
+                    "attempt={attempt}:{}",
+                    retained_release_snapshot(&temp.path().join("state"), &root, &r1)
+                ));
+            }
+            Err(_) => panic!(
+                "release returned an unexpected non-contention error;attempts={attempt};before=({release_before});deferred={release_deferred:?}"
+            ),
+        }
+        if attempt < 32 && release_started.elapsed() < release_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert!(
+        released,
+        "release did not succeed within 32 attempts/5s;attempts={release_attempts};before=({release_before});deferred={release_deferred:?};after=({});queue={};maintenance_busy={maintenance_busy_before}->{}",
+        retained_release_snapshot(&temp.path().join("state"), &root, &r1),
+        store
+            .open_maintenance_queue_probe()
+            .map(|probe| format!("{:?}", probe.check()))
+            .unwrap_or_else(|_| "unknown".to_owned()),
+        store.maintenance_sqlite_busy_attempts()
     );
+    let release_after = retained_release_snapshot(&temp.path().join("state"), &root, &r1);
+    let maintenance_busy_after = store.maintenance_sqlite_busy_attempts();
+    let queue_after = store
+        .open_maintenance_queue_probe()
+        .map(|probe| format!("{:?}", probe.check()))
+        .unwrap_or_else(|_| "unknown".to_owned());
+    // Public read-only telemetry does not expose permit or step state.
+    let (code, expired_view) = call(
+        &app,
+        "GET",
+        &pinned("/api/views/old-view", &r1),
+        Value::Null,
+    )
+    .await;
     assert_eq!(
-        call(&app, "GET", &pinned("/api/annotations", &r1), Value::Null)
-            .await
-            .0,
-        409
+        code, 409,
+        "release_attempts={release_attempts};deferred={release_deferred:?};release_before=({release_before});release_after=({release_after});maintenance_busy={maintenance_busy_before}->{maintenance_busy_after};queue_after={queue_after};permit=unknown;step=unknown"
     );
+    assert_eq!(expired_view["error"]["code"], "pin_expired");
+    let (code, expired_notes) =
+        call(&app, "GET", &pinned("/api/annotations", &r1), Value::Null).await;
+    assert_eq!(
+        code, 409,
+        "release_attempts={release_attempts};deferred={release_deferred:?};release_before=({release_before});release_after=({release_after});maintenance_busy={maintenance_busy_before}->{maintenance_busy_after};queue_after={queue_after};permit=unknown;step=unknown"
+    );
+    assert_eq!(expired_notes["error"]["code"], "pin_expired");
 }

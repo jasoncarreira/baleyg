@@ -453,6 +453,166 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
     }
 }
 
+/// Failure-only, content-masked witness for independent cold CLI comparison.
+/// No source bytes, workspace spelling or home path are emitted.
+fn cold_cli_failure(
+    stage: &str,
+    output: &std::process::Output,
+    cold_home: &std::path::Path,
+) -> String {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt, unix::process::ExitStatusExt};
+
+    fn tail_shape(bytes: &[u8]) -> String {
+        // Keep the final output's size and shape, never its source or path bytes.
+        bytes[bytes.len().saturating_sub(256)..]
+            .iter()
+            .map(|byte| match byte {
+                b'\n' => '|',
+                b'\r' => '~',
+                b' ' | b'\t' => '_',
+                _ => '.',
+            })
+            .collect()
+    }
+    fn error_tags(bytes: &[u8]) -> Vec<&'static str> {
+        const TAGS: [&str; 13] = [
+            "storage_busy",
+            "index_not_ready",
+            "root_changed",
+            "leader",
+            "reconcil",
+            "selected",
+            "pin",
+            "queue",
+            "graph",
+            "cleanup",
+            "sqlite",
+            "panic",
+            "error",
+        ];
+        let lower = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+        TAGS.iter()
+            .copied()
+            .filter(|tag| lower.contains(tag))
+            .collect()
+    }
+    fn snapshot(db_path: Option<std::path::PathBuf>, sql: &str) -> String {
+        let Some(db_path) = db_path else {
+            return "absent".into();
+        };
+        let Ok(db) = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return "ro_open_failed".into();
+        };
+        if db.busy_timeout(Duration::ZERO).is_err() {
+            return "busy_configuration_failed".into();
+        }
+        match db.query_row(sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        }) {
+            Ok((first, second, third, fourth, fifth)) => {
+                let state = match second.as_str() {
+                    "queued" => "queued",
+                    "running" => "running",
+                    "done" => "done",
+                    "failed" => "failed",
+                    _ => "opaque",
+                };
+                format!(
+                    "first={first} state={state} second_len={} third_present={} third_len={:?} fourth={fourth:?} fifth_present={} fifth_tags={:?}",
+                    second.len(),
+                    third.is_some(),
+                    third.as_ref().map(String::len),
+                    fifth.is_some(),
+                    fifth.as_deref().map(|value| error_tags(value.as_bytes()))
+                )
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => "no_row".into(),
+            Err(_) => "query_failed".into(),
+        }
+    }
+    let queue_path = request_db_under(cold_home);
+    let index_path = index_db_under(cold_home);
+    // A cold child has exited. Also acquire the existing index-use inode
+    // exclusively without waiting; do not open SQLite if any peer still uses it.
+    let use_path = index_path.as_ref().or(queue_path.as_ref()).and_then(|db| {
+        let dir = db.parent()?;
+        Some(dir.with_extension("lock"))
+    });
+    let use_guard = use_path.and_then(|path| fs::OpenOptions::new().read(true).open(path).ok());
+    let use_state = match &use_guard {
+        None => "index_use_absent_or_unreadable",
+        Some(file) => {
+            let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if acquired == 0 {
+                "index_use_exclusive"
+            } else {
+                "index_use_busy_or_failed"
+            }
+        }
+    };
+    let (queue, pin) = if use_state == "index_use_exclusive" {
+        (
+            snapshot(
+                queue_path,
+                "SELECT seq,state,result_generation,result_revision,error_code FROM requests ORDER BY seq DESC LIMIT 1",
+            ),
+            snapshot(
+                index_path,
+                "SELECT schema_version,index_generation,reconciled_incarnation,index_revision,NULL FROM index_metadata WHERE singleton=1",
+            ),
+        )
+    } else {
+        ("skipped_unprotected".into(), "skipped_unprotected".into())
+    };
+    let lock = match leader_lock_under(cold_home) {
+        None => "absent".to_owned(),
+        Some(path) => match fs::OpenOptions::new().read(true).open(path) {
+            Err(_) => "ro_open_failed".to_owned(),
+            Ok(file) => {
+                let metadata = file.metadata();
+                let status =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+                let probe = if status == 0 {
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                    "shared_available"
+                } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    "exclusive_held"
+                } else {
+                    "probe_failed"
+                };
+                match metadata {
+                    Ok(metadata) => format!(
+                        "dev={} ino={} size={} {probe}",
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.len()
+                    ),
+                    Err(_) => format!("metadata_failed {probe}"),
+                }
+            }
+        },
+    };
+    format!(
+        "cold_{stage} exit_code={:?} signal={:?} stdout_bytes={} stdout_tail_shape={} stderr_bytes={} stderr_tail_shape={} stderr_tags={:?} queue_last={queue} selected_metadata={pin} leader_lock={lock} use_lock={use_state}",
+        output.status.code(),
+        output.status.signal(),
+        output.stdout.len(),
+        tail_shape(&output.stdout),
+        output.stderr.len(),
+        tail_shape(&output.stderr),
+        error_tags(&output.stderr),
+    )
+}
+
 fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::process::Command {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_baleyg"));
     child
@@ -1877,7 +2037,11 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
         .arg(B_MAX_BYTES.to_string())
         .output()
         .unwrap();
-    assert!(cold_index.status.success(), "cold B full index failed");
+    assert!(
+        cold_index.status.success(),
+        "{}",
+        cold_cli_failure("index", &cold_index, &cold_home)
+    );
     let cold = cli(&cold_root, &cold_home, "export").output().unwrap();
     assert!(cold.status.success());
     let mut cold: serde_json::Value = serde_json::from_slice(&cold.stdout).unwrap();
@@ -3340,15 +3504,18 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
             fs::copy(entry.path(), cold_root.join(entry.file_name())).unwrap();
         }
     }
+    let cold_index = cli(&cold_root, &cold_home, "index").output().unwrap();
     assert!(
-        cli(&cold_root, &cold_home, "index")
-            .output()
-            .unwrap()
-            .status
-            .success()
+        cold_index.status.success(),
+        "{}",
+        cold_cli_failure("index", &cold_index, &cold_home)
     );
     let cold_export = cli(&cold_root, &cold_home, "export").output().unwrap();
-    assert!(cold_export.status.success());
+    assert!(
+        cold_export.status.success(),
+        "{}",
+        cold_cli_failure("export", &cold_export, &cold_home)
+    );
     let cold: serde_json::Value = serde_json::from_slice(&cold_export.stdout).unwrap();
     assert_eq!(
         live["files"], cold["files"],
@@ -4162,7 +4329,7 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function replacement() {}\n").unwrap();
     assert!(
-        daemon.force_retention_idle_tick_for_tests().is_err(),
+        daemon.force_root_transition_tick_for_tests().is_err(),
         "held requests.db writer must block the root-loss terminal transition"
     );
     assert_eq!(
@@ -4175,7 +4342,7 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
         "old root cannot serve selected evidence"
     );
     blocker.execute_batch("ROLLBACK").unwrap();
-    daemon.force_retention_idle_tick_for_tests().unwrap();
+    daemon.force_root_transition_tick_for_tests().unwrap();
     assert_eq!(
         daemon.root_loss_retirement_for_tests(),
         (false, false, false)
@@ -4211,5 +4378,188 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
             .1
             .text,
         "function before() {}\n"
+    );
+}
+
+#[test]
+fn ingress_filters_only_certain_excluded_noise_before_debounce() {
+    use baleyg::watch::WatchSignals;
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind, RenameMode},
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::create_dir(root.join("node_modules")).unwrap();
+    let noise = [
+        root.join("target/build.js"),
+        root.join(".git/HEAD"),
+        root.join("node_modules/module.js"),
+    ];
+    for path in &noise {
+        fs::write(path, "noise").unwrap();
+    }
+    let mut watch = WatchSignals::new(root.to_owned(), None, None);
+    // This fixture drives the bounded synthetic ingress only. Do not let a
+    // live notify callback race the exact generation being acknowledged.
+    watch.disable_native_watcher_for_tests();
+    let initial = watch.drain();
+    assert!(watch.accepted_unacked());
+    assert!(watch.acknowledge(&initial));
+    assert!(!watch.accepted_unacked());
+    let event = |path: &std::path::Path| {
+        Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(path.to_owned())
+    };
+    for _ in 0..32 {
+        for path in &noise {
+            watch.submit_event(Ok(event(path)));
+        }
+    }
+    assert!(
+        !watch.accepted_unacked(),
+        "ignored noise must never occupy the bounded ingress"
+    );
+    assert_eq!(watch.drain().generation, initial.generation);
+    assert!(watch.next_deadline().is_none());
+    let source = root.join("a.js");
+    fs::write(
+        &source,
+        "function changed() {}
+",
+    )
+    .unwrap();
+    watch.submit_event(Ok(event(&source)));
+    assert!(
+        watch.accepted_unacked(),
+        "source intent exists before debounce/drain"
+    );
+    assert!(!watch.batch_ready_at(Instant::now()));
+    let received = watch.drain();
+    assert!(received.generation > initial.generation);
+    assert!(watch.acknowledge(&received));
+    assert!(!watch.accepted_unacked());
+    // One missing rename endpoint is uncertain, even when the other endpoint
+    // sits under an excluded subtree.
+    watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+        RenameMode::Both,
+    )))
+    .add_path(noise[0].clone())
+    .add_path(root.join("missing.js"))));
+    assert!(watch.accepted_unacked());
+    assert!(watch.drain().full);
+}
+
+#[test]
+fn selected_input_inside_excluded_subtree_is_accepted() {
+    use baleyg::watch::WatchSignals;
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path();
+    fs::create_dir(root.join("target")).unwrap();
+    let selected = root.join("target/index.scip");
+    fs::write(&selected, "selected input").unwrap();
+    let mut watch = WatchSignals::new(root.to_owned(), Some(selected.clone()), None);
+    let initial = watch.drain();
+    assert!(watch.acknowledge(&initial));
+    watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+        DataChange::Content,
+    )))
+    .add_path(selected)));
+    assert!(watch.accepted_unacked());
+    assert!(watch.drain().full);
+}
+
+#[test]
+fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
+    use baleyg::index_coordinator::{self, IndexJobCoordinator};
+    use notify::{
+        Event, EventKind,
+        event::{DataChange, ModifyKind},
+    };
+    use std::sync::{Mutex, mpsc};
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let source = workspace.join("a.js");
+    fs::write(&source, "function source() {}\n").unwrap();
+    let store = Store::open_for_tests(&temp.path().join("state"), &workspace).unwrap();
+    store.set_retention_clock_for_tests(1000, 0);
+    let options = IndexOptions::new(workspace);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let old = store.status().unwrap().revision;
+    IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run_serving(&options, &cancel, |_| {})
+        .unwrap();
+    let mut work = LeaderWork::new(&store, &session, &options).unwrap();
+    work.disable_native_watcher_for_tests();
+    work.reconcile_due(&store, &session, &options, &cancel, true)
+        .unwrap();
+    assert!(!work.accepted_watch_intent(&options));
+    let work = Arc::new(Mutex::new(work));
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    store.set_maintenance_before_writer_hook_for_tests(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    store.set_retention_clock_for_tests(1900, 900);
+    let worker_store = store.clone();
+    let worker_session = session.clone();
+    let worker_options = options.clone();
+    let worker_watch = work.clone();
+    let maintenance = std::thread::spawn(move || {
+        index_coordinator::cooperative_maintenance_unit(&worker_store, &worker_session, || {
+            !worker_watch
+                .lock()
+                .unwrap()
+                .accepted_watch_intent(&worker_options)
+        })
+    });
+    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    fs::write(&source, "function changed() {}\n").unwrap();
+    let event = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+        .add_path(source.clone());
+    work.lock().unwrap().submit_watch_event_for_tests(Ok(event));
+    assert!(
+        work.lock().unwrap().accepted_watch_intent(&options),
+        "accepted before debounce/drain"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        maintenance.join().unwrap().unwrap(),
+        baleyg::store::MaintenanceOutcome::Deferred
+    );
+    assert!(
+        store.source_at("a.js", Some(old)).unwrap().is_some(),
+        "no retention before watch ACK"
+    );
+    assert!(
+        work.lock()
+            .unwrap()
+            .reconcile_due(&store, &session, &options, &cancel, true)
+            .unwrap()
+    );
+    assert!(!work.lock().unwrap().accepted_watch_intent(&options));
+    let selected = store.status().unwrap().revision;
+    assert!(selected.index_revision > old.index_revision);
+    let (_, captured) = store.source_at("a.js", Some(selected)).unwrap().unwrap();
+    assert_eq!(captured.text, "function changed() {}\n");
+    // After the verified fresh watcher publication and ACK, debt advances.
+    assert_eq!(
+        index_coordinator::cooperative_maintenance_unit(&store, &session, || !work
+            .lock()
+            .unwrap()
+            .accepted_watch_intent(&options))
+        .unwrap(),
+        baleyg::store::MaintenanceOutcome::Progress
     );
 }

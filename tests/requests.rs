@@ -1,5 +1,8 @@
 //! Queue rows are durable independently of the native index and only the held leader may claim.
-use baleyg::{indexer::IndexOptions, store::Store};
+use baleyg::{
+    indexer::IndexOptions,
+    store::{MaintenanceQueueState, QueueProbeAdmission, Store},
+};
 use std::fs;
 
 #[test]
@@ -1351,4 +1354,308 @@ fn body_edit_explicit_claim_with_real_executable_drift_cannot_use_local_reuse() 
 #[test]
 fn same_body_edit_without_executable_drift_is_proven_local_control() {
     asserted_claim_under_real_executable_drift(true, false);
+}
+
+/// The parent holds the probe open while this separate process admits durable
+/// work or an exclusive queue writer. No timing or polling is needed.
+#[test]
+fn maintenance_probe_external_child() {
+    let Ok(mode) = std::env::var("BALEYG_TEST_MAINTENANCE_PROBE_CHILD") else {
+        return;
+    };
+    let state = std::path::Path::new(&std::env::var("BALEYG_PROBE_STATE").unwrap()).to_path_buf();
+    let workspace =
+        std::path::Path::new(&std::env::var("BALEYG_PROBE_WORKSPACE").unwrap()).to_path_buf();
+    let store = Store::open_for_tests(&state, &workspace).unwrap();
+    if mode == "enqueue" {
+        store
+            .enqueue_request(&IndexOptions::new(workspace), None)
+            .unwrap();
+    } else if mode == "exclusive" || mode == "wal" || mode == "journal" {
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        if mode == "exclusive" {
+            db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        } else if mode == "journal" {
+            db.execute_batch("BEGIN IMMEDIATE; UPDATE queue_identity SET root_key=root_key||'x'")
+                .unwrap();
+        } else {
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; UPDATE queue_identity SET root_key=root_key;").unwrap();
+        }
+        use std::io::{Read, Write};
+        std::io::stdout().write_all(b"@").unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut release = [0];
+        std::io::stdin().read_exact(&mut release).unwrap();
+        if mode == "exclusive" || mode == "journal" {
+            db.execute_batch("ROLLBACK").unwrap();
+        }
+    } else {
+        panic!("unknown probe child mode: {mode}");
+    }
+}
+
+fn maintenance_probe_child(
+    mode: &str,
+    state: &std::path::Path,
+    workspace: &std::path::Path,
+) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("maintenance_probe_external_child")
+        .arg("--nocapture")
+        .env("BALEYG_TEST_MAINTENANCE_PROBE_CHILD", mode)
+        .env("BALEYG_PROBE_STATE", state)
+        .env("BALEYG_PROBE_WORKSPACE", workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert!(matches!(probe, QueueProbeAdmission::AbsentVirgin(_)));
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external FIFO failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
+    drop(probe);
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Pending
+    );
+
+    // A different fresh workspace with an interrupted first queue creator
+    // must never initialize that version-zero inode from the probe.
+    let other_state = tempfile::tempdir().unwrap();
+    let other_workspace = tempfile::tempdir().unwrap();
+    fs::write(other_workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let other = Store::open_for_tests(other_state.path(), other_workspace.path()).unwrap();
+    let path = other.request_db_path();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    drop(db);
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert_eq!(
+        other.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn maintenance_probe_external_fifo_busy_and_inode_replacement() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, leader) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    let claimed = store.claim_request(&leader).unwrap().unwrap();
+    assert_eq!(request.id, claimed.id);
+    store
+        .finish_request(&leader, &claimed, Err(anyhow::anyhow!("test failure")))
+        .unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert!(matches!(probe, QueueProbeAdmission::Ready(_)));
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external FIFO failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
+    drop(probe);
+
+    // A writer's EXCLUSIVE lock must cause immediate Unknown, not the normal
+    // queue opener's three-second busy wait. The pipe is a deterministic hold.
+    let mut child = maintenance_probe_child("exclusive", state.path(), workspace.path());
+    let mut ready = [0];
+    // The Rust test harness may print its own preamble before the marker.
+    loop {
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        if ready == *b"@" {
+            break;
+        }
+    }
+    let busy = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(busy.check(), MaintenanceQueueState::Unknown);
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    let path = store.request_db_path();
+    let old = path.with_extension("old-queue");
+    fs::rename(&path, &old).unwrap();
+    fs::copy(&old, &path).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
+}
+
+/// WAL is an ordinary unsupported queue format, not an attacker. Even a
+/// read-only SQLite open may create shared-memory sidecars for WAL: reject it
+/// before opening, without changing queue/index bytes or sidecar names/bytes.
+#[test]
+fn maintenance_probe_rejects_wal_with_and_without_sidecars_without_mutation() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+        .unwrap();
+    let path = store.request_db_path();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    let index_path = roots.index_db(&identity);
+    let sidecar_bytes = || {
+        ["-journal", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let sidecar = path.with_file_name(format!(
+                    "{}{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    suffix
+                ));
+                match fs::read(&sidecar) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("unexpected sidecar read error: {error}"),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut child = maintenance_probe_child("wal", state.path(), workspace.path());
+    let mut ready = [0];
+    loop {
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        if ready == *b"@" {
+            break;
+        }
+    }
+    let with_sidecars = sidecar_bytes();
+    assert!(with_sidecars[1].is_some() && with_sidecars[2].is_some());
+    let main_before = fs::read(&path).unwrap();
+    assert_eq!(&main_before[18..20], &[2, 2]);
+    let index_before = fs::read(&index_path).unwrap();
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), main_before);
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(sidecar_bytes(), with_sidecars);
+
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+    let without_sidecars = sidecar_bytes();
+    assert_eq!(without_sidecars, vec![None, None, None]);
+    let main_before = fs::read(&path).unwrap();
+    assert_eq!(&main_before[18..20], &[2, 2]);
+    let index_before = fs::read(&index_path).unwrap();
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), main_before);
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(sidecar_bytes(), without_sidecars);
+}
+
+#[test]
+fn maintenance_probe_detects_uncommitted_journal_after_initial_guard() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+        .unwrap();
+    // An initial pending queue would return Pending on the unchanged-version
+    // fast path. A held uncommitted writer must instead force Unknown.
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
+    let queue = store.request_db_path();
+    let journal = queue.with_file_name(format!(
+        "{}-journal",
+        queue.file_name().unwrap().to_string_lossy()
+    ));
+    let mut held = None;
+    let mut while_held = None;
+    let state_at_check = probe.check_with_hook(|| {
+        let mut child = maintenance_probe_child("journal", state.path(), workspace.path());
+        let mut ready = [0];
+        loop {
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut ready)
+                .unwrap();
+            if ready == *b"@" {
+                break;
+            }
+        }
+        assert!(
+            journal.exists(),
+            "writer must create rollback journal before version read"
+        );
+        while_held = Some((fs::read(&queue).unwrap(), fs::read(&journal).unwrap()));
+        held = Some(child);
+    });
+    assert_eq!(state_at_check, MaintenanceQueueState::Unknown);
+    assert_eq!(
+        (fs::read(&queue).unwrap(), fs::read(&journal).unwrap()),
+        while_held.unwrap(),
+        "maintenance probe cannot mutate held writer database or journal"
+    );
+    let mut child = held.unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
 }

@@ -812,6 +812,7 @@ async fn index_request_without_startup_session_takes_over_after_ack() {
 async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
     let (dir, store, state, app) = setup();
     let workspace = dir.path().join("workspace");
+    store.set_retention_clock_for_tests(1_000, 0);
     std::fs::write(workspace.join("a.js"), "function before() {}\n").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let session = state.retained_serving_session().unwrap();
@@ -837,6 +838,7 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
     let old = publish(store.index_baseline().unwrap());
     std::fs::write(workspace.join("a.js"), "function after() {}\n").unwrap();
     let head = publish(old);
+    store.set_retention_clock_for_tests(1_900, 900);
     store
         .release_revision(old, session.leader_guard().unwrap())
         .unwrap();
@@ -1100,5 +1102,267 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
         (manifests, immutable),
         (2, 1),
         "browser claim must publish its own revision without extracting again"
+    );
+}
+
+/// A separate CLI-like process commits Q2 to durable requests.db. Its stdout
+/// is a barrier: the parent never releases maintenance before Q2 is accepted.
+#[test]
+#[ignore]
+fn maintenance_external_fifo_child() {
+    use std::io::Write;
+    let root = std::path::PathBuf::from(std::env::var_os("BALEYG_MAINTENANCE_ROOT").unwrap());
+    let state = std::path::PathBuf::from(std::env::var_os("BALEYG_MAINTENANCE_STATE").unwrap());
+    let store = Store::open_for_tests(&state, &root).unwrap();
+    let queued = store
+        .enqueue_request(&IndexOptions::new(root), None)
+        .unwrap();
+    println!("MAINTENANCE_REQUEST_ID={}", queued.id);
+    std::io::stdout().flush().unwrap();
+}
+
+fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path) -> String {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "maintenance_external_fifo_child",
+            "--nocapture",
+        ])
+        .env("BALEYG_MAINTENANCE_ROOT", root)
+        .env("BALEYG_MAINTENANCE_STATE", state)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut request = String::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        if let Some(id) = line.strip_prefix("MAINTENANCE_REQUEST_ID=") {
+            request = id.to_owned();
+        }
+    }
+    assert!(child.wait().unwrap().success());
+    assert!(!request.is_empty());
+    request
+}
+
+#[test]
+fn queued_second_process_preempts_maintenance_before_writer_admission() {
+    use baleyg::index_coordinator::{self, IndexJobCoordinator};
+    use std::sync::mpsc;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let data = dir.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("one.js"), "function before() {}\n").unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let store = Store::open_for_tests(&data, &workspace).unwrap();
+    store.set_retention_clock_for_tests(1000, 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let old = store.status().unwrap().revision;
+    std::fs::write(workspace.join("one.js"), "function after() {}\n").unwrap();
+    IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    store.set_retention_clock_for_tests(1899, 899);
+    state.force_retention_idle_tick_for_tests().unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    store.set_maintenance_before_writer_hook_for_tests(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    store.set_retention_clock_for_tests(1900, 900);
+    let worker = state.clone();
+    let maintenance = std::thread::spawn(move || worker.force_retention_idle_tick_for_tests());
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let id = external_maintenance_request(&workspace, &data);
+    let queue_store = store.clone();
+    let queue_session = session.clone();
+    let foreground = std::thread::spawn(move || {
+        index_coordinator::drain_one_request_observed(&queue_store, &queue_session, |_, _| {})
+    });
+    release_tx.send(()).unwrap();
+    maintenance.join().unwrap().unwrap();
+    assert_eq!(foreground.join().unwrap().unwrap(), 1);
+    assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
+    // The older pin survives: maintenance was unable to start its writer
+    // after Q2 reached the durable queue, while Q2 published and ACKed.
+    assert!(store.source_at("one.js", Some(old)).unwrap().is_some());
+}
+
+#[test]
+fn second_process_fifo_interrupts_after_first_real_maintenance_delete() {
+    use baleyg::index_coordinator::{self, IndexJobCoordinator};
+    use std::sync::mpsc;
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let data = dir.path().join("state");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("one.js"), "function before() {}\n").unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let store = Store::open_for_tests(&data, &workspace).unwrap();
+    store.set_retention_clock_for_tests(1000, 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let old = store.status().unwrap().revision;
+    std::fs::write(workspace.join("one.js"), "function after() {}\n").unwrap();
+    IndexJobCoordinator::prepare_with_session(&store, None, session.clone())
+        .unwrap()
+        .run(&options, &cancel, |_| {})
+        .unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session.clone());
+    store.set_retention_clock_for_tests(1899, 899);
+    state.force_retention_idle_tick_for_tests().unwrap();
+    store.set_retention_clock_for_tests(1900, 900);
+    state.force_retention_idle_tick_for_tests().unwrap(); // retained -> pending
+    let path = store.request_db_path().with_file_name("index.db");
+    let count = || -> i64 {
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row("SELECT count(*) FROM revision_documents m JOIN native_revisions r ON r.id=m.revision_id WHERE r.published_index_revision=?1", [old.index_revision as i64], |row| row.get(0)).unwrap()
+    };
+    let before = count();
+    assert!(before > 0, "pending transition must preserve full manifest");
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let worker = state.clone();
+    let maintenance = std::thread::spawn(move || worker.force_retention_idle_tick_for_tests());
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let id = external_maintenance_request(&workspace, &data);
+    release_tx.send(()).unwrap();
+    maintenance.join().unwrap().unwrap();
+    assert_eq!(
+        count(),
+        before,
+        "post-DELETE queue arrival must ROLLBACK the full maintenance unit"
+    );
+    let queue_store = store.clone();
+    let queue_session = session.clone();
+    assert_eq!(
+        std::thread::spawn(move || index_coordinator::drain_one_request_observed(
+            &queue_store,
+            &queue_session,
+            |_, _| {},
+        ))
+        .join()
+        .unwrap()
+        .unwrap(),
+        1
+    );
+    assert_eq!(store.request_by_id(&id).unwrap().unwrap().state, "done");
+    // Debt remains durable. A later genuinely idle owner resumes in one unit.
+    state.force_retention_idle_tick_for_tests().unwrap();
+    assert!(count() < before);
+}
+
+#[test]
+fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
+    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    let dir = tempfile::tempdir().unwrap();
+    let current_root = dir.path().join("current");
+    let candidate_root = dir.path().join("candidate");
+    let state = dir.path().join("state");
+    std::fs::create_dir(&current_root).unwrap();
+    std::fs::create_dir(&candidate_root).unwrap();
+    let current_store = Store::open_for_tests(&state, &current_root).unwrap();
+    let candidate_store = Store::open_for_tests(&state, &candidate_root).unwrap();
+    let roots = TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"));
+    let current = WorkspaceIdentity::discover(Some(&current_root), &current_root).unwrap();
+    let candidate = WorkspaceIdentity::discover(Some(&candidate_root), &candidate_root).unwrap();
+    let candidate_db = roots.index_db(&candidate);
+    drop(candidate_store);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    rusqlite::Connection::open(&candidate_db)
+        .unwrap()
+        .execute(
+            "UPDATE index_metadata SET last_opened_at=?1",
+            [now - 31 * 86_400],
+        )
+        .unwrap();
+    let session = current_store.leader_session().unwrap();
+    let probe = current_store.open_maintenance_queue_probe().unwrap();
+    let mut reached = 0;
+    let mut hook = |stage| -> anyhow::Result<()> {
+        if stage == GcStage::BeforeCandidate {
+            reached += 1;
+            let _id = external_maintenance_request(&current_root, &state);
+            assert_ne!(probe.check(), baleyg::store::MaintenanceQueueState::Clear);
+            anyhow::bail!("maintenance deferred for publication");
+        }
+        Ok(())
+    };
+    let error = roots
+        .automatic_gc_at_with_hook(&current, session.leader_guard().unwrap(), now, &mut hook)
+        .unwrap_err();
+    assert!(error.to_string().contains("maintenance deferred"));
+    assert_eq!(reached, 1);
+    assert!(
+        candidate_db.exists(),
+        "no candidate was unlinked after queue priority"
+    );
+    let mut same_day = 0;
+    assert_eq!(
+        roots
+            .automatic_gc_at_with_hook(&current, session.leader_guard().unwrap(), now, &mut |_| {
+                same_day += 1;
+                Ok(())
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(same_day, 0, "durable daily stamp forbids same-day rescan");
+    let mut next_day = 0;
+    let next = roots.automatic_gc_at_with_hook(
+        &current,
+        session.leader_guard().unwrap(),
+        now + 86_400,
+        &mut |stage| {
+            if stage == GcStage::BeforeCandidate {
+                next_day += 1;
+                anyhow::bail!("defer again");
+            }
+            Ok(())
+        },
+    );
+    assert!(next.unwrap_err().to_string().contains("defer again"));
+    assert_eq!(
+        next_day, 1,
+        "unscanned candidate is retried only next eligible day"
     );
 }
