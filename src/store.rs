@@ -3930,12 +3930,16 @@ pub(crate) fn compare_capture_observations(
     comparison
 }
 
+// Keep the selected manifest indexed even when many older revisions are retained.
+// The revision join still verifies that this is the exact metadata-selected head.
+const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) ORDER BY d.path";
+
 fn compare_capture_snapshot(
     db: &Connection,
     capture: &crate::capture::Capture,
 ) -> Result<ScanComparison> {
     let mut previous_sources = BTreeMap::new();
-    let mut statement = db.prepare("SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY d.path")?;
+    let mut statement = db.prepare(SELECTED_CAPTURE_SNAPSHOT_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -11187,6 +11191,36 @@ impl Store {
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
         self.records().delete_annotation(id)
+    }
+}
+
+#[cfg(test)]
+mod selected_capture_query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn selected_capture_does_not_scan_retained_revision_manifests() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V8).unwrap();
+        let plan: Vec<String> = db
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {SELECTED_CAPTURE_SNAPSHOT_SQL}"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH d USING INDEX ")
+                    && step.contains("(revision_id=?)")),
+            "selected revision must drive the manifest index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN d")),
+            "historical manifest scan: {plan:?}"
+        );
     }
 }
 
