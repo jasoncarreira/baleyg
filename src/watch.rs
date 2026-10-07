@@ -175,7 +175,9 @@ impl WatchSignals {
     /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
     pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(MAX_DIRTY_PATHS);
+        // Preserve short bursts beyond one bounded drain without treating a
+        // repeated path as lost input. Actual channel overflow still forces full.
+        let (sender, receiver) = mpsc::sync_channel(MAX_DIRTY_PATHS * 4);
         let generation = Arc::new(AtomicU64::new(1));
         let overflow = Arc::new(AtomicBool::new(false));
         let callback_sender = sender.clone();
@@ -295,16 +297,12 @@ impl WatchSignals {
     /// Nonblocking, bounded drain: never wait for a continuously active producer.
     /// The caller must drain again before acting on a batch or checking its cutoff.
     pub fn drain(&mut self) -> DirtyBatch {
-        let mut processed = 0;
         for _ in 0..MAX_DIRTY_PATHS {
             match self.receiver.try_recv() {
-                Ok(Signal { event, received_at }) => {
-                    processed += 1;
-                    match event {
-                        Ok(event) => self.record(&event, received_at),
-                        Err(_) => self.fail(),
-                    }
-                }
+                Ok(Signal { event, received_at }) => match event {
+                    Ok(event) => self.record(&event, received_at),
+                    Err(_) => self.fail(),
+                },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     if !self.degraded {
@@ -314,12 +312,8 @@ impl WatchSignals {
                 }
             }
         }
-        // The bounded drain may leave events queued. Until a complete inventory
-        // accounts for them, neither a partial path set nor a generation is proof.
-        if processed == MAX_DIRTY_PATHS {
-            self.pending.full = true;
-            self.urgent = true;
-        }
+        // A bounded drain may leave queued events. Generation checks during
+        // acknowledgment prevent clearing until they are incorporated.
         if self.overflow.swap(false, Ordering::SeqCst) {
             self.pending.full = true;
             self.urgent = true;
@@ -488,7 +482,6 @@ fn relevant_input(path: &Path) -> bool {
             .iter()
             .any(|name| path == Path::new(name))
 }
-
 #[cfg(test)]
 mod ingress_tests {
     use super::*;
