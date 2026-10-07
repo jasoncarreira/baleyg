@@ -2391,6 +2391,10 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
         let name = name.unwrap();
         let (predicate, alias) = match name.as_str() {
             "native_revisions" => ("id=?1", ""),
+            "native_revision_release_debt"
+            | "native_release_candidate_versions"
+            | "native_release_candidate_graphs"
+            | "native_release_candidate_classes" => ("revision_id=?1", ""),
             "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
             "native_source_sets" => (
                 "id=(SELECT source_set_id FROM native_revisions WHERE id=?1)",
@@ -2432,7 +2436,7 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
                 "version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)",
                 "",
             ),
-            _ => panic!("unexpected v8 evidence table: {name}"),
+            _ => panic!("unexpected v9 evidence table: {name}"),
         };
         let mut table = db
             .prepare(&format!(
@@ -2458,12 +2462,24 @@ fn real_native_snapshot(home: &std::path::Path) -> Value {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
+        if matches!(
+            name.as_str(),
+            "native_revision_release_debt"
+                | "native_release_candidate_versions"
+                | "native_release_candidate_graphs"
+                | "native_release_candidate_classes"
+        ) {
+            assert!(
+                records.is_empty(),
+                "selected HEAD {pin_id} has unexpected v9 release control rows in {name}: {records:?}"
+            );
+        }
         all_rows.insert(name, serde_json::json!(records));
     }
     assert_eq!(
         all_rows.len(),
-        28,
-        "retain every v8 evidence table in raw snapshot"
+        32,
+        "retain every v9 evidence table in raw snapshot"
     );
     serde_json::json!({"sourceSet":{"id":source_set.0,"rootId":source_set.1},
         "revision":{"id":revision.0,"sourceSetId":revision.1,"toolchainHash":revision.2,
@@ -3191,7 +3207,7 @@ def sink():
         assert_eq!(
             same_bytes_evidence(&native_after),
             same_bytes_evidence(&native_before),
-            "{name}: all 28 evidence tables and documents must match after only publication identity normalization"
+            "{name}: all 32 v9 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
             graph_after, graph_before,
@@ -3717,7 +3733,7 @@ def sink():
         assert_eq!(failed["state"], "failed", "{name}: {failed}");
         assert_eq!(failed["error"]["code"], "revision_conflict", "{name}");
         // The successful same-byte reindex advanced publication identity. A
-        // stale request must leave that current, fully raw v8 pair untouched.
+        // stale request must leave that current, fully raw v9 pair untouched.
         assert_eq!(real_native_snapshot(&home), native_after, "{name}");
         let unchanged_status: Value = client
             .get(format!("{url}/api/status"))
@@ -4490,7 +4506,7 @@ async fn saved_items_real_index_matrix() {
         .unwrap()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(index_version, 8, "derived index inspection is separate");
+    assert_eq!(index_version, 9, "derived v9 index inspection is separate");
 
     let edited_view_body = serde_json::json!({
         "id":"real-view","title":"Edited","query":{"seed":seed}

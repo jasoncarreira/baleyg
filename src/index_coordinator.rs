@@ -4,10 +4,72 @@ use crate::{
     capture::Capture,
     indexer::{self, IndexOptions},
     model::{CancelFlag, IndexPin, IndexProgress},
-    store::{RecoveryBaseline, Store, topology::LeaderSession},
+    store::{PublishPermit, RecoveryBaseline, Store, topology::LeaderSession},
 };
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, atomic::Ordering};
+
+// Optional diagnostics never write on the publication or maintenance thread.
+// A full bounded channel increments a loss counter rather than blocking work.
+struct DiagnosticMarkers {
+    sender: std::sync::mpsc::SyncSender<String>,
+    lost: std::sync::atomic::AtomicU64,
+    origin: std::time::Instant,
+}
+impl DiagnosticMarkers {
+    fn emit(&self, incarnation: &str, event: &str, detail: &str) {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.as_millis());
+        let elapsed = self.origin.elapsed().as_micros();
+        let lost = self.lost.swap(0, Ordering::AcqRel);
+        let message = format!(
+            "maintenance wall_ms={wall} monotonic_us={elapsed} incarnation={incarnation} event={event} detail={detail} marker_lost={lost}\n"
+        );
+        if self.sender.try_send(message).is_err() {
+            self.lost.fetch_add(lost + 1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn diagnostics() -> Option<&'static DiagnosticMarkers> {
+    static MARKERS: std::sync::OnceLock<Option<DiagnosticMarkers>> = std::sync::OnceLock::new();
+    MARKERS
+        .get_or_init(|| {
+            if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() != Ok("1") {
+                return None;
+            }
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(256);
+            std::thread::Builder::new()
+                .name("baleyg-diagnostic-writer".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    while let Ok(line) = receiver.recv() {
+                        // Never hold stderr's global lock while waiting for
+                        // the next marker: CLI publication diagnostics and
+                        // fixture barriers use stderr on other threads.
+                        let mut out = std::io::stderr().lock();
+                        let _ = out.write_all(line.as_bytes());
+                        let _ = out.flush();
+                    }
+                })
+                .ok()?;
+            Some(DiagnosticMarkers {
+                sender,
+                lost: std::sync::atomic::AtomicU64::new(0),
+                origin: std::time::Instant::now(),
+            })
+        })
+        .as_ref()
+}
+pub(crate) fn diagnostics_enabled() -> bool {
+    diagnostics().is_some()
+}
+pub(crate) fn diagnostic_marker(incarnation: &str, event: &str, detail: &str) {
+    if let Some(markers) = diagnostics() {
+        markers.emit(incarnation, event, detail);
+    }
+}
 
 struct PublicationAdmission<C> {
     capture: Option<Capture>,
@@ -19,19 +81,35 @@ pub struct IndexJobCoordinator {
     store: Store,
     expected: RecoveryBaseline,
     session: Arc<LeaderSession>,
+    publication: Option<PublishPermit>,
 }
 
 impl IndexJobCoordinator {
     /// The control baseline admits known old indexes without exposing their evidence to readers.
     /// A supplied HTTP pair is checked before any source admission or worker is started.
     pub fn prepare(store: &Store, requested: Option<IndexPin>) -> Result<Self> {
+        // Leader opening has its own Store gate around its data_version→COMMIT
+        // window. It must finish before acquiring this publication's permit.
+        let session = store.leader_session()?;
+        let publication = store.enter_publication(
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_millis(250),
+        )?;
+        diagnostic_marker(
+            &session.incarnation().to_string(),
+            "publication_wait",
+            &format!(
+                "reason={:?} duration_us={}",
+                publication.wait_reason(),
+                publication.waited_for().as_micros()
+            ),
+        );
         let expected = store.recovery_index_baseline()?;
         ensure!(
             requested.is_none_or(|pin| expected.pin() == Some(pin)),
             "revision conflict: prior index pin is not decodable or changed"
         );
-        let session = store.leader_session()?;
-        Self::prepare_with_session_and_baseline(store, requested, expected, session)
+        Self::prepare_with_admitted_publication(store, requested, expected, session, publication)
     }
 
     pub fn prepare_with_session(
@@ -39,15 +117,29 @@ impl IndexJobCoordinator {
         requested: Option<IndexPin>,
         session: Arc<LeaderSession>,
     ) -> Result<Self> {
+        let publication = store.enter_publication(
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_millis(250),
+        )?;
+        diagnostic_marker(
+            &session.incarnation().to_string(),
+            "publication_wait",
+            &format!(
+                "reason={:?} duration_us={}",
+                publication.wait_reason(),
+                publication.waited_for().as_micros()
+            ),
+        );
         let expected = store.recovery_index_baseline()?;
-        Self::prepare_with_session_and_baseline(store, requested, expected, session)
+        Self::prepare_with_admitted_publication(store, requested, expected, session, publication)
     }
 
-    fn prepare_with_session_and_baseline(
+    fn prepare_with_admitted_publication(
         store: &Store,
         requested: Option<IndexPin>,
         expected: RecoveryBaseline,
         session: Arc<LeaderSession>,
+        publication: PublishPermit,
     ) -> Result<Self> {
         ensure!(session.is_leader(), "storage_busy: follower cannot publish");
         store.verify_leader_session(&session)?;
@@ -59,28 +151,13 @@ impl IndexJobCoordinator {
             store: store.clone(),
             expected,
             session,
+            publication: Some(publication),
         })
     }
 
     pub fn session(&self) -> Arc<LeaderSession> {
         self.session.clone()
     }
-    fn maintain_after_publish(&self) {
-        if let Ok(leader) = self.session.leader_guard()
-            && let Err(error) = self.store.maintain_revisions(leader)
-        {
-            // Publication is already committed. Idle maintenance retries rather
-            // than turning a committed pin into an ambiguous failed request.
-            eprintln!("revision maintenance deferred: {error:#}");
-        }
-        if let Ok(leader) = self.session.leader_guard()
-            && let Err(error) = self.store.automatic_gc(leader)
-        {
-            // GC is independent of the committed publication and its ACK.
-            eprintln!("derived GC attempt deferred: {error:#}");
-        }
-    }
-
     /// A diagnostic decision for two immutable admissions. Publication classifies
     /// its persisted prior manifest in one private read snapshot instead.
     pub fn staged_capture_decision(
@@ -118,7 +195,7 @@ impl IndexJobCoordinator {
 
     /// `observe` sees the job's single capture after admission and before publication.
     pub(crate) fn run_observed(
-        self,
+        mut self,
         options: &IndexOptions,
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
@@ -141,7 +218,7 @@ impl IndexJobCoordinator {
     /// A fresh, guarded unchanged capture may reuse selected native versions
     /// for serving and for a normally claimed explicit request.
     pub fn run_serving(
-        self,
+        mut self,
         options: &IndexOptions,
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
@@ -163,13 +240,13 @@ impl IndexJobCoordinator {
     /// Publish exactly the leader's admitted immutable snapshot. A watch cutoff
     /// rejects signals observed before publication; later signals stay pending.
     fn run_captured_serving(
-        self,
+        mut self,
         options: &IndexOptions,
         cancel: &CancelFlag,
         capture: Capture,
         cutoff: impl FnMut() -> Result<()>,
-    ) -> Result<IndexPin> {
-        self.run_with_capture(
+    ) -> Result<(IndexPin, PublishPermit)> {
+        let pin = self.run_with_capture(
             options,
             cancel,
             |_| {},
@@ -180,11 +257,12 @@ impl IndexJobCoordinator {
                 unchanged_fast: false,
                 cutoff,
             },
-        )
+        )?;
+        Ok((pin, self.publication.take().expect("publication admitted")))
     }
 
     fn run_with_capture(
-        self,
+        &mut self,
         options: &IndexOptions,
         cancel: &CancelFlag,
         progress: impl Fn(IndexProgress) + Sync,
@@ -236,7 +314,6 @@ impl IndexJobCoordinator {
             observe(&capture);
             self.store
                 .attest_post_acquisition_reconciliation(&self.session, pin)?;
-            self.maintain_after_publish();
             return Ok(pin);
         }
         let root = std::fs::canonicalize(&options.workspace_root)?;
@@ -283,7 +360,6 @@ impl IndexJobCoordinator {
                 report("publish", phase_start.elapsed());
                 self.store
                     .attest_post_acquisition_reconciliation(&self.session, pin)?;
-                self.maintain_after_publish();
                 return Ok(pin);
             }
             // A moved D4 class cut is unproved: recalculate every native fact
@@ -325,7 +401,6 @@ impl IndexJobCoordinator {
         report("publish", phase_start.elapsed());
         self.store
             .attest_post_acquisition_reconciliation(&self.session, published)?;
-        self.maintain_after_publish();
         Ok(published)
     }
 }
@@ -369,6 +444,29 @@ impl LeaderWork {
             last_accounted_generation: None,
             options: options.clone(),
         })
+    }
+
+    /// An accepted signal is visible at ingress, before debounce and before
+    /// the native stream drains the bounded channel. A selected-options change
+    /// has not registered a replacement watcher yet, so it is also intent.
+    pub fn accepted_watch_intent(&self, options: &IndexOptions) -> bool {
+        self.options.workspace_root != options.workspace_root
+            || self.options.scip_path != options.scip_path
+            || self.options.manifest_path != options.manifest_path
+            || self.options.max_file_bytes != options.max_file_bytes
+            || self.watch.accepted_unacked()
+    }
+
+    #[doc(hidden)]
+    pub fn disable_native_watcher_for_tests(&mut self) {
+        self.watch.disable_native_watcher_for_tests();
+    }
+
+    /// Feed the same bounded ingress as notify in a deterministic scheduler
+    /// fixture. The intent is visible before debounce and before drain.
+    #[doc(hidden)]
+    pub fn submit_watch_event_for_tests(&self, event: notify::Result<notify::Event>) {
+        self.watch.submit_event(event);
     }
 
     /// Model a watcher that lost its event channel without modifying the
@@ -467,7 +565,18 @@ impl LeaderWork {
         }
         // The first post-registration full inventory closes the takeover/watch gap.
         // An identical selected capture needs no gratuitous new revision.
-        let outcome: Result<()> = (|| {
+        let outcome: Result<PublishPermit> = (|| {
+            let publication =
+                store.enter_publication(cancel, std::time::Duration::from_millis(250))?;
+            diagnostic_marker(
+                &session.incarnation().to_string(),
+                "publication_wait",
+                &format!(
+                    "reason={:?} duration_us={}",
+                    publication.wait_reason(),
+                    publication.waited_for().as_micros()
+                ),
+            );
             let captured = Capture::admit(options, cancel, &|_| {})?;
             observe(&captured, &self.watch);
             // Reject a hinted edit before checking the admitted bytes against
@@ -492,13 +601,21 @@ impl LeaderWork {
             if unchanged {
                 cutoff()?;
             } else {
-                IndexJobCoordinator::prepare_with_session(store, None, session.clone())?
-                    .run_captured_serving(options, cancel, captured, cutoff)?;
+                let coordinator = IndexJobCoordinator::prepare_with_admitted_publication(
+                    store,
+                    None,
+                    baseline,
+                    session.clone(),
+                    publication,
+                )?;
+                return coordinator
+                    .run_captured_serving(options, cancel, captured, cutoff)
+                    .map(|(_, publication)| publication);
             }
-            Ok(())
+            Ok(publication)
         })();
         match outcome {
-            Ok(_) => {
+            Ok(publication) => {
                 after_cutoff(&self.watch);
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
@@ -508,6 +625,7 @@ impl LeaderWork {
                     // Keep it dirty for the next tick or successor full takeover.
                     self.watch.require_full();
                 }
+                drop(publication);
                 self.last_inventory = std::time::Instant::now();
                 self.retry_after = None;
                 Ok(accounted)
@@ -646,11 +764,12 @@ fn drain_requests_observed_with_cancel(
         // admission. A BUSY COMMIT can be safely retried only if its terminal
         // queue reread and current control pin still match this baseline.
         let mut before_publish = None;
+        let mut publication = None;
         let outcome = (|| {
             let options = request.options(std::path::Path::new(store.workspace_root()))?;
             #[cfg(test)]
             diagnostic_stage.set("prepare");
-            let coordinator = IndexJobCoordinator::prepare_with_session(
+            let mut coordinator = IndexJobCoordinator::prepare_with_session(
                 store,
                 request.expected,
                 session.clone(),
@@ -658,7 +777,7 @@ fn drain_requests_observed_with_cancel(
             before_publish = Some(coordinator.expected.pin());
             #[cfg(test)]
             diagnostic_stage.set("run");
-            coordinator.run_with_capture(
+            let result = coordinator.run_with_capture(
                 &options,
                 cancel,
                 |p| progress(&request.id, p),
@@ -669,7 +788,11 @@ fn drain_requests_observed_with_cancel(
                     unchanged_fast: true,
                     cutoff: || Ok(()),
                 },
-            )
+            );
+            // A post-COMMIT error can be ambiguous. Retain the permit through
+            // terminal ACK, cached completion or typed busy requeue even then.
+            publication = coordinator.publication.take();
+            result
         })();
         #[cfg(test)]
         if let Err(ref error) = outcome {
@@ -742,6 +865,7 @@ fn drain_requests_observed_with_cancel(
         // No unverified worker can mark a request terminal. On fencing loss leave it running
         // for the next incarnation to reclaim after its complete root reconciliation.
         store.record_and_finish_request(session, &request, outcome)?;
+        drop(publication);
         completed += 1;
         if completed >= max_completed {
             break;
@@ -1065,6 +1189,38 @@ fn enqueue_and_wait_observed_inner(
     }
 }
 
+/// One private low-priority unit, never a queued publication. The caller
+/// refreshes its watcher/session snapshot and re-arbitrates before another unit.
+/// Contention is deferred, never returned to a foreground FIFO caller.
+pub fn cooperative_maintenance_unit(
+    store: &Store,
+    session: &Arc<LeaderSession>,
+    mut priority: impl FnMut() -> bool,
+) -> Result<crate::store::MaintenanceOutcome> {
+    use crate::store::{MaintenanceOutcome, MaintenanceQueueState};
+    if !priority() || session.verify().is_err() {
+        return Ok(MaintenanceOutcome::Deferred);
+    }
+    let Some(permit) = store.maintenance_try_enter() else {
+        return Ok(MaintenanceOutcome::Deferred);
+    };
+    let probe = match store.open_maintenance_queue_probe() {
+        Ok(probe) => probe,
+        Err(error) if crate::store::transient_storage_contention(&error) => {
+            return Ok(MaintenanceOutcome::Deferred);
+        }
+        Err(error) => return Err(error),
+    };
+    if probe.check() != MaintenanceQueueState::Clear || !priority() {
+        return Ok(MaintenanceOutcome::Deferred);
+    }
+    let leader = match session.leader_guard() {
+        Ok(leader) => leader,
+        Err(_) => return Ok(MaintenanceOutcome::Deferred),
+    };
+    store.maintenance_step(leader, &permit, &probe, priority)
+}
+
 /// Establish one bounded serving owner. A free lock performs one complete
 /// reconciliation; contention is admitted only as a verified follower.
 pub fn establish_serving_session(
@@ -1086,6 +1242,17 @@ pub fn establish_serving_session(
     match store.leader_session() {
         Ok(session) => {
             store.fail_changed_root_requests(&session)?;
+            let publication =
+                store.enter_publication(cancel, std::time::Duration::from_millis(250))?;
+            diagnostic_marker(
+                &session.incarnation().to_string(),
+                "publication_wait",
+                &format!(
+                    "reason={:?} duration_us={}",
+                    publication.wait_reason(),
+                    publication.waited_for().as_micros()
+                ),
+            );
             let expected = store.recovery_index_baseline()?;
             let options = match explicit_options {
                 Some(options) => options.clone(),
@@ -1093,11 +1260,12 @@ pub fn establish_serving_session(
                     IndexOptions::new(std::path::PathBuf::from(store.workspace_root()))
                 }),
             };
-            let coordinator = IndexJobCoordinator::prepare_with_session_and_baseline(
+            let coordinator = IndexJobCoordinator::prepare_with_admitted_publication(
                 store,
                 None,
                 expected,
                 session.clone(),
+                publication,
             )?;
             coordinator.run_serving(&options, cancel, |_| {})?;
             session.verify()?;
@@ -2213,5 +2381,32 @@ mod queue_completion_retry_tests {
             "queued"
         );
         assert_eq!(store.status().unwrap().revision, published);
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    #[test]
+    fn bounded_marker_channel_reports_losses_without_blocking_writer() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let markers = DiagnosticMarkers {
+            sender,
+            lost: std::sync::atomic::AtomicU64::new(0),
+            origin: std::time::Instant::now(),
+        };
+        markers.emit("incarnation", "start", "kind=retention");
+        markers.emit("incarnation", "end", "outcome=deferred");
+        assert_eq!(markers.lost.load(Ordering::Acquire), 1);
+        let first = receiver.try_recv().unwrap();
+        assert!(first.contains("event=start"));
+        assert!(first.contains("marker_lost=0"));
+        markers.emit("incarnation", "end", "outcome=progress");
+        let last = receiver.try_recv().unwrap();
+        assert!(last.contains("event=end"));
+        assert!(last.contains("marker_lost=1"));
+        assert!(last.contains("monotonic_us="));
+        assert!(last.contains("wall_ms="));
+        assert_eq!(markers.lost.load(Ordering::Acquire), 0);
     }
 }

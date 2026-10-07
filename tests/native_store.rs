@@ -39,6 +39,45 @@ fn live_class_projection(db: &Connection, path: &str) -> String {
         |row| row.get(0),
     ).unwrap()
 }
+// Build an actual old disposable v8 schema from a v9 fixture. The old
+// supersession extension was optional, so omit it and retain binding tables.
+fn downgrade_index_to_v8(path: &std::path::Path) {
+    let db = Connection::open(path).unwrap();
+    let metadata_sql: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='index_metadata'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let metadata_sql = metadata_sql
+        .replace(
+            "CREATE TABLE index_metadata(",
+            "CREATE TABLE index_metadata_v8(",
+        )
+        .replace("CHECK(schema_version=9)", "CHECK(schema_version=8)");
+    db.execute_batch(
+        "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+        DROP TABLE native_release_candidate_classes;
+        DROP TABLE native_release_candidate_graphs;
+        DROP TABLE native_release_candidate_versions;
+        DROP TABLE native_revision_release_debt;
+        DROP TABLE native_revision_supersessions;",
+    )
+    .unwrap();
+    db.execute_batch(&metadata_sql).unwrap();
+    db.execute_batch(
+        "INSERT INTO index_metadata_v8
+        SELECT singleton,8,extractor_version,root_spelling,root_device,root_inode,
+            index_generation,index_revision,last_opened_at,indexed_at,stats,diagnostics,
+            reconciled_incarnation,reconcile_options FROM index_metadata;
+        DROP TABLE index_metadata;
+        ALTER TABLE index_metadata_v8 RENAME TO index_metadata;
+        PRAGMA user_version=8; COMMIT; PRAGMA foreign_keys=ON;",
+    )
+    .unwrap();
+}
+
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store, CancelFlag) {
     let state = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -215,7 +254,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     let count: i64 = db
         .query_row(
@@ -1540,6 +1579,7 @@ fn assert_retained_native_family_parity(
 fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc() {
     use baleyg::native_evidence::DocumentKey;
     let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
     // Independent full-rewrite measurements, separate from publish()'s capture.
     let (_, measured_r1, _) = index_workspace_bundle(
         &IndexOptions::new(root.path().to_owned()),
@@ -1577,10 +1617,12 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
         |_| {},
     )
     .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
     let source2 = store.native_source_at(r2, &key).unwrap().unwrap();
     assert_ne!(source1.1, source2.1);
     fs::remove_file(root.path().join("flow.js")).unwrap();
+    store.set_retention_clock_for_tests(1_002, 2);
     let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
     assert!(store.native_source_at(r3, &key).unwrap().is_none());
     assert_eq!(store.native_source_at(r1, &key).unwrap().unwrap(), source1);
@@ -1603,6 +1645,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
     // native evidence, not the head's or each other's projection.
     assert_retained_native_family_parity(&store, r1, &measured_r1);
     assert_retained_native_family_parity(&store, r2, &measured_r2);
+    store.set_retention_clock_for_tests(1_901, 901);
     store.release_revision(r1, &leader).unwrap();
     assert!(
         store
@@ -2018,10 +2061,11 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
 }
 
 #[test]
-fn leader_migrates_legacy_v8_history_with_fresh_grace_without_changing_pins() {
+fn obsolete_v8_rebuilds_same_inode_with_new_generation_and_preserves_unfinished_fifo() {
+    use std::os::unix::fs::MetadataExt;
     let (state, root, store, cancel) = fixture();
     let leader = store.leader().unwrap();
-    let first = publish(
+    let old = publish(
         &store,
         root.path(),
         &cancel,
@@ -2029,8 +2073,9 @@ fn leader_migrates_legacy_v8_history_with_fresh_grace_without_changing_pins() {
         &leader,
     )
     .unwrap();
-    fs::write(root.path().join("flow.js"), "function changed() {}\n").unwrap();
-    let head = publish(&store, root.path(), &cancel, first, &leader).unwrap();
+    let pending = store
+        .enqueue_request(&IndexOptions::new(root.path().to_owned()), None)
+        .unwrap();
     drop(leader);
     drop(store);
     let identity =
@@ -2041,49 +2086,44 @@ fn leader_migrates_legacy_v8_history_with_fresh_grace_without_changing_pins() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE native_revision_supersessions")
-        .unwrap();
-    drop(db);
+    downgrade_index_to_v8(&path);
+    let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let leader = reopened.leader().unwrap();
-    let db = Connection::open(&path).unwrap();
-    let grace: i64 = db
-        .query_row(
-            "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
-            [format!(
-                "pin:v1:{}:{}",
-                first.index_generation, first.index_revision
-            )],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    assert!(
-        (0..=3).contains(&(now - grace)),
-        "migration grants fresh 15-minute grace"
-    );
+    assert!(reopened.status().is_err(), "v8 cannot serve an old pin");
+    let session = reopened.leader_session().unwrap();
+    let new_pin = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+        &reopened,
+        None,
+        session.clone(),
+    )
+    .unwrap()
+    .run(&IndexOptions::new(root.path().to_owned()), &cancel, |_| {})
+    .unwrap();
     assert_eq!(
-        db.query_row(
-            "SELECT count(*) FROM native_revision_supersessions",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        1
+        fs::metadata(&path).unwrap().ino(),
+        inode,
+        "T06 normally retains index.db inode"
     );
-    assert_eq!(reopened.index_baseline().unwrap(), head);
-    let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
-    assert_eq!(next.index_generation, first.index_generation);
-    assert!(reopened.graph_at(Some(first)).is_ok());
+    assert_ne!(new_pin.index_generation, old.index_generation);
+    assert_eq!(new_pin.index_revision, 1);
+    let old_error = reopened.graph_at(Some(old)).unwrap_err();
+    assert!(
+        old_error.to_string().contains("revision conflict"),
+        "{old_error:#}"
+    );
+    let preserved = reopened.request_by_id(&pending.id).unwrap().unwrap();
+    assert_eq!(preserved.id, pending.id);
+    assert_eq!(
+        preserved.state, "queued",
+        "unfinished durable FIFO must survive disposable rebuild"
+    );
+    assert_eq!(reopened.status().unwrap().revision, new_pin);
 }
 
 #[test]
-fn supersession_backfill_omits_released_tombstones() {
+fn released_supersession_never_reenters_retained_due_inventory() {
     let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
     let r1 = publish(
         &store,
@@ -2093,11 +2133,12 @@ fn supersession_backfill_omits_released_tombstones() {
         &leader,
     )
     .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_002, 2);
     let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
-    store.release_revision(r1, &leader).unwrap();
-    drop(leader);
-    drop(store);
+    store.set_retention_clock_for_tests(1_901, 901);
+    store.maintain_revisions(&leader).unwrap();
     let identity =
         baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
@@ -2107,27 +2148,27 @@ fn supersession_backfill_omits_released_tombstones() {
         .join(identity.root_key)
         .join("index.db");
     let db = Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE native_revision_supersessions")
+    for (pin, expected) in [(r1, "released"), (r2, "retained")] {
+        let id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let state: String = db
+            .query_row(
+                "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected);
+    }
+    let due: i64 = db
+        .query_row(
+            "SELECT count(*) FROM native_revision_supersessions INDEXED BY native_supersessions_due
+        WHERE state='retained' AND superseded_at<=1001",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    drop(db);
-    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    let _leader = reopened.leader().unwrap();
-    let db = Connection::open(&path).unwrap();
-    let revisions: Vec<String> = db
-        .prepare("SELECT revision_id FROM native_revision_supersessions ORDER BY revision_id")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(
-        revisions,
-        [format!(
-            "pin:v1:{}:{}",
-            r2.index_generation, r2.index_revision
-        )]
-    );
-    assert_eq!(reopened.index_baseline().unwrap(), r3);
+    assert_eq!(due, 0);
+    assert_eq!(store.status().unwrap().revision, r3);
 }
 
 #[test]
@@ -2342,10 +2383,11 @@ fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
 }
 
 #[test]
-fn migrated_history_gets_new_clock_grace_until_exact_boundary() {
+fn failed_v8_transactional_rebuild_rolls_back_without_new_inode_or_serving_old() {
+    use std::{os::unix::fs::MetadataExt, sync::atomic::Ordering};
     let (state, root, store, cancel) = fixture();
     let leader = store.leader().unwrap();
-    let first = publish(
+    let old = publish(
         &store,
         root.path(),
         &cancel,
@@ -2353,7 +2395,6 @@ fn migrated_history_gets_new_clock_grace_until_exact_boundary() {
         &leader,
     )
     .unwrap();
-    let head = publish(&store, root.path(), &cancel, first, &leader).unwrap();
     drop(leader);
     drop(store);
     let identity =
@@ -2364,26 +2405,48 @@ fn migrated_history_gets_new_clock_grace_until_exact_boundary() {
         .join("cache/indexes")
         .join(identity.root_key)
         .join("index.db");
-    Connection::open(path)
-        .unwrap()
-        .execute_batch("DROP TABLE native_revision_supersessions")
-        .unwrap();
+    downgrade_index_to_v8(&path);
+    let inode = fs::metadata(&path).unwrap().ino();
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
-    reopened.set_retention_clock_for_tests(1_000, 0);
-    let leader = reopened.leader().unwrap();
-    publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
-    reopened.set_retention_clock_for_tests(1_899, 899);
-    reopened.maintain_revisions(&leader).unwrap();
-    assert!(reopened.graph_at(Some(first)).is_ok());
-    reopened.set_retention_clock_for_tests(1_900, 900);
-    reopened.maintain_revisions(&leader).unwrap();
-    assert!(
-        reopened
-            .graph_at(Some(first))
-            .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
-            .is_some()
+    let stop = cancel.clone();
+    reopened
+        .set_publication_before_commit_hook_for_tests(move || stop.store(true, Ordering::Release));
+    let error = baleyg::index_coordinator::IndexJobCoordinator::prepare(&reopened, None)
+        .unwrap()
+        .run(&IndexOptions::new(root.path().to_owned()), &cancel, |_| {})
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error:#}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().ino(),
+        inode,
+        "failed T06 cannot recreate inode"
     );
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        8
+    );
+    let generation: String = db
+        .query_row(
+            "SELECT index_generation FROM index_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(generation, old.index_generation.to_string());
+    drop(db);
+    assert!(
+        reopened.status().is_err(),
+        "obsolete failed rebuild must stay not-ready"
+    );
+    cancel.store(false, Ordering::Release);
+    let next = baleyg::index_coordinator::IndexJobCoordinator::prepare(&reopened, None)
+        .unwrap()
+        .run(&IndexOptions::new(root.path().to_owned()), &cancel, |_| {})
+        .unwrap();
+    assert_ne!(next.index_generation, old.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 }
 
 #[test]
@@ -2474,4 +2537,606 @@ fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
         );
         assert!(error.downcast_ref::<baleyg::store::PinExpired>().is_none());
     }
+}
+
+#[test]
+fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let error = store.release_revision(old, &leader).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<baleyg::store::SqliteContention>()
+            .is_some(),
+        "blocked due release must return typed retryable contention: {error:#}"
+    );
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let db = Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let (state, debt, tombstones): (String, i64, i64) = db
+        .query_row(
+            "SELECT state,
+                (SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1),
+                (SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1
+                    AND input_key IN ('__pending_release:v1','__released:v1'))
+             FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((state, debt, tombstones), ("retained".into(), 0, 0));
+    assert!(store.graph_at(Some(old)).is_ok(), "old pin stays readable");
+    assert_eq!(store.status().unwrap().revision, head);
+    drop(permit);
+}
+
+#[test]
+fn v9_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
+    use baleyg::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    for number in 0..5 {
+        fs::write(
+            root.path().join(format!("extra{number}.js")),
+            format!("function extra{number}() {{ return {number}; }}"),
+        )
+        .unwrap();
+    }
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    assert!(
+        store
+            .release_revision(old, &leader)
+            .unwrap_err()
+            .to_string()
+            .contains("retention grace")
+    );
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let original: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(original > 4);
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let db = Connection::open(&path).unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        original
+    );
+    assert_eq!(db.query_row("SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1 AND input_key='__pending_release:v1' AND payload='pending_release:v1'",[&id],|r|r.get::<_,i64>(0)).unwrap(),1);
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1",
+            [&id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+    assert_eq!(store.status().unwrap().revision, head);
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let partial: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        partial > 0 && partial < original,
+        "partial manifest durable after one unit"
+    );
+    assert_eq!(store.status().unwrap().revision, head);
+    drop(probe);
+    drop(permit);
+    drop(db);
+    store.maintain_revisions(&leader).unwrap();
+    let db = Connection::open(&path).unwrap();
+    let exact: (String, i64, i64, i64) = db
+        .query_row(
+            "SELECT state,
+         (SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1),
+         (SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1),
+         (SELECT count(*) FROM revision_documents WHERE revision_id=?1)
+         FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(exact, ("released".into(), 1, 0, 0));
+    assert_eq!(store.status().unwrap().revision, head);
+}
+
+#[test]
+fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() {
+    use baleyg::store::MaintenanceOutcome;
+    use std::sync::atomic::Ordering;
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    let priority = Arc::new(AtomicBool::new(false));
+    let signal = priority.clone();
+    store.set_maintenance_after_first_delete_hook_for_tests(move || {
+        signal.store(true, Ordering::Release)
+    });
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || !priority
+                .load(Ordering::Acquire))
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    assert!(priority.load(Ordering::Acquire));
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [&id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        4
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_release_candidate_versions WHERE revision_id=?1",
+            [&id],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        store.status().unwrap().revision.index_revision,
+        old.index_revision + 1
+    );
+}
+
+#[test]
+fn v9_noop_retention_uses_covering_indexes_and_never_opens_writer() {
+    use baleyg::store::MaintenanceOutcome;
+    use std::sync::atomic::Ordering;
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let observer = Connection::open(&path).unwrap();
+    let plans = [
+        (
+            "SELECT max(superseded_at) FROM native_revision_supersessions",
+            "native_supersessions_clock",
+        ),
+        (
+            "SELECT revision_id FROM native_revision_supersessions WHERE state='retained' AND superseded_at<=1000 ORDER BY superseded_at,revision_id LIMIT 1",
+            "native_supersessions_due",
+        ),
+        (
+            "SELECT revision_id FROM native_revision_release_debt LIMIT 1",
+            "sqlite_autoindex_native_revision_release_debt",
+        ),
+    ];
+    for (query, index) in plans {
+        let detail: Vec<String> = observer
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map([], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            detail.iter().any(|entry| entry.contains(index)),
+            "{query}: {detail:?}"
+        );
+    }
+    let before: i64 = observer
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .unwrap();
+    let attempted = Arc::new(AtomicBool::new(false));
+    let flag = attempted.clone();
+    store.set_maintenance_before_writer_hook_for_tests(move || flag.store(true, Ordering::Release));
+    store.set_retention_clock_for_tests(1_899, 899);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Idle
+    );
+    assert!(!attempted.load(Ordering::Acquire));
+    let after: i64 = observer
+        .pragma_query_value(None, "data_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after, "no-op made an index write");
+    assert_eq!(store.oldest_due_debt_age(&leader).unwrap(), None);
+    store.set_retention_clock_for_tests(1_901, 901);
+    assert_eq!(
+        store.oldest_due_debt_age(&leader).unwrap(),
+        Some(std::time::Duration::from_secs(900))
+    );
+}
+
+#[test]
+fn v9_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
+    use baleyg::store::MaintenanceOutcome;
+    for mutation in [
+        "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
+        "UPDATE revision_capture_inputs SET payload='invalid' WHERE revision_id=?1 AND input_key='__pending_release:v1'",
+        "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) VALUES(?1,'__released:v1','released:v1')",
+    ] {
+        let (state, root, store, cancel) = fixture();
+        store.set_retention_clock_for_tests(1_000, 0);
+        let leader = store.leader().unwrap();
+        let old = publish(
+            &store,
+            root.path(),
+            &cancel,
+            store.index_baseline().unwrap(),
+            &leader,
+        )
+        .unwrap();
+        store.set_retention_clock_for_tests(1_001, 1);
+        publish(&store, root.path(), &cancel, old, &leader).unwrap();
+        store.set_retention_clock_for_tests(1_901, 901);
+        let permit = store.maintenance_try_enter().unwrap();
+        let probe = store.open_maintenance_queue_probe().unwrap();
+        assert_eq!(
+            store
+                .maintenance_step(&leader, &permit, &probe, || true)
+                .unwrap(),
+            MaintenanceOutcome::Progress
+        );
+        drop(probe);
+        drop(permit);
+        drop(leader);
+        drop(store);
+        let identity =
+            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+                .unwrap();
+        let path = state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db");
+        let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+        Connection::open(path)
+            .unwrap()
+            .execute(mutation, [id])
+            .unwrap();
+        let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let error = reopened.status().unwrap_err();
+        assert!(
+            error.to_string().contains("incompatible_index"),
+            "{mutation}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn maintenance_index_writer_busy_defers_and_counts_only_confirmed_sqlite_busy() {
+    use baleyg::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let blocker = Connection::open(path).unwrap();
+    blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    let before = store.maintenance_sqlite_busy_attempts();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Deferred
+    );
+    assert!(store.maintenance_sqlite_busy_attempts() > before);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    assert!(
+        store.graph_at(Some(old)).is_ok(),
+        "deferred writer did not release the pin"
+    );
+}
+
+#[test]
+fn publication_gate_is_shared_by_clones_and_independent_same_root_stores() {
+    let (state, root, store, cancel) = fixture();
+    let cloned = store.clone();
+    let independent = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let publication = store
+        .enter_publication(&cancel, std::time::Duration::ZERO)
+        .unwrap();
+    assert!(cloned.maintenance_try_enter().is_none());
+    assert!(independent.maintenance_try_enter().is_none());
+    drop(publication);
+    let maintenance = independent.maintenance_try_enter().unwrap();
+    let error = store
+        .enter_publication(&cancel, std::time::Duration::ZERO)
+        .unwrap_err();
+    assert!(error.to_string().contains("storage_busy"));
+    drop(maintenance);
+    let permit = cloned
+        .enter_publication(&cancel, std::time::Duration::ZERO)
+        .unwrap();
+    assert_eq!(
+        permit.wait_reason(),
+        baleyg::store::PublicationWaitReason::None
+    );
+}
+
+#[test]
+fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generation() {
+    use baleyg::store::MaintenanceOutcome;
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    store.set_retention_clock_for_tests(1_001, 1);
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_901, 901);
+    let permit = store.maintenance_try_enter().unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        store
+            .maintenance_step(&leader, &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    drop(probe);
+    drop(permit);
+    drop(leader);
+    drop(store);
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    reopened.set_retention_clock_for_tests(1_901, 0);
+    let session = reopened.leader_session().unwrap();
+    let next = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+        &reopened,
+        None,
+        session.clone(),
+    )
+    .unwrap()
+    .run(&IndexOptions::new(root.path().to_owned()), &cancel, |_| {})
+    .unwrap();
+    assert_eq!(next.index_generation, head.index_generation);
+    assert_eq!(next.index_revision, head.index_revision + 1);
+    assert!(
+        reopened
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+    assert_eq!(
+        reopened
+            .maintenance_oldest_due_age_secs(session.leader_guard().unwrap())
+            .unwrap(),
+        Some(900)
+    );
+    let permit = reopened.maintenance_try_enter().unwrap();
+    let probe = reopened.open_maintenance_queue_probe().unwrap();
+    assert_eq!(
+        reopened
+            .maintenance_step(session.leader_guard().unwrap(), &permit, &probe, || true)
+            .unwrap(),
+        MaintenanceOutcome::Progress
+    );
+    drop(probe);
+    drop(permit);
+    reopened
+        .maintain_revisions(session.leader_guard().unwrap())
+        .unwrap();
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
+    let db = Connection::open(path).unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        matches!(state.as_str(), "pending" | "released"),
+        "bounded units may defer without losing debt"
+    );
+    assert_eq!(reopened.status().unwrap().revision, next);
+}
+
+#[test]
+fn unsupported_disposable_schema_version_rebuilds_transactionally_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version=10")
+        .unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    assert!(reopened.status().is_err());
+    let session = reopened.leader_session().unwrap();
+    let next = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+        &reopened,
+        None,
+        session.clone(),
+    )
+    .unwrap()
+    .run(&IndexOptions::new(root.path().to_owned()), &cancel, |_| {})
+    .unwrap();
+    assert_eq!(next.index_revision, 1);
+    assert_ne!(next.index_generation, old.index_generation);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(reopened.status().unwrap().revision, next);
 }

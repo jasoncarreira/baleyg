@@ -4,29 +4,27 @@ pub mod requests;
 pub mod topology;
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
+pub use requests::{MaintenanceQueueProbe, MaintenanceQueueState, QueueProbeAdmission};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Deref, DerefMut},
     path::Path,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Condvar, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestOneShotHook(Mutex<Option<Box<dyn FnOnce() + Send>>>);
-#[cfg(test)]
 impl std::fmt::Debug for TestOneShotHook {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("TestOneShotHook")
     }
 }
-#[cfg(test)]
 impl TestOneShotHook {
     pub(crate) fn set(&self, hook: impl FnOnce() + Send + 'static) {
         *self.0.lock().unwrap() = Some(Box::new(hook));
@@ -59,10 +57,88 @@ impl RetentionClock {
     }
 }
 
+// A single process/root gate serializes maintenance with the entire publication
+// lifetime, including terminal ACK. Independent Store instances share the gate.
+#[derive(Debug, Default)]
+struct PublicationGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+#[derive(Debug, Default)]
+struct GateState {
+    active: bool,
+    maintenance: bool,
+    waiting: usize,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationWaitReason {
+    None,
+    Maintenance,
+    Publisher,
+}
+#[must_use]
+#[derive(Debug)]
+pub struct PublishPermit {
+    gate: Arc<PublicationGate>,
+    waited_for: Duration,
+    wait_reason: PublicationWaitReason,
+}
+impl PublishPermit {
+    pub fn waited_for(&self) -> Duration {
+        self.waited_for
+    }
+    pub fn wait_reason(&self) -> PublicationWaitReason {
+        self.wait_reason
+    }
+}
+#[must_use]
+#[derive(Debug)]
+pub struct MaintenancePermit {
+    gate: Arc<PublicationGate>,
+}
+impl Drop for PublishPermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap();
+        state.active = false;
+        state.maintenance = false;
+        self.gate.changed.notify_all();
+    }
+}
+impl Drop for MaintenancePermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap();
+        state.active = false;
+        state.maintenance = false;
+        self.gate.changed.notify_all();
+    }
+}
+fn publication_gate(key: String) -> Arc<PublicationGate> {
+    static GATES: OnceLock<Mutex<HashMap<String, Weak<PublicationGate>>>> = OnceLock::new();
+    let mut gates = GATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, weak| weak.strong_count() > 0);
+    let gate = Arc::new(PublicationGate::default());
+    gates.insert(key, Arc::downgrade(&gate));
+    gate
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceOutcome {
+    Idle,
+    Deferred,
+    Progress,
+}
+
 #[derive(Clone, Debug)]
 pub struct Store {
     roots: topology::TopologyRoots,
     identity: Arc<topology::WorkspaceIdentity>,
+    publication_gate: Arc<PublicationGate>,
+    maintenance_busy_attempts: Arc<AtomicU64>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
     recovery_disposition: Arc<AtomicU8>,
@@ -75,6 +151,9 @@ pub struct Store {
     // selected reconciliation was observed committed under the synced EX.
     reconciled_leader: Arc<Mutex<Option<uuid::Uuid>>>,
     retention_clock: Arc<Mutex<RetentionClock>>,
+    maintenance_before_writer_hook: Arc<TestOneShotHook>,
+    maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
+    publication_before_commit_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -322,13 +401,21 @@ SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.
 UNION ALL
 SELECT COALESCE(length(CAST(x.projection_id AS BLOB)),0)+COALESCE(length(CAST(x.id AS BLOB)),0)+COALESCE(length(CAST(x.owner AS BLOB)),0)+COALESCE(length(CAST(x.target AS BLOB)),0)+COALESCE(length(CAST(x.payload AS BLOB)),0) AS row_bytes FROM class_relations x WHERE x.projection_id=?2
 )"#;
-const DATABASE_SCHEMA_VERSION: u32 = 8;
+const DATABASE_SCHEMA_VERSION: u32 = 9;
 const EXTRACTOR_VERSION: &str = "native-v4-delta-v1";
 const EVIDENCE_FORMAT: &str = "terminal-native-graph-v1";
-const SUPERSESSION_SCHEMA_V8: &str = "CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));";
+const SUPERSESSION_SCHEMA_V9: &str = r#"
+CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991),state TEXT NOT NULL CHECK(state IN ('retained','pending','released')));
+CREATE INDEX native_supersessions_clock ON native_revision_supersessions(superseded_at,revision_id);
+CREATE INDEX native_supersessions_due ON native_revision_supersessions(superseded_at,revision_id) WHERE state='retained';
+CREATE TABLE native_revision_release_debt(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,phase TEXT NOT NULL CHECK(phase='pending'));
+CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
+"#;
 
-const CACHE_SCHEMA_V8: &str = r#"
-CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
+const CACHE_SCHEMA_V9: &str = r#"
+CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=9), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
 CREATE TABLE native_producers(id TEXT NOT NULL,version TEXT NOT NULL,executable_hash TEXT NOT NULL CHECK(length(executable_hash)=64),kind TEXT NOT NULL CHECK(kind='native'),position_encoding TEXT NOT NULL CHECK(position_encoding='utf8'),PRIMARY KEY(id,version));
 CREATE TABLE native_producer_languages(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,inventory_authenticated INTEGER NOT NULL CHECK(inventory_authenticated IN (0,1)),ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language),UNIQUE(producer_id,producer_version,ordinal),FOREIGN KEY(producer_id,producer_version) REFERENCES native_producers(id,version) DEFERRABLE INITIALLY DEFERRED);
 CREATE TABLE native_producer_inputs(producer_id TEXT NOT NULL,producer_version TEXT NOT NULL,language TEXT NOT NULL,component_name TEXT NOT NULL,ordinal INTEGER NOT NULL CHECK(ordinal>=0),PRIMARY KEY(producer_id,producer_version,language,component_name),UNIQUE(producer_id,producer_version,language,ordinal),FOREIGN KEY(producer_id,producer_version,language) REFERENCES native_producer_languages(producer_id,producer_version,language) DEFERRABLE INITIALLY DEFERRED);
@@ -375,7 +462,7 @@ CREATE TABLE native_version_call_regions(version_id TEXT NOT NULL,call_id TEXT N
 "#;
 // Additive schema8 extension. An existing v8 cache keeps every row, generation,
 // pin, and queue; the first new publication installs these two tables atomically.
-const PRODUCER_BINDING_SCHEMA_V8: &str = r#"
+const PRODUCER_BINDING_SCHEMA_V9: &str = r#"
 CREATE TABLE native_binding_epoch(singleton INTEGER PRIMARY KEY CHECK(singleton=1),index_generation TEXT NOT NULL,first_revision INTEGER NOT NULL CHECK(first_revision BETWEEN 1 AND 9007199254740991));
 CREATE TABLE revision_producer_bindings(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,producer_sha TEXT NOT NULL CHECK(length(producer_sha)=64),binding_sha TEXT NOT NULL CHECK(length(binding_sha)=64));
 "#;
@@ -1107,6 +1194,52 @@ impl StagedIndex {
 // file on disk rather than silently creating a retained, deleted inode.
 /// Match every cache schema object, including type, name, owning table, SQL,
 /// and SQLite autoindexes. Unknown views/triggers must never execute on rebaseline.
+/// Rebuild disposable index-owned schema in the same inode and transaction.
+/// The enclosing IMMEDIATE transaction also publishes the new full pair, so a
+/// failed rebuild rolls back all DDL and leaves the old index not-ready.
+fn reset_disposable_schema(
+    tx: &Connection,
+    root: &str,
+    identity: &topology::WorkspaceIdentity,
+) -> Result<()> {
+    tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+    let objects: Vec<(String, String)> = tx
+        .prepare(
+            "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'
+         AND type IN ('view','trigger','table')
+         ORDER BY CASE type WHEN 'view' THEN 0 WHEN 'trigger' THEN 1 ELSE 2 END,name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (kind, name) in objects {
+        let quoted = name.replace('"', "\"\"");
+        tx.execute_batch(&format!(
+            "DROP {} IF EXISTS \"{}\";",
+            kind.to_uppercase(),
+            quoted
+        ))?;
+    }
+    tx.execute_batch(CACHE_SCHEMA_V9)?;
+    tx.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
+    tx.execute_batch(SUPERSESSION_SCHEMA_V9)?;
+    let age = publication_second()?;
+    tx.execute(
+        "INSERT INTO index_metadata VALUES(1,9,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
+        params![
+            EXTRACTOR_VERSION,
+            root,
+            identity.device.to_string(),
+            identity.inode.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            age,
+            json(&IndexStats::default())?,
+            json(&Vec::<Diagnostic>::new())?
+        ],
+    )?;
+    tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
+    Ok(())
+}
+
 fn validate_cache_shape(db: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(db: &Connection) -> Result<Vec<Object>> {
@@ -1128,22 +1261,22 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         version == DATABASE_SCHEMA_VERSION,
         "incompatible_index: unknown schema version"
     );
-    expected.execute_batch(CACHE_SCHEMA_V8)?;
+    expected.execute_batch(CACHE_SCHEMA_V9)?;
     let actual = objects(db)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
-    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
+    expected.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
-    expected.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    expected.execute_batch(SUPERSESSION_SCHEMA_V9)?;
     if actual == objects(&expected)? {
         return Ok(());
     }
     let without_binding = Connection::open_in_memory()?;
-    without_binding.execute_batch(CACHE_SCHEMA_V8)?;
-    without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+    without_binding.execute_batch(CACHE_SCHEMA_V9)?;
+    without_binding.execute_batch(SUPERSESSION_SCHEMA_V9)?;
     control_ensure!(
         actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -1164,6 +1297,167 @@ fn publication_second() -> Result<i64> {
         "invalid_supersession_time"
     );
     Ok(seconds as i64)
+}
+
+// A SQLite progress callback bounds actual statement work, not only nominal
+// manifest-row count. The callback never unwinds through SQLite and may query
+// the separate autocommit queue probe (not the index writer connection).
+struct MaintenanceProgress<'a> {
+    allowed: &'a mut dyn FnMut() -> bool,
+    started: Instant,
+}
+impl MaintenanceProgress<'_> {
+    fn check(&mut self) -> bool {
+        self.started.elapsed() < Duration::from_millis(150)
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.allowed)()))
+                .unwrap_or(false)
+    }
+}
+unsafe extern "C" fn maintenance_progress_callback(arg: *mut std::ffi::c_void) -> libc::c_int {
+    // SAFETY: the stack context remains pinned in the active maintenance unit
+    // until the progress handler is removed, before its SQLite connection closes.
+    let context = unsafe { &mut *(arg as *mut MaintenanceProgress<'_>) };
+    if context.check() { 0 } else { 1 }
+}
+struct MaintenanceProgressGuard(*mut rusqlite::ffi::sqlite3);
+impl Drop for MaintenanceProgressGuard {
+    fn drop(&mut self) {
+        // SAFETY: writer DB outlives this guard. Remove before context drops.
+        unsafe { rusqlite::ffi::sqlite3_progress_handler(self.0, 0, None, std::ptr::null_mut()) };
+    }
+}
+fn install_maintenance_progress(
+    db: &Connection,
+    context: &mut MaintenanceProgress<'_>,
+) -> MaintenanceProgressGuard {
+    // SAFETY: SQLite invokes this callback on the current connection's thread;
+    // the guard removes it before `context` or `db` may be dropped.
+    let handle = unsafe { db.handle() };
+    unsafe {
+        rusqlite::ffi::sqlite3_progress_handler(
+            handle,
+            256,
+            Some(maintenance_progress_callback),
+            (context as *mut MaintenanceProgress<'_>).cast(),
+        );
+    }
+    MaintenanceProgressGuard(handle)
+}
+
+fn maintenance_sqlite_busy(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SqliteContention>().is_some()
+        || error
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|sqlite| {
+                matches!(sqlite,
+            rusqlite::Error::SqliteFailure(info, _) if matches!(info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+            })
+}
+
+fn maintenance_contention(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SqliteContention>().is_some()
+        || error.downcast_ref::<topology::StorageBusy>().is_some()
+        || error.downcast_ref::<rusqlite::Error>().is_some_and(|sqlite| matches!(sqlite,
+            rusqlite::Error::SqliteFailure(info, _) if matches!(info.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked | rusqlite::ErrorCode::OperationInterrupted)))
+}
+
+fn cleanup_release_candidate(tx: &Connection, revision: &str, kind: &str) -> Result<()> {
+    let (candidate, parent, reference, children, child_key) = match kind {
+        "class" => (
+            "native_release_candidate_classes",
+            "class_projections",
+            "class_projection_id",
+            &["class_relations", "classes"][..],
+            "projection_id",
+        ),
+        "graph" => (
+            "native_release_candidate_graphs",
+            "graph_projections",
+            "graph_projection_id",
+            &["graph_calls", "graph_regions", "graph_nodes"][..],
+            "projection_id",
+        ),
+        "version" => (
+            "native_release_candidate_versions",
+            "document_versions",
+            "document_version_id",
+            &[
+                "native_version_call_regions",
+                "native_version_calls",
+                "native_version_control_regions",
+                "native_version_header_items",
+                "native_version_parameters",
+                "native_version_headers",
+                "native_version_ancestor_signature_types",
+                "native_version_own_signature_types",
+                "native_version_declaration_ancestors",
+                "native_version_declarations",
+                "native_version_coverage_roles",
+            ][..],
+            "version_id",
+        ),
+        _ => unreachable!("fixed cleanup kind"),
+    };
+    let candidate_id: Option<String> = tx
+        .query_row(
+            &format!("SELECT id FROM {candidate} WHERE revision_id=?1 ORDER BY id LIMIT 1"),
+            [revision],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(id) = candidate_id else {
+        return Ok(());
+    };
+    let still_referenced: bool = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM revision_documents WHERE {reference}=?1 LIMIT 1)"),
+        [&id],
+        |r| r.get(0),
+    )?;
+    if !still_referenced {
+        // Some projections are not directly in a manifest (for example an
+        // optional class projection). Journal one dependent candidate first;
+        // never orphan it by deleting its graph/version parent prematurely.
+        let dependent = match kind {
+            "graph" => Some((
+                "class_projections",
+                "graph_projection_id",
+                "native_release_candidate_classes",
+            )),
+            "version" => Some((
+                "graph_projections",
+                "document_version_id",
+                "native_release_candidate_graphs",
+            )),
+            _ => None,
+        };
+        if let Some((table, field, queue)) = dependent {
+            let child: Option<String> = tx
+                .query_row(
+                    &format!("SELECT id FROM {table} WHERE {field}=?1 ORDER BY id LIMIT 1"),
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(child) = child {
+                tx.execute(
+                    &format!("INSERT OR IGNORE INTO {queue}(revision_id,id) VALUES(?1,?2)"),
+                    params![revision, child],
+                )?;
+                return Ok(());
+            }
+        }
+        for child in children {
+            tx.execute(&format!("DELETE FROM {child} WHERE {child_key}=?1"), [&id])?;
+        }
+        tx.execute(&format!("DELETE FROM {parent} WHERE id=?1"), [&id])?;
+    }
+    tx.execute(
+        &format!("DELETE FROM {candidate} WHERE revision_id=?1 AND id=?2"),
+        params![revision, id],
+    )?;
+    Ok(())
 }
 
 fn retention_due(now: i64, superseded_at: i64) -> bool {
@@ -1199,10 +1493,10 @@ mod retention_clock_tests {
 // Called only with the leader's immediate write transaction. Existing pins stay put.
 fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
     if !has_revision_supersessions(db)? {
-        db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
+        db.execute_batch(SUPERSESSION_SCHEMA_V9)?;
         db.execute(
-            "INSERT INTO native_revision_supersessions(revision_id,superseded_at)
-             SELECT r.id,?1 FROM native_revisions r CROSS JOIN index_metadata m
+            "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
+             SELECT r.id,?1,'retained' FROM native_revisions r CROSS JOIN index_metadata m
              WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision
                AND NOT EXISTS (SELECT 1 FROM revision_capture_inputs c
                  WHERE c.revision_id=r.id AND c.input_key='__released:v1')",
@@ -1244,7 +1538,7 @@ fn validate_supersessions(db: &Connection) -> Result<()> {
 fn stamp_predecessor(db: &Connection, old: &str, now: i64) -> Result<()> {
     ensure!(
         db.execute(
-            "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES(?1,?2)",
+            "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state) VALUES(?1,?2,'retained')",
             params![old, now],
         )? == 1,
         "incompatible_index: predecessor supersession missing"
@@ -1328,9 +1622,9 @@ fn open_index(path: &Path, writable: bool) -> Result<ProtectedSqliteConnection> 
         return Err(ObsoleteIndexFormat(marker).into());
     }
     let version: u32 = storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
-    ensure!(
+    control_ensure!(
         version == DATABASE_SCHEMA_VERSION,
-        "incompatible_index: schema version {version}"
+        "incompatible_index: unsupported disposable schema version"
     );
     storage_result(db.prepare(
         "SELECT index_generation,index_revision,indexed_at,stats,diagnostics FROM index_metadata",
@@ -1359,10 +1653,11 @@ enum RecoveryClass {
     Hard,
 }
 fn recovery_class(error: &anyhow::Error) -> RecoveryClass {
-    if error.downcast_ref::<ExceptionalIndexFormat>().is_some()
-        || error.downcast_ref::<ObsoleteIndexFormat>().is_some()
-    {
+    if error.downcast_ref::<ExceptionalIndexFormat>().is_some() {
         return RecoveryClass::RecreatePending;
+    }
+    if error.downcast_ref::<ObsoleteIndexFormat>().is_some() {
+        return RecoveryClass::Rebuild;
     }
     if error.downcast_ref::<SelectedIntegrity>().is_some()
         || error.downcast_ref::<ControlIntegrity>().is_some()
@@ -2669,7 +2964,7 @@ fn write_native(
     for (key, observation) in capture.persisted_inputs()? {
         check_cancel(cancel)?;
         ensure!(
-            key != "__released:v1",
+            key != "__released:v1" && key != "__pending_release:v1",
             "native_evidence_required: reserved release marker"
         );
         immutable.insert_manifest(
@@ -3004,7 +3299,7 @@ fn validate_v8_bootstrap(db: &Connection) -> Result<()> {
         indexed_at.is_empty() && incarnation.is_none() && options.is_none(),
         "incompatible_index: invalid v8 bootstrap metadata"
     );
-    // Fixed identifiers from CACHE_SCHEMA_V8 only. Do not read table names from
+    // Fixed identifiers from CACHE_SCHEMA_V9 only. Do not read table names from
     // sqlite_master or treat a partial publication as a valid empty bootstrap.
     for name in [
         "class_projections",
@@ -3299,26 +3594,69 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
         count == current && first == Some(1) && last == Some(current) && mismatched == 0,
         "incompatible_index: native header pin mismatch"
     );
-    // A release leaves its header as a durable tombstone. Missing manifests
-    // without that exact marker (including an empty legitimate revision) are
-    // never accepted as released. The marker owns no native capture input.
+    // Validate all states on broad admission/status, never on a private no-op.
+    // Pending retains original inputs while its manifest may be partly drained.
     let malformed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM native_revisions r WHERE
-            (EXISTS(SELECT 1 FROM revision_capture_inputs i
-                WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
-              ((SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1 OR
-               NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                 WHERE i.revision_id=r.id AND i.input_key='__released:v1' AND i.payload='released:v1') OR
-               EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
-            OR (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                WHERE i.revision_id=r.id AND i.input_key='__released:v1') AND
-               (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                   != json_array_length(r.source_inventory)))",
-        [], |row| row.get(0),
+        "SELECT EXISTS(SELECT 1 FROM native_revisions r
+         CROSS JOIN index_metadata h
+         LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
+         LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
+         WHERE
+           (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
+                AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL))
+           OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
+                AND s.revision_id IS NULL)
+           OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
+           OR (s.state='pending' AND debt.revision_id IS NULL)
+           OR (s.state='retained' AND (debt.revision_id IS NOT NULL
+                OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                  AND i.input_key IN ('__pending_release:v1','__released:v1'))
+                OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                   != json_array_length(r.source_inventory)))
+           OR (s.state='pending' AND (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                     WHERE i.revision_id=r.id AND i.input_key='__pending_release:v1'
+                       AND i.payload='pending_release:v1')
+                OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                    AND i.input_key='__released:v1')
+                OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                   > json_array_length(r.source_inventory)))
+           OR (s.state='released' AND (debt.revision_id IS NOT NULL
+                OR (SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1
+                OR NOT EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                     AND i.input_key='__released:v1' AND i.payload='released:v1')
+                OR EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
+           OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
+                      OR s.state!='pending'))
+                     OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
+                      OR s.state!='released')))))",
+        [],
+        |row| row.get(0),
     )?;
     control_ensure!(
         !malformed,
         "incompatible_index: retained manifest/release mismatch"
+    );
+    let stray_candidates: bool = db.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM native_release_candidate_versions c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+           UNION ALL
+           SELECT 1 FROM native_release_candidate_graphs c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+           UNION ALL
+           SELECT 1 FROM native_release_candidate_classes c
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=c.revision_id
+             WHERE s.state IS NOT 'pending'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    control_ensure!(
+        !stray_candidates,
+        "incompatible_index: release candidates without pending debt"
     );
     bounded_graph_pair(
         db,
@@ -4217,6 +4555,81 @@ fn native_index_unavailable(error: &anyhow::Error) -> bool {
     error.downcast_ref::<topology::IndexNotReady>().is_some()
 }
 impl Store {
+    /// The waiting count is registered before waiting, giving new publications
+    /// priority over the next maintenance unit. The permit is owned across ACK.
+    pub fn enter_publication(
+        &self,
+        cancel: &CancelFlag,
+        max_wait: Duration,
+    ) -> Result<PublishPermit> {
+        let started = Instant::now();
+        let deadline = started + max_wait;
+        let gate = &self.publication_gate;
+        let mut state = gate.state.lock().unwrap();
+        let mut wait_reason = PublicationWaitReason::None;
+        state.waiting += 1;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                state.waiting -= 1;
+                gate.changed.notify_all();
+                anyhow::bail!("index publication cancelled");
+            }
+            if !state.active {
+                state.waiting -= 1;
+                state.active = true;
+                state.maintenance = false;
+                return Ok(PublishPermit {
+                    gate: Arc::clone(gate),
+                    waited_for: started.elapsed(),
+                    wait_reason,
+                });
+            }
+            if wait_reason == PublicationWaitReason::None {
+                wait_reason = if state.maintenance {
+                    PublicationWaitReason::Maintenance
+                } else {
+                    PublicationWaitReason::Publisher
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.waiting -= 1;
+                gate.changed.notify_all();
+                return Err(SqliteContention(()).into());
+            }
+            state = gate
+                .changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(25)))
+                .unwrap()
+                .0;
+        }
+    }
+
+    pub fn maintenance_try_enter(&self) -> Option<MaintenancePermit> {
+        let gate = &self.publication_gate;
+        let mut state = gate.state.try_lock().ok()?;
+        if state.active || state.waiting != 0 {
+            return None;
+        }
+        state.active = true;
+        state.maintenance = true;
+        Some(MaintenancePermit {
+            gate: Arc::clone(gate),
+        })
+    }
+
+    fn maintenance_priority(
+        &self,
+        permit: &MaintenancePermit,
+        probe: &QueueProbeAdmission,
+        priority: &mut impl FnMut() -> bool,
+    ) -> bool {
+        let waiting = self.publication_gate.state.lock().unwrap().waiting;
+        Arc::ptr_eq(&self.publication_gate, &permit.gate)
+            && waiting == 0
+            && probe.check() == MaintenanceQueueState::Clear
+            && priority()
+    }
     pub fn open(
         roots: topology::TopologyRoots,
         identity: topology::WorkspaceIdentity,
@@ -4256,10 +4669,14 @@ impl Store {
         match admission {
             Ok(()) => Ok(store),
             Err(error) if recovery_class(&error) == RecoveryClass::RecreatePending => {
+                store.mark_recovery(RecoveryDisposition::RecreatePending);
+                Ok(store)
+            }
+            Err(error) if recovery_class(&error) == RecoveryClass::Rebuild => {
                 if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
                     *store.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
                 }
-                store.mark_recovery(RecoveryDisposition::RecreatePending);
+                store.mark_recovery(RecoveryDisposition::Rebuild);
                 Ok(store)
             }
             Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
@@ -4279,8 +4696,15 @@ impl Store {
                 .to_str()
                 .context("workspace path is not UTF-8")?
                 .to_owned(),
+            publication_gate: publication_gate(format!(
+                "{}:{}:{}",
+                identity.root.display(),
+                identity.device,
+                identity.inode
+            )),
             roots,
             identity: Arc::new(identity),
+            maintenance_busy_attempts: Arc::new(AtomicU64::new(0)),
             recovery_required: Arc::new(AtomicBool::new(false)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
@@ -4295,6 +4719,9 @@ impl Store {
                 started: Instant::now(),
                 injected: None,
             })),
+            maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
+            maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
+            publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -4599,11 +5026,11 @@ impl Store {
             db.pragma_update(None, "synchronous", "FULL")?;
             db.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> Result<()> {
-                db.execute_batch(CACHE_SCHEMA_V8)?;
+                db.execute_batch(CACHE_SCHEMA_V9)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
-                    "INSERT INTO index_metadata VALUES(1,8,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
+                    "INSERT INTO index_metadata VALUES(1,9,?1,?2,?3,?4,?5,0,?6,'',?7,?8,NULL,NULL)",
                     params![
                         EXTRACTOR_VERSION,
                         self.workspace_root,
@@ -5026,6 +5453,13 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
+        // Leader startup has its own live data_version→COMMIT interval before
+        // coordinator preparation. Do not recursively acquire the gate inside
+        // the coordinator: it enters publication only AFTER leader_session().
+        let _publication = self.enter_publication(
+            &Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(250),
+        )?;
         self.ensure_not_recreate_pending()?;
         drop(
             self.cache()
@@ -5079,7 +5513,17 @@ impl Store {
         self.ensure_not_recreate_pending()?;
         self.identity.verify()?;
         let use_guard = self.roots.index_use_existing(&self.identity)?;
-        let db = open_index(&self.roots.index_db(&self.identity), writable)?;
+        let path = self.roots.index_db(&self.identity);
+        let db = match open_index(&path, writable) {
+            Ok(db) => db,
+            Err(error)
+                if self.disposition() == RecoveryDisposition::Rebuild
+                    && recovery_class(&error) == RecoveryClass::Rebuild =>
+            {
+                open_index_marker_probe(&path, writable, Duration::from_secs(5))?
+            }
+            Err(error) => return Err(error),
+        };
         self.identity.verify()?;
         use_guard.verify()?;
         Ok(IndexConnection {
@@ -5264,10 +5708,28 @@ impl Store {
     }
 
     fn recovery_baseline(&self, db: &Connection) -> Result<RecoveryBaseline> {
-        validate_cache_shape(db)?;
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         self.verify_metadata_root(db)?;
         let witness = self.metadata_witness(db, schema)?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
+        if let Err(error) = validate_cache_shape(db) {
+            if recovery_class(&error) != RecoveryClass::Rebuild {
+                return Err(error);
+            }
+            self.mark_recovery(RecoveryDisposition::Rebuild);
+            return Ok(RecoveryBaseline {
+                witness,
+                pin: None,
+                compatible: false,
+            });
+        }
         let bounded_text = |atom: &MetadataAtom, max: usize| matches!(atom, MetadataAtom::Streamed { text: true, byte_length, .. } if *byte_length <= max);
         if !bounded_text(&witness.extractor_version, 256)
             || !bounded_text(&witness.index_generation, 64)
@@ -7685,11 +8147,8 @@ impl Store {
         if let PublicationTarget::Live = target {
             self.ensure_not_recreate_pending()?;
         }
-        ensure!(
-            schema == DATABASE_SCHEMA_VERSION,
-            "incompatible_index: unsupported schema cannot be rebaselined"
-        );
-        let rebaseline = !compatible
+        let rebaseline = schema != DATABASE_SCHEMA_VERSION
+            || !compatible
             || !decoded
             || (matches!(target, PublicationTarget::Live)
                 && self.disposition() == RecoveryDisposition::Rebuild);
@@ -7741,39 +8200,13 @@ impl Store {
             },
         };
         if rebaseline {
-            if !has_revision_supersessions(&tx)? {
-                tx.execute_batch(SUPERSESSION_SCHEMA_V8)?;
-            }
+            reset_disposable_schema(&tx, &self.workspace_root, &self.identity)?;
         } else {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
         }
         let binding_extension = has_revision_producer_bindings(&tx)?;
-        if rebaseline && binding_extension {
-            tx.execute_batch(
-                "DELETE FROM revision_producer_bindings; DELETE FROM native_binding_epoch;",
-            )?;
-        }
-        if rebaseline {
-            // An incompatible/corrupt generation is explicitly replaced, never served.
-            // Only compatible same-generation publication appends history.
-            tx.execute_batch("DELETE FROM revision_documents; DELETE FROM revision_capture_inputs;
-                DELETE FROM native_version_call_regions; DELETE FROM native_version_calls;
-                DELETE FROM native_version_control_regions; DELETE FROM native_version_own_signature_types;
-                DELETE FROM native_version_ancestor_signature_types; DELETE FROM native_version_parameters;
-                DELETE FROM native_version_header_items; DELETE FROM native_version_headers;
-                DELETE FROM native_version_declaration_ancestors; DELETE FROM native_version_declarations;
-                DELETE FROM native_version_coverage_roles; DELETE FROM class_relations; DELETE FROM classes;
-                DELETE FROM class_projections; DELETE FROM graph_calls; DELETE FROM graph_regions;
-                DELETE FROM graph_nodes; DELETE FROM graph_projections; DELETE FROM document_versions;
-                DELETE FROM native_revision_supersessions; DELETE FROM native_revisions; DELETE FROM native_source_set_dependencies;
-                DELETE FROM native_source_set_languages; DELETE FROM native_source_sets;
-                DELETE FROM native_producer_inputs; DELETE FROM native_producer_languages;
-                DELETE FROM native_producers;")?;
-        }
         if !binding_extension {
-            // DDL and epoch are committed with the FIRST newly bound revision.
-            // Readers before commit see the original exact v8 shape and old pins.
-            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V8)?;
+            tx.execute_batch(PRODUCER_BINDING_SCHEMA_V9)?;
         }
         if !binding_extension || rebaseline {
             tx.execute(
@@ -7918,7 +8351,7 @@ impl Store {
             let old_key = format!("pin:v1:{}:{}", prior.index_generation, prior.index_revision);
             stamp_predecessor(&tx, &old_key, publication_time.as_secs() as i64)?;
         }
-        tx.execute("UPDATE index_metadata SET schema_version=8,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
+        tx.execute("UPDATE index_metadata SET schema_version=9,extractor_version=?1,index_generation=?2,index_revision=?3,indexed_at=?4,stats=?5,diagnostics=?6,reconciled_incarnation=?7,reconcile_options=?8 WHERE singleton=1",
             params![EXTRACTOR_VERSION, revision.index_generation.to_string(), revision.index_revision as i64,timestamp,json(&stats)?,json(&graph.diagnostics)?,leader.incarnation.to_string(),json(capture.reconcile_options())?])?;
         immutable.counters.record(
             "manifest",
@@ -7957,6 +8390,7 @@ impl Store {
             stage.verify_path()?;
             leader.verify_exclusive_use(&self.roots.index_use_lock(&self.identity))?;
         }
+        self.publication_before_commit_hook.run();
         during_tx(PublishStage::BeforeCommit, &tx)?;
         check_cancel(cancel)?;
         capture.verify(cancel)?;
@@ -8027,7 +8461,7 @@ impl Store {
         let state: Option<bool> = db
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                WHERE i.revision_id=r.id AND i.input_key='__released:v1')
+                WHERE i.revision_id=r.id AND i.input_key IN ('__released:v1','__pending_release:v1'))
              FROM native_revisions r WHERE r.id=?1 AND r.published_index_revision=?2",
                 params![key, pin.index_revision as i64],
                 |r| r.get(0),
@@ -8084,6 +8518,18 @@ impl Store {
         self.automatic_gc_at(leader, now)
     }
 
+    pub fn automatic_gc_cooperative(
+        &self,
+        leader: &topology::LeaderGuard,
+        hook: &mut dyn FnMut(topology::GcStage) -> Result<()>,
+    ) -> Result<usize> {
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify()?;
+        self.identity.verify()?;
+        self.roots
+            .automatic_gc_at_with_hook(&self.identity, leader, publication_second()?, hook)
+    }
+
     #[doc(hidden)]
     pub fn automatic_gc_at(&self, leader: &topology::LeaderGuard, now: i64) -> Result<usize> {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
@@ -8091,25 +8537,46 @@ impl Store {
         self.roots.automatic_gc_at(&self.identity, leader, now)
     }
 
-    /// Only the verified owner may expire pins. An in-process forward clock jump
-    /// cannot shorten grace until monotonic time corroborates it; after restart
-    /// the new process trusts the persisted UTC timestamp.
-    pub fn maintain_revisions(&self, leader: &topology::LeaderGuard) -> Result<()> {
-        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
-        leader.verify()?;
-        self.identity.verify()?;
-        let clock = self.retention_clock.lock().unwrap();
-        let (wall, mono) = clock.sample()?;
-        ensure!(
-            (0..=9_007_199_254_740_991).contains(&wall),
-            "invalid_supersession_time"
-        );
-        let origin = clock.origin_wall;
-        let elapsed = mono.saturating_sub(clock.origin_mono);
-        drop(clock);
-        let due = self.with_evidence(|db| {
-            let head = self.read_revision(db, None)?.pin;
-            validate_supersessions(db)?;
+    /// Monotonic count of confirmed SQLite BUSY/LOCKED maintenance attempts.
+    /// Interrupts, unknown queue probes and use-lock contention are excluded.
+    pub fn maintenance_sqlite_busy_attempts(&self) -> u64 {
+        self.maintenance_busy_attempts.load(Ordering::Relaxed)
+    }
+
+    fn record_maintenance_busy(&self, error: &anyhow::Error) {
+        if maintenance_sqlite_busy(error) {
+            self.maintenance_busy_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Oldest eligible retained or pending debt age. The no-work path uses a
+    /// covering MAX, one partial-index LIMIT 1 and one indexed debt LIMIT 1.
+    /// Only if debt exists do we scan that debt set to find its oldest stamp.
+    pub fn oldest_due_debt_age(&self, leader: &topology::LeaderGuard) -> Result<Option<Duration>> {
+        let observed = (|| -> Result<Option<Duration>> {
+            leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+            leader.verify()?;
+            self.identity.verify()?;
+            let (wall, elapsed, origin) = {
+                let clock = self.retention_clock.lock().unwrap();
+                let (wall, mono) = clock.sample()?;
+                ensure!(
+                    (0..=9_007_199_254_740_991).contains(&wall),
+                    "invalid_supersession_time"
+                );
+                (
+                    wall,
+                    mono.saturating_sub(clock.origin_mono),
+                    clock.origin_wall,
+                )
+            };
+            let guard = self.roots.index_use_existing_readonly(&self.identity)?;
+            let db = open_index_marker_probe(
+                &self.roots.index_db(&self.identity),
+                false,
+                Duration::ZERO,
+            )?;
             let latest: Option<i64> = db.query_row(
                 "SELECT max(superseded_at) FROM native_revision_supersessions",
                 [],
@@ -8119,74 +8586,421 @@ impl Store {
             if !retention_clock_plausible(origin, now, elapsed) {
                 return Ok(None);
             }
-            let mut stmt = db.prepare(
-                "SELECT r.published_index_revision,s.superseded_at FROM native_revision_supersessions s
-                 JOIN native_revisions r ON r.id=s.revision_id
-                 WHERE r.id!=?1
-                   AND NOT EXISTS(SELECT 1 FROM revision_capture_inputs c
-                     WHERE c.revision_id=r.id AND c.input_key='__released:v1')
-                 ORDER BY r.published_index_revision",
-            )?;
-            let rows = stmt.query_map(
-                [format!("pin:v1:{}:{}", head.index_generation, head.index_revision)],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )?.collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(Some(rows.into_iter().filter(|(_, stamp)| retention_due(now, *stamp))
-                .map(|(revision, _)| IndexPin {
-                    index_generation: head.index_generation,
-                    index_revision: revision as u64,
-                }).collect::<Vec<_>>()))
-        })?;
-        let Some(due) = due else {
-            return Ok(());
-        };
-        for pin in &due {
-            self.release_revision(*pin, leader)?;
+            let pending: Option<String> = db
+                .query_row(
+                    "SELECT revision_id FROM native_revision_release_debt LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let pending_oldest: Option<i64> = if pending.is_some() {
+                db.query_row(
+                    "SELECT min(s.superseded_at) FROM native_revision_release_debt d
+                JOIN native_revision_supersessions s ON s.revision_id=d.revision_id",
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                None
+            };
+            let due_oldest: Option<i64> = db
+                .query_row(
+                    "SELECT superseded_at FROM native_revision_supersessions
+             WHERE state='retained' AND superseded_at<=?1
+             ORDER BY superseded_at,revision_id LIMIT 1",
+                    [now.saturating_sub(900)],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            guard.verify()?;
+            self.identity.verify()?;
+            Ok(pending_oldest
+                .into_iter()
+                .chain(due_oldest)
+                .min()
+                .map(|stamp| Duration::from_secs(now.saturating_sub(stamp) as u64)))
+        })();
+        match observed {
+            Err(error) if maintenance_sqlite_busy(&error) => {
+                self.record_maintenance_busy(&error);
+                Err(SqliteContention(()).into())
+            }
+            result => result,
         }
-        // Also reclaim rows left by a crash between release and collection.
-        self.collect_unreferenced(leader)
     }
 
-    /// Remove one non-head manifest. Physical versions are collected separately;
-    /// a crash between these commits can only leave unreferenced immutable rows.
+    pub fn maintenance_oldest_due_age_secs(
+        &self,
+        leader: &topology::LeaderGuard,
+    ) -> Result<Option<u64>> {
+        Ok(self.oldest_due_debt_age(leader)?.map(|age| age.as_secs()))
+    }
+
+    /// Deterministic rollback after a complete index rebuild but before COMMIT.
+    #[doc(hidden)]
+    pub fn set_publication_before_commit_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.publication_before_commit_hook.set(hook);
+    }
+
+    /// Deterministic test barrier just before writer admission. Never use in production.
+    #[doc(hidden)]
+    pub fn set_maintenance_before_writer_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.maintenance_before_writer_hook.set(hook);
+    }
+
+    /// Deterministic test barrier after the first real DELETE inside IMMEDIATE.
+    #[doc(hidden)]
+    pub fn set_maintenance_after_first_delete_hook_for_tests(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.maintenance_after_first_delete_hook.set(hook);
+    }
+
+    /// One small writer unit. All negative no-op probes stay read-only and indexed.
+    /// A newly waiting publisher or changed durable FIFO causes rollback.
+    pub fn maintenance_step(
+        &self,
+        leader: &topology::LeaderGuard,
+        permit: &MaintenancePermit,
+        probe: &QueueProbeAdmission,
+        mut priority: impl FnMut() -> bool,
+    ) -> Result<MaintenanceOutcome> {
+        if !self.maintenance_priority(permit, probe, &mut priority) {
+            return Ok(MaintenanceOutcome::Deferred);
+        }
+        leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.verify()?;
+        self.identity.verify()?;
+        let (wall, elapsed, origin) = {
+            let clock = self.retention_clock.lock().unwrap();
+            let (wall, mono) = clock.sample()?;
+            ensure!(
+                (0..=9_007_199_254_740_991).contains(&wall),
+                "invalid_supersession_time"
+            );
+            (
+                wall,
+                mono.saturating_sub(clock.origin_mono),
+                clock.origin_wall,
+            )
+        };
+        // The reader holds a nonblocking SH use guard and never opens an IMMEDIATE
+        // transaction on the no-work path. The covering and partial indexes make
+        // the probe independent of workspace size and history size.
+        let guard = match self.roots.index_use_existing_readonly(&self.identity) {
+            Ok(guard) => guard,
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
+        let path = self.roots.index_db(&self.identity);
+        let db = match open_index_marker_probe(&path, false, Duration::ZERO) {
+            Ok(db) => db,
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
+        let selected_read = (|| -> Result<(IndexPin, i64, Option<String>)> {
+            let head = ReadRevision::current(&db)?.pin;
+            let max_stamp: Option<i64> = db.query_row(
+                "SELECT max(superseded_at) FROM native_revision_supersessions",
+                [],
+                |r| r.get(0),
+            )?;
+            let now = wall.max(max_stamp.unwrap_or(wall));
+            let pending: Option<String> = db
+                .query_row(
+                    "SELECT revision_id FROM native_revision_release_debt LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let due = if retention_clock_plausible(origin, now, elapsed) {
+                db.query_row(
+                    "SELECT revision_id FROM native_revision_supersessions
+                    WHERE state='retained' AND superseded_at<=?1
+                    ORDER BY superseded_at,revision_id LIMIT 1",
+                    [now.saturating_sub(900)],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            Ok((head, now, pending.or(due)))
+        })();
+        drop(db);
+        guard.verify()?;
+        drop(guard);
+        let (head, now, selected) = match selected_read {
+            Ok(read) => read,
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(selected) = selected else {
+            return Ok(MaintenanceOutcome::Idle);
+        };
+        self.maintenance_before_writer_hook.run();
+        if !self.maintenance_priority(permit, probe, &mut priority) {
+            return Ok(MaintenanceOutcome::Deferred);
+        }
+        let guard = match self.roots.index_use_existing_readonly(&self.identity) {
+            Ok(guard) => guard,
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut db = match open_index_marker_probe(&path, true, Duration::ZERO) {
+            Ok(db) => db,
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            Err(error) => return Err(error),
+        };
+        if !self.maintenance_priority(permit, probe, &mut priority) {
+            return Ok(MaintenanceOutcome::Deferred);
+        }
+        let mut allowed = || self.maintenance_priority(permit, probe, &mut priority);
+        let mut progress = MaintenanceProgress {
+            allowed: &mut allowed,
+            started: Instant::now(),
+        };
+        let progress_guard = install_maintenance_progress(&db, &mut progress);
+        let work = (|| -> Result<MaintenanceOutcome> {
+            if !progress.check() {
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Targeted header and state reads only. No broad status/manifest sweep.
+            let current = ReadRevision::current(&tx)?;
+            ensure!(
+                current.pin == head,
+                "revision conflict: maintenance head changed"
+            );
+            ensure!(
+                selected != current.key,
+                "revision conflict: maintenance selected head"
+            );
+            let state: String = tx.query_row(
+                "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+                [&selected],
+                |r| r.get(0),
+            )?;
+            if state == "retained" {
+                let changed = tx.execute(
+                    "UPDATE native_revision_supersessions SET state='pending'
+                    WHERE revision_id=?1 AND state='retained' AND superseded_at<=?2",
+                    params![selected, now.saturating_sub(900)],
+                )?;
+                ensure!(changed == 1, "revision conflict: due revision changed");
+                tx.execute(
+                    "INSERT INTO native_revision_release_debt(revision_id,phase)
+                    VALUES(?1,'pending')",
+                    [&selected],
+                )?;
+                tx.execute(
+                    "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
+                    VALUES(?1,'__pending_release:v1','pending_release:v1')",
+                    [&selected],
+                )?;
+            } else {
+                ensure!(
+                    state == "pending",
+                    "incompatible_index: invalid pending debt state"
+                );
+                let entries: Vec<(String, String, Option<String>, i64)> = tx
+                    .prepare(
+                        "SELECT document_version_id,graph_projection_id,class_projection_id,ordinal
+                     FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 4",
+                    )?
+                    .query_map([&selected], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (version, graph, class, ordinal) in &entries {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO native_release_candidate_versions VALUES(?1,?2)",
+                        params![selected, version],
+                    )?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO native_release_candidate_graphs VALUES(?1,?2)",
+                        params![selected, graph],
+                    )?;
+                    if let Some(class) = class {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO native_release_candidate_classes VALUES(?1,?2)",
+                            params![selected, class],
+                        )?;
+                    }
+                    let deleted = tx.execute(
+                        "DELETE FROM revision_documents WHERE revision_id=?1 AND ordinal=?2",
+                        params![selected, ordinal],
+                    )?;
+                    if deleted == 1 && ordinal == &entries[0].3 {
+                        self.maintenance_after_first_delete_hook.run();
+                    }
+                }
+                // The candidate journal and manifest DELETE commit atomically.
+                // Bound dependent cleanup by one candidate per table per unit.
+                cleanup_release_candidate(&tx, &selected, "class")?;
+                cleanup_release_candidate(&tx, &selected, "graph")?;
+                cleanup_release_candidate(&tx, &selected, "version")?;
+                let has_manifest: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?1 LIMIT 1)",
+                    [&selected],
+                    |r| r.get(0),
+                )?;
+                let has_candidates: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM native_release_candidate_classes WHERE revision_id=?1)
+                     OR EXISTS(SELECT 1 FROM native_release_candidate_graphs WHERE revision_id=?1)
+                     OR EXISTS(SELECT 1 FROM native_release_candidate_versions WHERE revision_id=?1)",
+                    [&selected], |r| r.get(0))?;
+                if !has_manifest && !has_candidates {
+                    tx.execute(
+                        "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
+                        [&selected],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
+                        VALUES(?1,'__released:v1','released:v1')",
+                        [&selected],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
+                        [&selected],
+                    )?;
+                    tx.execute(
+                        "UPDATE native_revision_supersessions SET state='released'
+                        WHERE revision_id=?1 AND state='pending'",
+                        [&selected],
+                    )?;
+                }
+            }
+            leader.verify()?;
+            self.identity.verify()?;
+            guard.verify()?;
+            if !progress.check() {
+                return Ok(MaintenanceOutcome::Deferred);
+            }
+            tx.commit()?;
+            Ok(MaintenanceOutcome::Progress)
+        })();
+        drop(progress_guard);
+        // Dropping an uncommitted Transaction rolls back BEFORE releasing the
+        // writer connection, including BUSY COMMIT in DELETE journal mode.
+        match work {
+            Err(error) if maintenance_contention(&error) => {
+                self.record_maintenance_busy(&error);
+                Ok(MaintenanceOutcome::Deferred)
+            }
+            other => other,
+        }
+    }
+
+    /// Explicit leader cleanup for CLI/test callers. Daemon maintenance uses
+    /// one `maintenance_step` at a time, never this draining convenience API.
+    pub fn maintain_revisions(&self, leader: &topology::LeaderGuard) -> Result<()> {
+        let Some(permit) = self.maintenance_try_enter() else {
+            return Ok(());
+        };
+        for _ in 0..4096 {
+            let probe = self.open_maintenance_queue_probe()?;
+            match self.maintenance_step(leader, &permit, &probe, || true)? {
+                MaintenanceOutcome::Progress => {}
+                MaintenanceOutcome::Idle | MaintenanceOutcome::Deferred => return Ok(()),
+            }
+        }
+        Ok(()) // Debt remains durable; the next owner/idle turn resumes it.
+    }
+
+    /// Public release is due-fenced. Earlier release is never exposed to a
+    /// production caller; tests can advance the injected clock instead.
     pub fn release_revision(&self, pin: IndexPin, leader: &topology::LeaderGuard) -> Result<()> {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         self.identity.verify()?;
-        self.with_evidence(|db| {
-            let head = self.read_revision(db, None)?.pin;
-            ensure!(pin != head, "revision conflict: cannot release head");
-            self.read_revision(db, Some(pin))?;
-            Ok(())
-        })?;
-        let mut db = self.cache_write()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let head = self.read_revision(&tx, None)?.pin;
-        ensure!(pin != head, "revision conflict: cannot release head");
-        let selected = self.read_revision(&tx, Some(pin))?;
-        leader.verify()?;
-        self.identity.verify()?;
-        tx.execute(
-            "DELETE FROM revision_documents WHERE revision_id=?1",
-            [&selected.key],
-        )?;
-        tx.execute(
-            "DELETE FROM revision_capture_inputs WHERE revision_id=?1",
-            [&selected.key],
-        )?;
+        let clock = self.retention_clock.lock().unwrap();
+        let (wall, mono) = clock.sample()?;
+        let elapsed = mono.saturating_sub(clock.origin_mono);
+        let origin = clock.origin_wall;
+        drop(clock);
+        let db = self.cache()?;
+        let head = ReadRevision::current(&db)?.pin;
         ensure!(
-            tx.execute(
-                "INSERT INTO revision_capture_inputs(revision_id,input_key,payload)
-            SELECT id,'__released:v1','released:v1' FROM native_revisions
-            WHERE id=?1 AND published_index_revision=?2",
-                params![selected.key, pin.index_revision as i64]
-            )? == 1,
-            "revision conflict: retained header changed"
+            pin.index_generation == head.index_generation
+                && pin.index_revision > 0
+                && pin.index_revision < head.index_revision,
+            "revision conflict: cannot release head or foreign pin"
         );
-        Self::check_retained_foreign_keys(&tx)?;
-        leader.verify()?;
-        self.identity.verify()?;
-        tx.commit()?;
-        Ok(())
+        let key = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let entry: Option<(i64,String)> = db.query_row(
+            "SELECT superseded_at,state FROM native_revision_supersessions WHERE revision_id=?1",
+            [&key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (stamp, state) = entry.context("revision conflict: missing superseded native pin")?;
+        let max_stamp: Option<i64> = db.query_row(
+            "SELECT max(superseded_at) FROM native_revision_supersessions",
+            [],
+            |r| r.get(0),
+        )?;
+        let now = wall.max(max_stamp.unwrap_or(wall));
+        ensure!(
+            state == "pending"
+                || state == "released"
+                || (retention_clock_plausible(origin, now, elapsed) && retention_due(now, stamp)),
+            "revision conflict: native pin is within retention grace"
+        );
+        drop(db);
+        self.maintain_revisions(leader)?;
+        // Draining is best-effort: admission may be occupied, a step may defer,
+        // or the bounded loop may end with durable debt. The explicit release
+        // API must only report success after the requested pin is committed.
+        let observed = (|| -> Result<bool> {
+            let guard = self.roots.index_use_existing_readonly(&self.identity)?;
+            let db = open_index_marker_probe(
+                &self.roots.index_db(&self.identity),
+                false,
+                Duration::ZERO,
+            )?;
+            let exact: Option<(String, i64, i64, i64)> = db
+                .query_row(
+                    "SELECT state,
+                        (SELECT count(*) FROM native_revision_release_debt WHERE revision_id=?1),
+                        (SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1
+                            AND input_key='__released:v1' AND payload='released:v1'),
+                        (SELECT count(*) FROM revision_capture_inputs WHERE revision_id=?1
+                            AND input_key='__pending_release:v1')
+                     FROM native_revision_supersessions WHERE revision_id=?1",
+                    [&key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            leader.verify()?;
+            self.identity.verify()?;
+            guard.verify()?;
+            Ok(matches!(exact, Some((state, 0, 1, 0)) if state == "released"))
+        })();
+        match observed {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(SqliteContention(()).into()),
+            Err(error) if maintenance_sqlite_busy(&error) => Err(SqliteContention(()).into()),
+            Err(error) => Err(error),
+        }
     }
 
     fn check_retained_foreign_keys(db: &Connection) -> Result<()> {
@@ -10857,7 +11671,41 @@ mod rebaseline_fault_tests {
     }
 
     #[test]
-    fn obsolete_metadata_marker_recreates_fresh_pin_and_preserves_requests() {
+    fn exceptional_corrupt_recreate_refuses_busy_use_without_unlinking_index() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        drop(store);
+        fs::write(&path, b"short").unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let busy = recovering
+            .roots
+            .index_use_existing_readonly(&recovering.identity)
+            .unwrap();
+        let result = recovering.recreate_pending_leader_session(
+            &IndexOptions::new(work.path().to_owned()),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            result.is_err(),
+            "protected SH user must block exceptional EX recreation"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), b"short");
+        drop(busy);
+    }
+
+    #[test]
+    fn obsolete_metadata_marker_rebuilds_same_inode_and_preserves_requests() {
+        use std::os::unix::fs::MetadataExt;
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
@@ -10877,36 +11725,52 @@ mod rebaseline_fault_tests {
                 &cancel,
             )
             .unwrap();
-        assert_eq!(original.index_revision, 1);
-        assert_eq!(store.graph_at(Some(original)).unwrap().files.len(), 1);
         let request = store.enqueue_request(&options, Some(original)).unwrap();
         let index = store.roots.index_db(&store.identity);
         drop(owner);
         drop(store);
         let db = Connection::open(&index).unwrap();
         db.execute_batch(
-            "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
         )
         .unwrap();
         drop(db);
-        let pending = Store::open_for_tests(state.path(), work.path()).unwrap();
-        assert!(pending.is_recreate_pending());
-        let (pin, session) = pending
-            .recreate_pending_leader_session(&options, &cancel)
+        let inode = fs::metadata(&index).unwrap().ino();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(recovering.disposition(), RecoveryDisposition::Rebuild);
+        assert!(recovering.status().is_err());
+        let session = recovering.leader_session().unwrap();
+        let baseline = recovering.recovery_index_baseline().unwrap();
+        assert!(!baseline.compatible);
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, recovering.root_id(), &cancel, |_| {}).unwrap();
+        let pin = recovering
+            .publish_native_recovery(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                baseline,
+                &cancel,
+            )
             .unwrap();
+        recovering
+            .attest_post_acquisition_reconciliation_guard(session.leader_guard().unwrap(), pin)
+            .unwrap();
+        assert_eq!(fs::metadata(&index).unwrap().ino(), inode);
         assert_eq!(pin.index_revision, 1);
         assert_ne!(pin.index_generation, original.index_generation);
-        let queued = pending.request_by_id(&request.id).unwrap().unwrap();
+        let queued = recovering.request_by_id(&request.id).unwrap().unwrap();
         assert_eq!(queued.expected, Some(original));
         assert_eq!(queued.state, "queued");
         assert!(
-            pending
+            recovering
                 .graph_at(Some(original))
                 .unwrap_err()
                 .to_string()
                 .contains("revision conflict")
         );
-        drop(session);
     }
 
     #[test]
@@ -12768,7 +13632,7 @@ mod sqlite_schema_race_tests {
         assert!(
             error
                 .to_string()
-                .contains("incompatible_index: unknown cache object"),
+                .contains("incompatible_index: cache changed after admission"),
             "{error:#}"
         );
         assert_eq!(
@@ -12783,7 +13647,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                8,
+                9,
                 "native-v4-delta-v1",
                 old.index_generation.to_string(),
                 old.index_revision as i64
@@ -12792,7 +13656,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            8
+            9
         );
         let forged: i64 = db
             .query_row(
@@ -12919,7 +13783,7 @@ mod sqlite_schema_race_tests {
         assert!(
             leader_error
                 .to_string()
-                .contains("incompatible_index: unknown cache object")
+                .contains("incompatible_index: cache changed after admission")
         );
         assert_eq!(
             fs::read(&leader_path).unwrap(),
@@ -12933,7 +13797,7 @@ mod sqlite_schema_race_tests {
         assert_eq!(
             (schema, marker.as_str(), generation, revision),
             (
-                8,
+                9,
                 "native-v4-delta-v1",
                 leader_pin.index_generation.to_string(),
                 leader_pin.index_revision as i64
@@ -12944,7 +13808,7 @@ mod sqlite_schema_race_tests {
                 .status()
                 .unwrap_err()
                 .to_string()
-                .contains("incompatible_index: unknown cache object type, name or shape")
+                .contains("incompatible_index")
         );
         attacker
             .execute_batch("DROP VIEW leader_after_admission")

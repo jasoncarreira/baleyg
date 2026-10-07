@@ -603,6 +603,19 @@ async fn main() -> Result<()> {
             };
             let output = serde_json::json!({"publishedRevision":revision,"status":status});
             write_session_json(&output, &session, std::io::stdout().lock())?;
+            // No cleanup can run before the terminal ACK, selected-status proof
+            // and explicit JSON flush. This CLI owns no timer after it exits.
+            if session.is_leader() {
+                for _ in 0..2 {
+                    let priority = || session.verify().is_ok() && store.verify_root().is_ok();
+                    match baleyg::index_coordinator::cooperative_maintenance_unit(
+                        &store, &session, priority,
+                    ) {
+                        Ok(baleyg::store::MaintenanceOutcome::Progress) => {}
+                        Ok(_) | Err(_) => break, // Durable debt belongs to the next owner.
+                    }
+                }
+            }
             if diagnostics {
                 eprintln!(
                     "index-phase outside_status_output_ms={:.3} total_ms={:.3}",

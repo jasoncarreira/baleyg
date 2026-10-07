@@ -477,14 +477,86 @@ fn incompatible_index_refuses_without_migrating_durable_data() {
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.pragma_update(None, "user_version", 2).unwrap();
     drop(db);
-    assert!(crate::common::open_store(&state, &workspace).is_err());
+    // The old disposable index is admitted for verified-leader rebaseline,
+    // but its evidence cannot be served or migrated as durable user data.
+    let deferred = Store::open_for_tests(&state, &workspace).unwrap();
+    let refusal = deferred.status().unwrap_err();
+    assert!(
+        refusal.to_string().contains("incompatible_index"),
+        "{refusal:#}"
+    );
     assert_eq!(std::fs::read(record).unwrap(), before);
+    let db = rusqlite::Connection::open(index_db(&state)).unwrap();
+    assert_eq!(
+        db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
 }
 #[test]
 fn failed_publication_keeps_projection_atomic_with_graph() {
     let (dir, store, graph, app, session) = setup();
     let q = request(id(&graph, "A"), &store);
     let before = serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap();
+    let prior = store.status().unwrap().revision;
+    let page = serde_json::to_value(
+        store
+            .classes_at(Some("Types.java"), "", Some(prior), 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    let path = index_db(&dir.path().join("state"));
+    let before_bytes = std::fs::read(&path).unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::write(
+        workspace.join("Types.java"),
+        JAVA.replace("class Alone {}", "class Added {} class Alone {}"),
+    )
+    .unwrap();
+    let changed =
+        index_workspace(&IndexOptions::new(workspace.clone()), &cancel(), |_| {}).unwrap();
+    assert!(
+        changed
+            .nodes
+            .iter()
+            .any(|node| node.kind == SymbolKind::Class && node.name == "Added")
+    );
+    let abort = cancel();
+    let signal = abort.clone();
+    store.set_publication_before_commit_hook_for_tests(move || {
+        signal.store(true, std::sync::atomic::Ordering::Release)
+    });
+    let rollback = publish_bundle(
+        &store,
+        &changed,
+        &workspace,
+        session.leader_guard().unwrap(),
+        prior,
+        &abort,
+    )
+    .unwrap_err();
+    assert!(rollback.to_string().contains("cancelled"), "{rollback:#}");
+    std::fs::write(workspace.join("Types.java"), JAVA).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before_bytes,
+        "changed graph/class INSERT must roll back before COMMIT"
+    );
+    assert_eq!(store.status().unwrap().revision, prior);
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .classes_at(Some("Types.java"), "", Some(prior), 0, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        page
+    );
+    assert_eq!(
+        serde_json::to_value(store.class_diagram_at(&q).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(store.graph().unwrap().nodes, graph.nodes);
     drop(app);
     drop(session);
 
@@ -547,9 +619,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     )
     .unwrap_err();
     assert!(
-        rejected
-            .to_string()
-            .contains("incompatible_index: unknown cache object"),
+        rejected.to_string().contains("revision conflict: expected"),
         "{rejected:#}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), unchanged);
@@ -559,7 +629,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         (version, marker.as_str(), generation, revision),
         (
-            8,
+            9,
             "native-v4-delta-v1",
             prior.index_generation.to_string(),
             prior.index_revision as i64
@@ -568,7 +638,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     assert!(
         store
@@ -1823,6 +1893,7 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     )
     .unwrap();
     let changed = index_workspace(&IndexOptions::new(root.clone()), &cancel(), |_| {}).unwrap();
+    store.set_retention_clock_for_tests(1_000, 0);
     let new_pin = publish_bundle(
         &store,
         &changed,
@@ -1955,6 +2026,7 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     );
     assert_eq!(page["items"], cold_page["items"]);
     assert_eq!(diagram["nodes"], cold_diagram["nodes"]);
+    store.set_retention_clock_for_tests(1_900, 900);
     store
         .release_revision(old, session.leader_guard().unwrap())
         .unwrap();

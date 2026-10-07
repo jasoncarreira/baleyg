@@ -119,6 +119,49 @@ impl DependencyIndex {
         !std::mem::replace(&mut self.worker_running, true)
     }
 }
+#[derive(Debug)]
+struct GcPriorityYield;
+impl std::fmt::Display for GcPriorityYield {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("maintenance deferred for publication")
+    }
+}
+impl std::error::Error for GcPriorityYield {}
+
+#[derive(Default)]
+struct MaintenanceTelemetry {
+    preemptions: u64,
+    busy_attempts: u64,
+    successful_units: u64,
+    deferred_since: Option<Instant>,
+    max_deferred_ms: u128,
+    max_deferred_age_s: u64,
+}
+impl MaintenanceTelemetry {
+    fn observe_due_age(&mut self, age: Option<u64>) {
+        if let Some(age) = age {
+            self.max_deferred_age_s = self.max_deferred_age_s.max(age.saturating_sub(900));
+        }
+    }
+    fn deferred(&mut self, now: Instant) -> (u128, u128) {
+        self.preemptions = self.preemptions.saturating_add(1);
+        let age = now
+            .duration_since(*self.deferred_since.get_or_insert(now))
+            .as_millis();
+        self.max_deferred_ms = self.max_deferred_ms.max(age);
+        (age, self.max_deferred_ms)
+    }
+    fn progressed(&mut self, now: Instant) -> (u128, u128) {
+        self.successful_units = self.successful_units.saturating_add(1);
+        let age = self
+            .deferred_since
+            .take()
+            .map_or(0, |start| now.duration_since(start).as_millis());
+        self.max_deferred_ms = self.max_deferred_ms.max(age);
+        (age, self.max_deferred_ms)
+    }
+}
+
 pub struct DaemonState {
     store: Store,
     serving_session: Mutex<Option<Arc<crate::store::topology::LeaderSession>>>,
@@ -140,6 +183,8 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
+    maintenance_tick_started: AtomicBool,
+    maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     #[cfg(test)]
     queue_takeover_attempts: AtomicUsize,
     #[cfg(test)]
@@ -300,6 +345,8 @@ pub fn new_with_dependency_options(
         acp,
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
+        maintenance_tick_started: AtomicBool::new(false),
+        maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         #[cfg(test)]
         queue_takeover_attempts: AtomicUsize::new(0),
         #[cfg(test)]
@@ -359,6 +406,7 @@ impl DaemonState {
     }
     /// A leader checks only the queue at idle. Follower retries require an accepted local ID.
     fn start_queue_tick(self: &Arc<Self>) {
+        self.start_maintenance_tick();
         // A synchronous fixture may retain an owner without starting a daemon runtime.
         // Do not consume the start flag until a Tokio executor can own the tick.
         if tokio::runtime::Handle::try_current().is_err() {
@@ -392,11 +440,370 @@ impl DaemonState {
             }
         });
     }
-    /// Exercise the production queue tick at the idle maintenance deadline in
-    /// integration tests, without waiting for wall-clock time.
+    /// One independent, verified-owner, low-priority lane. It never holds the
+    /// serial native stream or a watcher mutex across a Store writer unit.
+    fn start_maintenance_tick(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err()
+            || self.maintenance_tick_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                let worker = state.clone();
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || worker.maintenance_tick()).await
+                {
+                    best_effort_queue_stderr(
+                        std::io::stderr(),
+                        format_args!("maintenance worker failed: {error:#}\n"),
+                    );
+                }
+            }
+        });
+    }
+
+    fn maintenance_priority_reason(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+        options: &IndexOptions,
+    ) -> Option<&'static str> {
+        if self.native_stream.try_lock().is_err() {
+            return Some("native_stream");
+        }
+        if self.store.root_path_replaced().unwrap_or(true)
+            || !session.is_leader()
+            || session.verify().is_err()
+        {
+            return Some("root_or_leader");
+        }
+        if self
+            .pending_requests
+            .try_lock()
+            .map_or(true, |pending| !pending.is_empty())
+        {
+            return Some("local_fifo");
+        }
+        if self.store.has_recorded_completion(session).unwrap_or(true) {
+            return Some("terminal_ack");
+        }
+        if self.serving_session.try_lock().map_or(true, |current| {
+            !current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, session))
+        }) {
+            return Some("session_replaced");
+        }
+        match self.leader_work.try_lock() {
+            Ok(work) => match work.as_ref() {
+                Some((owner, scheduler))
+                    if owner
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, session)) =>
+                {
+                    if scheduler.accepted_watch_intent(options) {
+                        Some("accepted_watcher")
+                    } else {
+                        None
+                    }
+                }
+                _ => Some("watcher_replaced"),
+            },
+            Err(_) => Some("watcher_busy"),
+        }
+    }
+
+    fn maintenance_priority(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+        options: &IndexOptions,
+    ) -> bool {
+        self.maintenance_priority_reason(session, options).is_none()
+    }
+
+    /// Targeted indexed debt probe, only for explicitly enabled diagnostics.
+    /// A BUSY/unknown read never blocks or changes foreground work.
+    fn maintenance_oldest_age(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+    ) -> (String, Option<u64>) {
+        if !crate::index_coordinator::diagnostics_enabled() {
+            return ("disabled".into(), None);
+        }
+        let Ok(leader) = session.leader_guard() else {
+            return ("unknown".into(), None);
+        };
+        match self.store.maintenance_oldest_due_age_secs(leader) {
+            Ok(Some(age)) => (age.to_string(), Some(age)),
+            Ok(None) => ("none_or_clock_held".into(), None),
+            Err(_) => ("unknown".into(), None),
+        }
+    }
+
+    fn maintenance_deferred_reason(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+        options: &IndexOptions,
+    ) -> &'static str {
+        if let Some(reason) = self.maintenance_priority_reason(session, options) {
+            return reason;
+        }
+        match self.store.open_maintenance_queue_probe() {
+            Ok(probe) => match probe.check() {
+                crate::store::MaintenanceQueueState::Clear => "writer_or_gate_uncertain",
+                crate::store::MaintenanceQueueState::Pending => "external_fifo",
+                crate::store::MaintenanceQueueState::Unknown => "queue_probe_unknown",
+            },
+            Err(_) => "queue_probe_unknown",
+        }
+    }
+
+    fn maintenance_deferred(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+        reason: &str,
+    ) {
+        let (oldest, measured_age) = self.maintenance_oldest_age(session);
+        let mut stats = self.maintenance_telemetry.lock().unwrap();
+        stats.busy_attempts = self.store.maintenance_sqlite_busy_attempts();
+        stats.observe_due_age(measured_age);
+        let (age, max_age) = stats.deferred(Instant::now());
+        let details = format!(
+            "reason={reason} preemptions={} busy_attempts={} successful_units={} deferred_ms={age} max_deferred_ms={max_age} max_deferred_age_s={} oldest_due_age_s={oldest}",
+            stats.preemptions,
+            stats.busy_attempts,
+            stats.successful_units,
+            stats.max_deferred_age_s
+        );
+        drop(stats);
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "deferred",
+            &details,
+        );
+    }
+
+    fn gc_tick(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+        options: &IndexOptions,
+    ) -> anyhow::Result<()> {
+        if self.gc_last_check.lock().unwrap().elapsed() < Duration::from_secs(3600)
+            || !self.maintenance_priority(session, options)
+        {
+            return Ok(());
+        }
+        let probe = match self.store.open_maintenance_queue_probe() {
+            Ok(probe) => probe,
+            Err(_) => return Ok(()),
+        };
+        if probe.check() != crate::store::MaintenanceQueueState::Clear {
+            return Ok(());
+        }
+        let Some(permit) = self.store.maintenance_try_enter() else {
+            return Ok(());
+        };
+        drop(permit); // Never hold the gate across the whole directory scan.
+        let Ok(leader) = session.leader_guard() else {
+            return Ok(());
+        };
+        let mut priority = |stage| -> anyhow::Result<()> {
+            if stage == crate::store::topology::GcStage::AfterFirstDbUnlink
+                || stage == crate::store::topology::GcStage::AfterParentSync
+            {
+                // Once unlink begins, finish the candidate's guarded sequence.
+                return Ok(());
+            }
+            let Some(unit) = self.store.maintenance_try_enter() else {
+                return Err(anyhow::Error::new(GcPriorityYield));
+            };
+            let clear = self.maintenance_priority(session, options)
+                && probe.check() == crate::store::MaintenanceQueueState::Clear;
+            drop(unit);
+            if !clear {
+                return Err(anyhow::Error::new(GcPriorityYield));
+            }
+            Ok(())
+        };
+        let started = Instant::now();
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "start",
+            "kind=gc",
+        );
+        let result = self.store.automatic_gc_cooperative(leader, &mut priority);
+        let outcome = if result.is_ok() {
+            "completed"
+        } else if result
+            .as_ref()
+            .is_err_and(|error| error.is::<GcPriorityYield>())
+        {
+            "deferred"
+        } else {
+            "error"
+        };
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "end",
+            &format!(
+                "kind=gc outcome={outcome} duration_us={}",
+                started.elapsed().as_micros()
+            ),
+        );
+        // A daily attempt stamp may already have committed. Any remaining
+        // candidate waits until the next authorized daily attempt after yield.
+        *self.gc_last_check.lock().unwrap() = Instant::now();
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) if error.is::<GcPriorityYield>() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn maintenance_tick(&self) -> anyhow::Result<()> {
+        use crate::store::MaintenanceOutcome;
+        if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
+            return Ok(());
+        }
+        let session = self
+            .serving_session
+            .try_lock()
+            .ok()
+            .and_then(|held| held.clone());
+        let Some(session) = session else {
+            return Ok(());
+        };
+        // Read selected options only outside a maintenance writer. A changed
+        // watcher/options binding is intent until native_stream replaces it.
+        let options = match self.store.recorded_index_options() {
+            Ok(Some(options)) => options,
+            Ok(None) => self.options.clone(),
+            Err(_) => return Ok(()),
+        };
+        if let Some(reason) = self.maintenance_priority_reason(&session, &options) {
+            self.maintenance_deferred(&session, reason);
+            *self.retention_last_run.lock().unwrap() =
+                Instant::now() - Duration::from_secs(60) + Duration::from_millis(250);
+            return Ok(());
+        }
+        let started = Instant::now();
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "start",
+            &format!(
+                "kind=retention oldest_due_age_s={}",
+                self.maintenance_oldest_age(&session).0
+            ),
+        );
+        let result =
+            crate::index_coordinator::cooperative_maintenance_unit(&self.store, &session, || {
+                self.maintenance_priority(&session, &options)
+            });
+        let outcome = match &result {
+            Ok(crate::store::MaintenanceOutcome::Progress) => "progress",
+            Ok(crate::store::MaintenanceOutcome::Deferred) => "deferred",
+            Ok(crate::store::MaintenanceOutcome::Idle) => "idle",
+            Err(_) => "error",
+        };
+        crate::index_coordinator::diagnostic_marker(
+            &session.incarnation().to_string(),
+            "end",
+            &format!(
+                "kind=retention outcome={outcome} duration_us={}",
+                started.elapsed().as_micros()
+            ),
+        );
+        match result {
+            Ok(MaintenanceOutcome::Progress) => {
+                let (oldest, measured_age) = self.maintenance_oldest_age(&session);
+                let mut stats = self.maintenance_telemetry.lock().unwrap();
+                stats.busy_attempts = self.store.maintenance_sqlite_busy_attempts();
+                if let Some(age) = measured_age {
+                    stats.max_deferred_age_s =
+                        stats.max_deferred_age_s.max(age.saturating_sub(900));
+                }
+                let (deferred, max_deferred) = stats.progressed(Instant::now());
+                let details = format!(
+                    "successful_units={} preemptions={} busy_attempts={} deferred_ms={deferred} max_deferred_ms={max_deferred} max_deferred_age_s={} oldest_due_age_s={oldest}",
+                    stats.successful_units,
+                    stats.preemptions,
+                    stats.busy_attempts,
+                    stats.max_deferred_age_s
+                );
+                drop(stats);
+                crate::index_coordinator::diagnostic_marker(
+                    &session.incarnation().to_string(),
+                    "progress",
+                    &details,
+                );
+                // Keep making one small unit at the next idle tick, after
+                // re-arbitrating every accepted watcher and external FIFO.
+            }
+            Ok(MaintenanceOutcome::Deferred) => {
+                let reason = self.maintenance_deferred_reason(&session, &options);
+                // Deferred also covers a newly accepted queue row or an unknown
+                // probe. Do not invent an exact SQLite BUSY count from it.
+                self.maintenance_deferred(&session, reason);
+                *self.retention_last_run.lock().unwrap() =
+                    Instant::now() - Duration::from_secs(60) + Duration::from_millis(250);
+            }
+            Ok(MaintenanceOutcome::Idle) => {
+                *self.retention_last_run.lock().unwrap() = Instant::now();
+            }
+            Err(error) => {
+                *self.retention_last_run.lock().unwrap() = Instant::now();
+                return Err(error);
+            }
+        }
+        self.gc_tick(&session, &options)?;
+        Ok(())
+    }
+
+    /// Exercise the independent low-priority maintenance lane at its deadline
+    /// in integration tests, without waiting for wall-clock time.
     #[doc(hidden)]
     pub fn force_retention_idle_tick_for_tests(self: &Arc<Self>) -> anyhow::Result<()> {
+        // A standalone fixture can retain an owner without running the native
+        // stream. Verify/ack its initial full watcher inventory before claiming
+        // a genuine idle maintenance opportunity.
+        {
+            let _stream = self.native_stream.lock().unwrap();
+            let session = self.serving_session.lock().unwrap().clone();
+            if let Some(session) = session {
+                let options = self
+                    .store
+                    .recorded_index_options()?
+                    .unwrap_or_else(|| self.options.clone());
+                let mut work = self.leader_work.lock().unwrap();
+                if work.is_none() {
+                    let mut scheduler =
+                        crate::index_coordinator::LeaderWork::new(&self.store, &session, &options)?;
+                    scheduler.reconcile_due(
+                        &self.store,
+                        &session,
+                        &options,
+                        &Arc::new(AtomicBool::new(false)),
+                        true,
+                    )?;
+                    *work = Some((Arc::downgrade(&session), scheduler));
+                }
+            }
+        }
         *self.retention_last_run.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        self.maintenance_tick()
+    }
+
+    /// Drive the serial root-loss transition in a standalone fixture without
+    /// conflating it with the independent low-priority maintenance lane.
+    #[doc(hidden)]
+    pub fn force_root_transition_tick_for_tests(self: &Arc<Self>) -> anyhow::Result<()> {
         self.queue_tick()
     }
 
@@ -593,16 +1000,6 @@ impl DaemonState {
                     return Err(error);
                 }
             };
-            if self.retention_last_run.lock().unwrap().elapsed() >= Duration::from_secs(60) {
-                self.store.maintain_revisions(session.leader_guard()?)?;
-                *self.retention_last_run.lock().unwrap() = Instant::now();
-            }
-            if self.gc_last_check.lock().unwrap().elapsed() >= Duration::from_secs(3600) {
-                *self.gc_last_check.lock().unwrap() = Instant::now();
-                if let Err(error) = self.store.automatic_gc(session.leader_guard()?) {
-                    eprintln!("derived GC attempt failed: {error:#}");
-                }
-            }
             if processed > 0 {
                 *self.packets.lock().unwrap() = PacketCache::default();
                 self.start_dependency_index();
@@ -5647,11 +6044,12 @@ mod normal_post_capture_cancellation_tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(
-            matches!(tables.len(), 28..=31),
-            "compare the complete legacy or extended v8 evidence inventory"
+        assert_eq!(
+            tables.len(),
+            35,
+            "compare exact v9 derived evidence inventory"
         );
-        let mut expected = vec![
+        let expected = vec![
             "class_projections",
             "class_relations",
             "classes",
@@ -5660,9 +6058,15 @@ mod normal_post_capture_cancellation_tests {
             "graph_nodes",
             "graph_projections",
             "graph_regions",
+            "native_binding_epoch",
             "native_producer_inputs",
             "native_producer_languages",
             "native_producers",
+            "native_release_candidate_classes",
+            "native_release_candidate_graphs",
+            "native_release_candidate_versions",
+            "native_revision_release_debt",
+            "native_revision_supersessions",
             "native_revisions",
             "native_source_set_dependencies",
             "native_source_set_languages",
@@ -5680,19 +6084,12 @@ mod normal_post_capture_cancellation_tests {
             "native_version_parameters",
             "revision_capture_inputs",
             "revision_documents",
+            "revision_producer_bindings",
         ];
-        if tables.contains(&"native_binding_epoch".to_string()) {
-            expected.extend(["native_binding_epoch", "revision_producer_bindings"]);
-            expected.sort_unstable();
-        }
-        if tables.contains(&"native_revision_supersessions".to_string()) {
-            expected.push("native_revision_supersessions");
-            expected.sort_unstable();
-        }
         assert_eq!(
             tables.iter().map(String::as_str).collect::<Vec<_>>(),
             expected,
-            "exact v8 table names: complete legacy or paired producer-binding, with optional supersession extension"
+            "exact v9 table names: complete paired producer bindings and durable release debt"
         );
         for required in [
             "document_versions",
@@ -6120,5 +6517,32 @@ mod dependency_lifecycle_tests {
         let generation = state.dependencies.lock().unwrap().generation;
         state.publish_dependency_index(generation, &active, Ok(catalog("after-shutdown", pin1)));
         assert!(state.catalog_snapshot(pin1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_telemetry_tests {
+    use super::*;
+    #[test]
+    fn deferred_preemption_busy_and_success_keep_max_age_without_sleep() {
+        let now = Instant::now();
+        let mut stats = MaintenanceTelemetry {
+            deferred_since: Some(now - Duration::from_secs(2)),
+            ..Default::default()
+        };
+        stats.busy_attempts = 1; // Store's exact counter is sampled by the scheduler.
+        let (age, max) = stats.deferred(now);
+        assert!(age >= 2_000 && max >= 2_000);
+        stats.observe_due_age(Some(899));
+        assert_eq!(stats.max_deferred_age_s, 0);
+        stats.observe_due_age(Some(905));
+        assert_eq!(stats.max_deferred_age_s, 5);
+        stats.observe_due_age(None);
+        assert_eq!(stats.max_deferred_age_s, 5);
+        assert_eq!((stats.preemptions, stats.busy_attempts), (1, 1));
+        let (age, max) = stats.progressed(now);
+        assert!(age >= 2_000 && max >= 2_000);
+        assert_eq!((stats.successful_units, stats.preemptions), (1, 1));
+        assert!(stats.deferred_since.is_none());
     }
 }
