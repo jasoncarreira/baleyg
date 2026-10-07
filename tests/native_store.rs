@@ -52,6 +52,8 @@ fn remove_maintenance_extension_for_v8_test(path: &std::path::Path) {
          DROP TABLE native_revision_release_debt;
          DROP INDEX native_supersessions_due;
          DROP INDEX native_supersessions_clock;
+         DROP INDEX native_version_declarations_owner;
+         DROP INDEX native_version_regions_parent;
          DROP TABLE native_revision_supersessions;
          CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));
          COMMIT; PRAGMA foreign_keys=ON;",
@@ -2093,6 +2095,132 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
 }
 
 #[test]
+fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
+    use std::os::unix::fs::MetadataExt;
+    let (state, root, store, cancel) = fixture();
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(
+        "DROP INDEX native_version_declarations_owner; DROP INDEX native_version_regions_parent;",
+    )
+    .unwrap();
+    drop(db);
+    let inode = fs::metadata(&path).unwrap().ino();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let leader = reopened.leader().unwrap();
+    let next = publish(&reopened, root.path(), &cancel, old, &leader).unwrap();
+    assert_eq!(next.index_generation, old.index_generation);
+    assert_eq!(next.index_revision, old.index_revision + 1);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    let db = Connection::open(&path).unwrap();
+    for name in [
+        "native_version_declarations_owner",
+        "native_version_regions_parent",
+    ] {
+        let present: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{name} missing after additive upgrade");
+    }
+    assert!(reopened.graph_at(Some(old)).is_ok());
+}
+
+#[test]
+fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
+    use std::os::unix::fs::MetadataExt;
+    let (state, root, store, cancel) = fixture();
+    store.set_retention_clock_for_tests(1_000, 0);
+    let leader = store.leader().unwrap();
+    let old = publish(
+        &store,
+        root.path(),
+        &cancel,
+        store.index_baseline().unwrap(),
+        &leader,
+    )
+    .unwrap();
+    let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
+    store.set_retention_clock_for_tests(1_902, 902);
+    store.maintain_revisions(&leader).unwrap();
+    assert!(
+        store
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+    drop(leader);
+    drop(store);
+    let identity =
+        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            .unwrap();
+    let path = state
+        .path()
+        .join("cache/indexes")
+        .join(identity.root_key)
+        .join("index.db");
+    remove_maintenance_extension_for_v8_test(&path);
+    let db = Connection::open(&path).unwrap();
+    db.execute(
+        "INSERT INTO native_revision_supersessions(revision_id,superseded_at) VALUES(?1,1000)",
+        [format!(
+            "pin:v1:{}:{}",
+            old.index_generation, old.index_revision
+        )],
+    )
+    .unwrap();
+    drop(db);
+    let inode = fs::metadata(&path).unwrap().ino();
+    let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
+    let leader = reopened.leader().unwrap();
+    let next = publish(&reopened, root.path(), &cancel, head, &leader).unwrap();
+    assert_eq!(next.index_generation, head.index_generation);
+    assert_eq!(next.index_revision, head.index_revision + 1);
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    let db = Connection::open(&path).unwrap();
+    let state: String = db
+        .query_row(
+            "SELECT state FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                old.index_generation, old.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "released");
+    assert!(
+        reopened
+            .graph_at(Some(old))
+            .unwrap_err()
+            .downcast_ref::<baleyg::store::PinExpired>()
+            .is_some()
+    );
+}
+
+#[test]
 fn released_supersession_never_reenters_retained_due_inventory() {
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
@@ -2553,7 +2681,7 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
 fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
     use baleyg::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
-    for number in 0..5 {
+    for number in 0..65 {
         fs::write(
             root.path().join(format!("extra{number}.js")),
             format!("function extra{number}() {{ return {number}; }}"),
@@ -2596,7 +2724,7 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
             |r| r.get(0),
         )
         .unwrap();
-    assert!(original > 4);
+    assert!(original > 64);
     store.set_retention_clock_for_tests(1_901, 901);
     let permit = store.maintenance_try_enter().unwrap();
     let probe = store.open_maintenance_queue_probe().unwrap();
@@ -3201,7 +3329,7 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     use baleyg::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     let source = root.path().join("large.js");
-    let body: String = (0..3_000)
+    let body: String = (0..20_000)
         .map(|n| format!("function f{n}() {{ return {n}; }}\n"))
         .collect();
     fs::write(&source, &body).unwrap();
@@ -3231,11 +3359,27 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     let facts: i64 = db.query_row(
         "SELECT count(*) FROM native_version_declarations WHERE version_id=(SELECT document_version_id FROM revision_documents WHERE revision_id=?1 AND path='large.js')",
         [&key], |r| r.get(0)).unwrap();
-    assert!(facts >= 3_000, "realistic version has {facts} declarations");
+    assert!(facts >= 20_000, "large version has {facts} declarations");
     store.set_retention_clock_for_tests(1_903, 903);
+    let started = std::time::Instant::now();
+    {
+        let permit = store.maintenance_try_enter().unwrap();
+        let probe = store.open_maintenance_queue_probe().unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                store
+                    .maintenance_step(&leader, &permit, &probe, || true)
+                    .unwrap(),
+                MaintenanceOutcome::Progress
+            );
+        }
+    }
+    // Publish another edit while the large prior document is partially drained.
+    fs::write(&source, format!("{body}\n// edited again\n")).unwrap();
+    let new_head = publish(&store, root.path(), &cancel, head, &leader).unwrap();
     let permit = store.maintenance_try_enter().unwrap();
     let probe = store.open_maintenance_queue_probe().unwrap();
-    let mut progress = 0;
+    let mut progress = 4;
     let mut released = false;
     for _ in 0..500 {
         match store
@@ -3262,7 +3406,12 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
         released,
         "{facts} declarations remained pending after {progress} progress units"
     );
-    assert_eq!(store.status().unwrap().revision, head);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "large-document release and interleaved edit took too long: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(store.status().unwrap().revision, new_head);
 }
 
 #[test]
@@ -3297,7 +3446,7 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
     {
         let permit = store.maintenance_try_enter().unwrap();
         let probe = store.open_maintenance_queue_probe().unwrap();
-        for _ in 0..8 {
+        for _ in 0..2 {
             assert_eq!(
                 store
                     .maintenance_step(&leader, &permit, &probe, || true)
@@ -3326,7 +3475,7 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
             .join("index.db"),
     )
     .unwrap();
-    let mut units = 8;
+    let mut units = 2;
     let permit = store.maintenance_try_enter().unwrap();
     let probe = store.open_maintenance_queue_probe().unwrap();
     let mut released = false;
@@ -3356,7 +3505,7 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
         "old 400-document revision remains pending after {units} units"
     );
     assert!(
-        units < 130,
+        units < 30,
         "candidate cleanup must batch, not need one unit per document"
     );
     assert_eq!(store.status().unwrap().revision, head);

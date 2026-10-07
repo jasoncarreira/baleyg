@@ -417,6 +417,12 @@ CREATE TABLE native_release_candidate_versions(revision_id TEXT NOT NULL REFEREN
 CREATE TABLE native_release_candidate_graphs(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
 CREATE TABLE native_release_candidate_classes(revision_id TEXT NOT NULL REFERENCES native_revisions(id) DEFERRABLE INITIALLY DEFERRED,id TEXT NOT NULL,PRIMARY KEY(revision_id,id));
 "#;
+// These indexes avoid quadratic self-FK checks when a large document is retired.
+// Keep them separate so indexes written by the previous v8 extension remain valid.
+const RETENTION_FK_INDEX_SCHEMA_V8: &str = r#"
+CREATE INDEX native_version_declarations_owner ON native_version_declarations(version_id,owner_syntax_id);
+CREATE INDEX native_version_regions_parent ON native_version_control_regions(version_id,parent_id,owner_syntax_id);
+"#;
 
 const CACHE_SCHEMA_V8: &str = r#"
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
@@ -1240,6 +1246,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     if actual == objects(&expected)? {
         return Ok(());
     }
+    expected.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
     let without_binding = Connection::open_in_memory()?;
     without_binding.execute_batch(CACHE_SCHEMA_V8)?;
     without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
@@ -1247,6 +1257,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         return Ok(());
     }
     without_binding.execute_batch(RETENTION_SCHEMA_V8)?;
+    if actual == objects(&without_binding)? {
+        return Ok(());
+    }
+    without_binding.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
     control_ensure!(
         actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -1263,6 +1277,13 @@ fn has_revision_supersessions(db: &Connection) -> Result<bool> {
 fn has_revision_release_debt(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_revision_release_debt')",
+        [], |r| r.get(0),
+    )?)
+}
+
+fn has_retention_fk_indexes(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_version_declarations_owner')",
         [], |r| r.get(0),
     )?)
 }
@@ -1536,19 +1557,42 @@ mod retention_clock_tests {
 // Called only with the leader's immediate write transaction. Existing pins stay put.
 fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
     let missing_supersessions = !has_revision_supersessions(db)?;
+    let missing_retention = !has_revision_release_debt(db)?;
     if missing_supersessions {
         db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
     }
-    if !has_revision_release_debt(db)? {
+    if missing_retention {
         db.execute_batch(RETENTION_SCHEMA_V8)?;
+    }
+    if !has_retention_fk_indexes(db)? {
+        db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
     }
     if missing_supersessions {
         db.execute(
             "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
-             SELECT r.id,?1,'retained' FROM native_revisions r CROSS JOIN index_metadata m
+             SELECT r.id,?1,CASE WHEN EXISTS (SELECT 1 FROM revision_capture_inputs c
+               WHERE c.revision_id=r.id AND c.input_key='__released:v1')
+               THEN 'released' ELSE 'retained' END
+             FROM native_revisions r CROSS JOIN index_metadata m
+             WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision",
+            [now],
+        )?;
+    } else if missing_retention {
+        // Earlier v8 could have released a pin before the state column existed.
+        // Preserve its tombstone instead of treating it as retained corruption.
+        db.execute_batch(
+            "UPDATE native_revision_supersessions SET state='released'
+             WHERE EXISTS (SELECT 1 FROM revision_capture_inputs c
+               WHERE c.revision_id=native_revision_supersessions.revision_id
+                 AND c.input_key='__released:v1');",
+        )?;
+        db.execute(
+            "INSERT INTO native_revision_supersessions(revision_id,superseded_at,state)
+             SELECT r.id,?1,'released' FROM native_revisions r CROSS JOIN index_metadata m
              WHERE m.singleton=1 AND r.id != 'pin:v1:'||m.index_generation||':'||m.index_revision
-               AND NOT EXISTS (SELECT 1 FROM revision_capture_inputs c
-                 WHERE c.revision_id=r.id AND c.input_key='__released:v1')",
+               AND EXISTS (SELECT 1 FROM revision_capture_inputs c
+                 WHERE c.revision_id=r.id AND c.input_key='__released:v1')
+               AND NOT EXISTS (SELECT 1 FROM native_revision_supersessions s WHERE s.revision_id=r.id)",
             [now],
         )?;
     }
@@ -4711,8 +4755,7 @@ impl Store {
         Arc::ptr_eq(&self.publication_gate, &permit.gate)
             && waiting == 0
             && probe.check() == MaintenanceQueueState::Clear
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| priority()))
-                .unwrap_or(false)
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(priority)).unwrap_or(false)
     }
     pub fn open(
         roots: topology::TopologyRoots,
@@ -5116,6 +5159,7 @@ impl Store {
                 db.execute_batch(CACHE_SCHEMA_V8)?;
                 db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
                 db.execute_batch(RETENTION_SCHEMA_V8)?;
+                db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -8301,6 +8345,9 @@ impl Store {
             if !has_revision_release_debt(&tx)? {
                 tx.execute_batch(RETENTION_SCHEMA_V8)?;
             }
+            if !has_retention_fk_indexes(&tx)? {
+                tx.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+            }
         } else {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
         }
@@ -8960,7 +9007,7 @@ impl Store {
                 let entries: Vec<(String, String, Option<String>, i64)> = tx
                     .prepare(
                         "SELECT document_version_id,graph_projection_id,class_projection_id,ordinal
-                     FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 4",
+                     FROM revision_documents WHERE revision_id=?1 ORDER BY ordinal LIMIT 64",
                     )?
                     .query_map([&selected], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -8990,7 +9037,7 @@ impl Store {
                     }
                 }
                 // The candidate journal and manifest DELETE commit atomically.
-                // Bound dependent cleanup by one candidate per table per unit.
+                // Bound dependent cleanup by 64 candidates per table per unit.
                 cleanup_release_candidate(&tx, &selected, "class")?;
                 cleanup_release_candidate(&tx, &selected, "graph")?;
                 cleanup_release_candidate(&tx, &selected, "version")?;
