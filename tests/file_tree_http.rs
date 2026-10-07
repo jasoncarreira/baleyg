@@ -52,15 +52,8 @@ fn setup() -> (
         root,
     )
     .unwrap();
-    // Tree API fixtures inspect a committed snapshot, not the asynchronous queue.
-    // Keep the 20ms queue tick from racing workspace-boundary mutations below.
-    std::thread::spawn({
-        let state = state.clone();
-        let session = session.clone();
-        move || state.retain_serving_session(session)
-    })
-    .join()
-    .unwrap();
+    // Offline snapshot test; the live reconciliation/read race is tracked in #111.
+    state.retain_serving_session_without_tick_for_tests(session.clone());
     let app = http::router(state);
     (temp, store, app, session)
 }
