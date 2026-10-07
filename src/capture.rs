@@ -812,7 +812,10 @@ mod tests {
         let live = dir.path().join("native-bin");
         let reported = dir.path().join("native-bin (deleted)");
         fs::write(&live, b"old binary").unwrap();
-        let running = fs::metadata(&live).unwrap();
+        // Keep the old inode open as a running process would. Otherwise Linux
+        // may immediately recycle its inode number after the replacement.
+        let running_file = fs::File::open(&live).unwrap();
+        let running = running_file.metadata().unwrap();
         fs::hard_link(&live, &reported).unwrap();
         assert_eq!(
             linux_executable_path(reported.clone(), &running).unwrap(),
