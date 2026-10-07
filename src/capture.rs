@@ -286,34 +286,28 @@ fn admit_running_executable(
     inputs: &mut BTreeMap<PathBuf, Option<Stamp>>,
     input_bytes: &mut BTreeMap<PathBuf, Option<Arc<[u8]>>>,
 ) -> Result<()> {
+    check(cancel)?;
     let state = image.initial.clone();
     let key = identity(&state);
     ensure!(
         !key.is_some_and(|key| source_identities.contains(&key)),
         "running executable aliases source"
     );
-    let bytes = image.verified_bytes(cancel)?;
-    if let Some(previous) = inputs.get(&image.path) {
-        ensure!(
-            previous == &Some(state.clone())
-                && input_bytes.get(&image.path).and_then(Option::as_deref) == Some(bytes.as_ref()),
-            "running executable pathname conflicts with another input"
-        );
-    }
-    if let Some(old_path) = key.and_then(|key| identities.get(&key)) {
-        ensure!(
-            inputs.get(old_path) == Some(&Some(state.clone()))
-                && input_bytes.get(old_path).and_then(Option::as_deref) == Some(bytes.as_ref()),
-            "running executable input alias drift"
-        );
-    }
+    // No other role may claim this path or inode: its bytes live only in the
+    // process-start digest, not the per-capture input byte map.
+    ensure!(
+        !inputs.contains_key(&image.path) && !key.is_some_and(|key| identities.contains_key(&key)),
+        "running executable aliases another input"
+    );
+    image.verify_stat()?;
     if let Some(key) = key {
-        identities.entry(key).or_insert_with(|| image.path.clone());
+        identities.insert(key, image.path.clone());
     }
     inputs.insert(image.path.clone(), Some(state));
-    input_bytes.insert(image.path.clone(), Some(bytes));
+    input_bytes.insert(image.path.clone(), None);
     Ok(())
 }
+
 fn source(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|x| x.to_str()),
@@ -391,7 +385,6 @@ struct RunningExecutable {
     path: PathBuf,
     file: std::sync::Mutex<fs::File>,
     initial: Stamp,
-    bytes: Arc<[u8]>,
     digest: String,
 }
 
@@ -425,21 +418,18 @@ impl RunningExecutable {
             path,
             file: std::sync::Mutex::new(file),
             initial,
-            bytes: Arc::from(Vec::<u8>::new()),
             digest: String::new(),
         };
         let bytes = image.read_file(&Arc::new(std::sync::atomic::AtomicBool::new(false)))?;
         image.digest = hash(&bytes);
-        image.bytes = bytes;
         Ok(image)
     }
-    fn verified_bytes(&self, cancel: &CancelFlag) -> Result<Arc<[u8]>> {
-        let now = self.read_file(cancel)?;
-        ensure!(
-            now.as_ref() == self.bytes.as_ref(),
-            "running executable contents drift from startup"
-        );
-        Ok(self.bytes.clone())
+    fn verify_stat(&self) -> Result<()> {
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("running executable lock poisoned"))?;
+        self.check_file(&file)
     }
     fn read_file(&self, cancel: &CancelFlag) -> Result<Arc<[u8]>> {
         use std::io::{Seek, SeekFrom};
@@ -521,7 +511,7 @@ pub struct Capture {
     // One admitted immutable executable byte allocation and one SHA-256 pass.
     // The private identity binds the cached digest to this exact captured Arc.
     executable_path: PathBuf,
-    executable_bytes: Arc<[u8]>,
+    executable_bytes: Option<Arc<[u8]>>,
     executable_digest: String,
     running_executable: Option<Arc<RunningExecutable>>,
     input_bytes: BTreeMap<PathBuf, Option<Arc<[u8]>>>,
@@ -633,17 +623,25 @@ impl Capture {
                 &mut input_bytes,
             )?;
         }
-        let executable_bytes = input_bytes
-            .get(&exe)
-            .and_then(Option::as_ref)
-            .filter(|bytes| !bytes.is_empty())
-            .cloned()
-            .with_context(|| format!("running executable bytes unavailable: {}", exe.display()))?;
+        let executable_bytes = if running_executable.is_some() {
+            None
+        } else {
+            Some(
+                input_bytes
+                    .get(&exe)
+                    .and_then(Option::as_ref)
+                    .filter(|bytes| !bytes.is_empty())
+                    .cloned()
+                    .with_context(|| {
+                        format!("running executable bytes unavailable: {}", exe.display())
+                    })?,
+            )
+        };
         check(cancel)?;
         let executable_digest = if let Some(image) = running_executable.as_ref() {
             image.digest.clone()
         } else {
-            hash(&executable_bytes)
+            hash(executable_bytes.as_ref().unwrap())
         };
         check(cancel)?;
         for path in [options.scip_path.as_ref(), options.manifest_path.as_ref()]
@@ -758,11 +756,11 @@ impl Capture {
                     path == &image.path && expected.as_ref() == Some(&image.initial),
                     "running executable observation drift"
                 );
-                let now = image.verified_bytes(cancel)?;
                 ensure!(
-                    self.input_bytes.get(path).and_then(Option::as_deref) == Some(now.as_ref()),
-                    "running executable contents drift"
+                    self.input_bytes.get(path) == Some(&None),
+                    "running executable input bytes unexpectedly populated"
                 );
+                image.verify_stat()?;
                 continue;
             }
             ensure!(
@@ -803,16 +801,25 @@ impl Capture {
     pub(crate) fn executable_path(&self) -> &Path {
         &self.executable_path
     }
-    /// Only the exact admitted executable Arc may use its one cached digest.
-    /// A missing or replaced map entry fails closed without hashing again.
+    /// The executing image is backed by a startup-pinned descriptor and digest.
+    /// Fixture-only path admissions still require their exact byte Arc.
     pub(crate) fn executable_digest(&self, path: &Path) -> Option<&str> {
-        (path == self.executable_path.as_path()
-            && self
-                .input_bytes
+        if path != self.executable_path.as_path() {
+            return None;
+        }
+        let admitted = if let Some(image) = self.running_executable.as_ref() {
+            self.inputs.get(path) == Some(&Some(image.initial.clone()))
+                && self.input_bytes.get(path) == Some(&None)
+                && self.executable_bytes.is_none()
+                && self.executable_digest == image.digest
+        } else {
+            self.input_bytes
                 .get(path)
                 .and_then(Option::as_ref)
-                .is_some_and(|bytes| Arc::ptr_eq(bytes, &self.executable_bytes)))
-        .then_some(self.executable_digest.as_str())
+                .zip(self.executable_bytes.as_ref())
+                .is_some_and(|(entry, original)| Arc::ptr_eq(entry, original))
+        };
+        admitted.then_some(self.executable_digest.as_str())
     }
     /// Compare the native roles of admitted inputs, not presentation pathnames. A single
     /// optional SCIP/manifest pathname can also be a root config, nested ignore file,
@@ -851,6 +858,16 @@ impl Capture {
                 .context("missing admitted native input")?;
             let digest = match (expected, bytes) {
                 (None, None) => None,
+                (Some(stat), None)
+                    if path == &self.executable_path && self.running_executable.is_some() =>
+                {
+                    ensure!(stat.kind == 2, "malformed admitted native executable");
+                    Some(
+                        self.executable_digest(path)
+                            .context("native executable startup identity mismatch")?
+                            .to_owned(),
+                    )
+                }
                 (Some(stat), Some(bytes)) => {
                     ensure!(
                         stat.kind == 2 && stat.len == bytes.len() as u64,
@@ -961,12 +978,18 @@ impl Capture {
                 None => CaptureInputObservation::Absent,
                 Some(stat) => CaptureInputObservation::Present {
                     stat: stat.persisted(),
-                    hash: hash(
-                        self.input_bytes
-                            .get(path)
-                            .and_then(Option::as_deref)
-                            .context("present input bytes missing")?,
-                    ),
+                    hash: if path == &self.executable_path && self.running_executable.is_some() {
+                        self.executable_digest(path)
+                            .context("running executable startup identity missing")?
+                            .to_owned()
+                    } else {
+                        hash(
+                            self.input_bytes
+                                .get(path)
+                                .and_then(Option::as_deref)
+                                .context("present input bytes missing")?,
+                        )
+                    },
                 },
             };
             ensure!(!roles.is_empty(), "capture input lacks a role");
@@ -990,35 +1013,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("native-bin");
         fs::write(&live, b"old executing binary").unwrap();
-        let file = fs::File::open(&live).unwrap();
-        let image = RunningExecutable::from_file(live.clone(), file).unwrap();
-        let startup_digest = image.digest.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
-        assert_eq!(
-            image.verified_bytes(&cancel).unwrap().as_ref(),
-            b"old executing binary"
-        );
+        let image =
+            RunningExecutable::from_file(live.clone(), fs::File::open(&live).unwrap()).unwrap();
+        let startup_digest = hash(b"old executing binary");
+        assert_eq!(image.digest, startup_digest);
+        image.verify_stat().unwrap();
         fs::write(dir.path().join("replacement"), b"new pathname binary").unwrap();
         fs::rename(dir.path().join("replacement"), &live).unwrap();
-        assert_eq!(
-            image.verified_bytes(&cancel).unwrap().as_ref(),
-            b"old executing binary"
-        );
+        image.verify_stat().unwrap();
         assert_eq!(image.digest, startup_digest);
         assert_eq!(fs::read(&live).unwrap(), b"new pathname binary");
     }
     #[test]
-    fn pinned_executable_refuses_in_place_byte_mutation() {
+    fn pinned_executable_refuses_in_place_stat_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("native-bin");
         fs::write(&path, b"old executing binary").unwrap();
         let image =
             RunningExecutable::from_file(path.clone(), fs::File::open(&path).unwrap()).unwrap();
-        fs::write(&path, b"new executing binary").unwrap();
-        let cancel = Arc::new(AtomicBool::new(false));
+        fs::write(&path, b"new larger executable binary").unwrap();
         assert!(
-            image.verified_bytes(&cancel).is_err(),
-            "mutating the pinned inode must fail closed rather than relabel old code"
+            image.verify_stat().is_err(),
+            "changing the pinned inode must fail its stat check"
         );
     }
     #[test]
@@ -1126,7 +1142,10 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
-        assert!(Arc::ptr_eq(&admitted, &capture.executable_bytes));
+        assert!(Arc::ptr_eq(
+            &admitted,
+            capture.executable_bytes.as_ref().unwrap()
+        ));
         let digest = capture.executable_digest(&exe).unwrap().to_owned();
         assert_eq!(
             digest,
