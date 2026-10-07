@@ -175,6 +175,26 @@ impl WatchSignals {
     /// outside this root; their paths still demand a full input reconciliation.
     /// The adapter does not elect a leader or retry registration on its own.
     pub fn new(root: PathBuf, scip_path: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
+        Self::construct(root, scip_path, manifest_path, true)
+    }
+
+    /// Fixture-only ingress with no asynchronous OS backend. Synthetic events
+    /// still exercise the production channel, overflow, and acknowledgment path.
+    #[doc(hidden)]
+    pub fn synthetic_for_tests(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+    ) -> Self {
+        Self::construct(root, scip_path, manifest_path, false)
+    }
+
+    fn construct(
+        root: PathBuf,
+        scip_path: Option<PathBuf>,
+        manifest_path: Option<PathBuf>,
+        native: bool,
+    ) -> Self {
         // Preserve short bursts beyond one bounded drain without treating a
         // repeated path as lost input. Actual channel overflow still forces full.
         let (sender, receiver) = mpsc::sync_channel(MAX_DIRTY_PATHS * 4);
@@ -207,11 +227,15 @@ impl WatchSignals {
                 event,
             );
         };
-        let watcher = notify::recommended_watcher(callback).and_then(|mut watcher| {
-            watcher.watch(&root, RecursiveMode::Recursive)?;
-            Ok(watcher)
-        });
-        let degraded = watcher.is_err();
+        let watcher = native
+            .then(|| {
+                notify::recommended_watcher(callback).and_then(|mut watcher| {
+                    watcher.watch(&root, RecursiveMode::Recursive)?;
+                    Ok(watcher)
+                })
+            })
+            .and_then(Result::ok);
+        let degraded = native && watcher.is_none();
         let captured_inputs = [scip_path, manifest_path]
             .into_iter()
             .flatten()
@@ -226,7 +250,7 @@ impl WatchSignals {
         Self {
             root,
             captured_inputs,
-            watcher: watcher.ok(),
+            watcher,
             sender,
             receiver,
             generation,

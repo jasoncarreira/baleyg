@@ -1860,10 +1860,7 @@ fn watcher_bounded_callback_overflow_and_runtime_error_force_full() {
     use notify::{Event, EventKind, event::ModifyKind};
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
-    if !watcher.watching() {
-        return;
-    }
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
     for _ in 0..1025 {
@@ -1896,24 +1893,28 @@ fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
     use std::time::{Duration, Instant};
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
-    if !watcher.watching() {
-        return;
-    }
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
-    let start = Instant::now();
-    for _ in 0..257 {
-        watcher.observe_event(
-            &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("source.js")),
+    for attempt in 0..50 {
+        let start = Instant::now();
+        for _ in 0..257 {
+            watcher.observe_event(
+                &Event::new(EventKind::Modify(ModifyKind::Any))
+                    .add_path(root.path().join("source.js")),
+            );
+        }
+        let batch = watcher.drain();
+        assert!(
+            !batch.full,
+            "synthetic burst became full on iteration {attempt}: {batch:?}"
         );
+        let deadline = watcher.next_deadline().unwrap();
+        assert!(deadline <= start + Duration::from_millis(250));
+        assert!(!watcher.batch_ready_at(deadline - Duration::from_nanos(1)));
+        assert!(watcher.batch_ready_at(deadline));
+        assert!(watcher.acknowledge(&batch));
     }
-    let batch = watcher.drain();
-    assert!(!batch.full);
-    let deadline = watcher.next_deadline().unwrap();
-    assert!(deadline <= start + Duration::from_millis(250));
-    assert!(!watcher.batch_ready_at(deadline - Duration::from_nanos(1)));
-    assert!(watcher.batch_ready_at(deadline));
 }
 
 #[test]
@@ -1922,23 +1923,21 @@ fn watcher_queued_burst_on_one_path_stays_partial_until_ack() {
     use notify::{Event, EventKind, event::ModifyKind};
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
-    let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
-    if !watcher.watching() {
-        return;
-    }
+    let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
     let initial = watcher.drain();
     assert!(watcher.acknowledge(&initial));
-    for _ in 0..257 {
-        watcher
-            .submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+    for attempt in 0..50 {
+        for _ in 0..257 {
+            watcher.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(root.path().join("source.js"))));
+        }
+        let batch = watcher.drain();
+        assert!(
+            !batch.full,
+            "a queued duplicate path became full on iteration {attempt}: {batch:?}"
+        );
+        assert!(watcher.acknowledge(&batch));
     }
-    let batch = watcher.drain();
-    assert!(
-        !batch.full,
-        "a queued duplicate path is not an unknown full inventory"
-    );
-    assert!(watcher.acknowledge(&batch));
 }
 
 #[test]
