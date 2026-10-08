@@ -1010,7 +1010,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
 }
 
 #[tokio::test]
-async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
+async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
     use std::os::{
         fd::AsRawFd,
         unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -1140,7 +1140,7 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
 
     // Repair the *same persisted-option input* without POST, CLI index, restart,
     // or a new daemon. A failed first H must trigger a bounded, request-free
-    // takeover. The initial HTTP 503 above never counts as serving success.
+    // takeover. The initial HTTP 503 and a valid prior head do not prove H.
     let queue = request_db_under(&home).unwrap();
     type DurableRow = (i64, String, String, Option<String>, Option<i64>);
     let durable_rows =
@@ -1215,17 +1215,43 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
             reqwest::StatusCode::OK,
             "unexpected post-repair serving response {code}: {body:?}"
         );
+        assert_eq!(body["workspaceRoot"], old["workspaceRoot"]);
         assert_eq!(
             body["revision"]["indexGeneration"],
             old["revision"]["indexGeneration"]
         );
-        assert!(
-            body["revision"]["indexRevision"].as_u64().is_some_and(
-                |revision| revision > old["revision"]["indexRevision"].as_u64().unwrap()
+        let prior_revision = old["revision"]["indexRevision"].as_u64().unwrap();
+        match body["revision"]["indexRevision"].as_u64() {
+            Some(revision) if revision > prior_revision => break body,
+            Some(revision) if revision == prior_revision => {
+                // A repaired successor can serve the authenticated prior head
+                // before mandatory H commits. Prove a new live EX before
+                // waiting for the new pin; this 200 is not H success.
+                let marker = fs::read(&leader_lock).unwrap();
+                assert_ne!(marker, new_marker, "failed-H incarnation still serves");
+                let probe = fs::OpenOptions::new()
+                    .read(true)
+                    .open(&leader_lock)
+                    .unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0,
+                    "prior head served without successor EX"
+                );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "repaired successor never committed H: prior_pin={:?} body={body:?} rows={:?} stderr={:?}",
+                    old["revision"],
+                    durable_rows(),
+                    fs::read_to_string(&stderr_path).unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => panic!(
+                "repaired successor served wrong pin: prior={:?} body={body:?}",
+                old["revision"]
             ),
-            "daemon served stale old pin after repair: {body:?}"
-        );
-        break body;
+        }
     };
     assert_eq!(
         successor.0.id(),
@@ -1767,13 +1793,17 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
+    let daemon_log = temp.path().join("follower-daemon-stderr.log");
     let daemon = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(address.to_string())
         .arg("--token-file")
         .arg(&token)
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            fs::File::create(&daemon_log).unwrap(),
+        ))
         .spawn()
         .unwrap();
     let mut daemon = Server(daemon);
@@ -1800,10 +1830,30 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
         );
         std::thread::sleep(Duration::from_millis(10));
     };
+    let failed_claim = || -> String {
+        let Some(path) = request_db_under(&home) else {
+            return "requests.db absent".into();
+        };
+        let sql = "SELECT state,error_code,claim_incarnation FROM requests ORDER BY seq LIMIT 1";
+        let row =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|db| {
+                    db.query_row(sql, [], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                });
+        format!("{row:?}")
+    };
     assert!(
         cli_exit.success(),
-        "actual CLI failed: {}",
-        fs::read_to_string(&cli_log).unwrap()
+        "actual CLI failed: {}\nclaimed row: {}\ndaemon log: {}",
+        fs::read_to_string(&cli_log).unwrap(),
+        failed_claim(),
+        fs::read_to_string(&daemon_log).unwrap_or_else(|error| error.to_string())
     );
     let cli_result: serde_json::Value =
         serde_json::from_slice(&fs::read(&cli_output).unwrap()).unwrap();
@@ -3368,15 +3418,37 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
                 || pin["indexGeneration"].as_str() != Some(expected_generation.as_str())
                 || second_row.3.as_ref() != Some(expected_generation)
                 || browser_row.3.as_ref() != Some(expected_generation)
-                || !observed_revision.is_some_and(|revision| {
-                    revision > own_row.4.unwrap() as u64
-                        && revision > browser_row.4.unwrap() as u64
-                        && revision > second_row.4.unwrap() as u64
-                })
             {
                 unavailable_status!("stale_or_wrong_root_status_200", Some(http_status), &body);
             }
-            break status;
+            let last_acked = [
+                own_row.4.unwrap(),
+                browser_row.4.unwrap(),
+                second_row.4.unwrap(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap() as u64;
+            match observed_revision {
+                Some(revision) if revision > last_acked => break status,
+                Some(revision) if revision == last_acked => {
+                    // The successor's validated prior head is readable while
+                    // mandatory H is still in progress. Do not mistake it for
+                    // H's COMMIT or for permission to claim the queued FIFO.
+                    if Instant::now() >= deadline {
+                        unavailable_status!(
+                            "prior_head_without_h_deadline",
+                            Some(http_status),
+                            &body
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    continue;
+                }
+                _ => {
+                    unavailable_status!("stale_or_wrong_root_status_200", Some(http_status), &body)
+                }
+            }
         }
         // Both exact typed BUSY responses can be transient while the verified
         // successor writes selected status. The direct SQLite BUSY mapping says

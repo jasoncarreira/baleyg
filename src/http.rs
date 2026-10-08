@@ -425,7 +425,12 @@ impl DaemonState {
         self: &Arc<Self>,
         session: Arc<crate::store::topology::LeaderSession>,
     ) {
-        self.replace_serving_session(Some(session));
+        // Re-retention must not race an in-flight tick that sampled an old,
+        // invalid holder and would replace this verified session afterward.
+        {
+            let _stream = self.native_stream.lock().unwrap();
+            self.replace_serving_session(Some(session));
+        }
         self.start_queue_tick();
     }
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.

@@ -432,17 +432,14 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     assert_eq!(old_pin, first);
     let original = old_file.text;
     let original_hash = hex::encode(Sha256::digest(original.as_bytes()));
-    let assert_public_closed = || {
-        let status_error = store.status().unwrap_err();
-        assert!(
-            status_error.to_string().contains("index_not_ready"),
-            "{status_error:#}"
-        );
-        let source_error = store.source_at("main.js", Some(first)).unwrap_err();
-        assert!(
-            source_error.to_string().contains("index_not_ready"),
-            "{source_error:#}"
-        );
+    let assert_prior_head_served = || {
+        assert_eq!(store.status().unwrap().revision, first);
+        for selected in [Some(first), None] {
+            let (served_pin, served_source) =
+                store.source_at("main.js", selected).unwrap().unwrap();
+            assert_eq!(served_pin, first);
+            assert_eq!(served_source.text, original);
+        }
     };
     let index = index_dir(state.path()).join("index.db");
     let persisted_source = || {
@@ -507,7 +504,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     );
     cancel.store(false, Ordering::Release);
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (
@@ -534,7 +531,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         .unwrap_err();
     assert!(error.to_string().contains("drift"), "{error:#}");
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (
@@ -556,7 +553,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         "stale pair must refuse before work"
     );
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (

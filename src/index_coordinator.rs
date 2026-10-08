@@ -850,14 +850,23 @@ fn drain_requests_observed_with_cancel(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; accepted request remains running for verified reclaim"
         );
-        if outcome
-            .as_ref()
-            .is_err_and(crate::store::transient_storage_contention)
+        let capture_drift = outcome.as_ref().is_err_and(|error| {
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::capture::WorkspaceInventoryDrift>()
+                    .is_some()
+            })
+        });
+        if capture_drift
+            || outcome
+                .as_ref()
+                .is_err_and(crate::store::transient_storage_contention)
         {
-            // The failed COMMIT might be ambiguous. Authenticate both the
-            // durable terminal row and the current pin before returning the
-            // SAME seq to queued; a changed pin remains running for a fresh
-            // leader reconciliation, never an invented terminal ACK.
+            // An invalidated capture cannot publish. A failed busy COMMIT can
+            // be ambiguous. For either one, authenticate the claim and exact
+            // unchanged pin before returning the SAME seq to queued. A changed
+            // pin stays running for verified successor recovery, never an
+            // invented terminal ACK or a duplicate native publication.
             let before = match before_publish {
                 Some(pin) => pin,
                 None => store.recovery_index_baseline()?.pin(),
@@ -1350,8 +1359,64 @@ mod tests {
     }
 
     #[test]
-    fn takeover_marker_refuses_old_read_then_reconciles_before_fifo_claim() {
-        use crate::store::topology::IndexNotReady;
+    fn claimed_request_requeues_same_fifo_row_after_capture_inventory_drift() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("a.js");
+        fs::write(&source, "function before() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (prior, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        let edited = AtomicBool::new(false);
+        let first = drain_requests_observed_with_native(
+            &store,
+            &owner,
+            |id, phase| {
+                if id == request.id && phase.phase == "scan" && !edited.swap(true, Ordering::AcqRel)
+                {
+                    // Capture has the old source, but its final inventory check
+                    // must observe this edit and reject that snapshot.
+                    fs::write(&source, "function after() {}\n").unwrap();
+                }
+            },
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert!(edited.load(Ordering::Acquire));
+        assert_eq!(first, 0);
+        assert_eq!(store.status().unwrap().revision, prior);
+        let pending = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(pending.seq, request.seq);
+        assert_eq!(pending.state, "queued");
+        assert!(pending.claim_incarnation.is_none() && pending.error_code.is_none());
+        assert!(owner.is_leader() && owner.verify().is_ok());
+
+        let second =
+            drain_requests_observed_with_native(&store, &owner, |_, _| {}, |_, _, _| {}).unwrap();
+        assert_eq!(second, 1);
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.seq, request.seq);
+        assert_eq!(done.state, "done");
+        let committed = done.revision.unwrap();
+        assert_eq!(committed.index_generation, prior.index_generation);
+        assert!(committed.index_revision > prior.index_revision);
+        let response = store.evidence_response().unwrap();
+        assert_eq!(
+            response
+                .source_at("a.js", Some(committed))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function after() {}\n"
+        );
+        response.finish(()).unwrap();
+    }
+
+    #[test]
+    fn takeover_marker_serves_prior_head_then_reconciles_before_fifo_claim() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
@@ -1389,16 +1454,21 @@ mod tests {
                     0
                 );
                 let follower = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-                let error = match follower.evidence_response() {
-                    Ok(_) => panic!("predecessor evidence served after successor marker"),
-                    Err(error) => error,
-                };
-                assert!(
-                    error
-                        .chain()
-                        .any(|cause| cause.downcast_ref::<IndexNotReady>().is_some()),
-                    "post-marker old selected read must refuse: {error:#}"
+                // The selected old pin remains readable under the new synced
+                // marker, but cannot grant the still-queued request a claim.
+                let response = follower.evidence_response().unwrap();
+                assert_eq!(response.status().unwrap().revision, old_pin);
+                assert_eq!(
+                    response
+                        .source_at("a.js", Some(old_pin))
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .text,
+                    "function old() {}\n"
                 );
+                response.finish(()).unwrap();
+                assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
             }
             if phase.phase == "timing:publish" && !first_publish.swap(true, Ordering::AcqRel) {
                 assert_eq!(
@@ -2176,8 +2246,12 @@ mod tests {
         let (files, ops) = cancelled.expect("capture observed before cancel");
         assert_eq!(ops, expected(&files));
         assert_eq!(store.index_baseline().unwrap(), first);
-        let closed = store.status().unwrap_err();
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        // Cancellation before COMMIT must not close the still-valid prior head.
+        assert_eq!(store.status().unwrap().revision, first);
+        assert_eq!(
+            store.source_at("main.js", Some(first)).unwrap().unwrap().0,
+            first
+        );
     }
     #[test]
     fn reused_leader_session_is_bound_to_its_store_before_capture() {
