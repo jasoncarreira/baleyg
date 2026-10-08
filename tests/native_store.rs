@@ -54,6 +54,7 @@ fn remove_maintenance_extension_for_v8_test(path: &std::path::Path) {
          DROP INDEX native_supersessions_clock;
          DROP INDEX native_version_declarations_owner;
          DROP INDEX native_version_regions_parent;
+         DROP INDEX native_revisions_header_cover;
          DROP TABLE native_revision_supersessions;
          CREATE TABLE native_revision_supersessions(revision_id TEXT PRIMARY KEY REFERENCES native_revisions(id),superseded_at INTEGER NOT NULL CHECK(superseded_at BETWEEN 0 AND 9007199254740991));
          COMMIT; PRAGMA foreign_keys=ON;",
@@ -2119,7 +2120,7 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
         .join("index.db");
     let db = Connection::open(&path).unwrap();
     db.execute_batch(
-        "DROP INDEX native_version_declarations_owner; DROP INDEX native_version_regions_parent;",
+        "DROP INDEX native_version_declarations_owner; DROP INDEX native_version_regions_parent; DROP INDEX native_revisions_header_cover;",
     )
     .unwrap();
     drop(db);
@@ -2134,6 +2135,7 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
     for name in [
         "native_version_declarations_owner",
         "native_version_regions_parent",
+        "native_revisions_header_cover",
     ] {
         let present: i64 = db
             .query_row(

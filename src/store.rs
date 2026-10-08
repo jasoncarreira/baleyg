@@ -423,6 +423,8 @@ const RETENTION_FK_INDEX_SCHEMA_V8: &str = r#"
 CREATE INDEX native_version_declarations_owner ON native_version_declarations(version_id,owner_syntax_id);
 CREATE INDEX native_version_regions_parent ON native_version_control_regions(version_id,parent_id,owner_syntax_id);
 "#;
+// Additive v8 index: validation can read headers without loading source_inventory.
+const REVISION_HEADER_INDEX_SCHEMA_V8: &str = "CREATE INDEX native_revisions_header_cover ON native_revisions(source_set_id,published_index_revision,id);";
 
 const CACHE_SCHEMA_V8: &str = r#"
 CREATE TABLE index_metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=8), extractor_version TEXT NOT NULL CHECK(extractor_version='native-v4-delta-v1'), root_spelling TEXT NOT NULL, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, index_generation TEXT NOT NULL, index_revision INTEGER NOT NULL CHECK(index_revision BETWEEN 0 AND 9007199254740991), last_opened_at INTEGER NOT NULL CHECK(last_opened_at BETWEEN 0 AND 9007199254740991), indexed_at TEXT NOT NULL, stats TEXT NOT NULL, diagnostics TEXT NOT NULL, reconciled_incarnation TEXT, reconcile_options TEXT);
@@ -1250,6 +1252,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
     if actual == objects(&expected)? {
         return Ok(());
     }
+    expected.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
+    if actual == objects(&expected)? {
+        return Ok(());
+    }
     let without_binding = Connection::open_in_memory()?;
     without_binding.execute_batch(CACHE_SCHEMA_V8)?;
     without_binding.execute_batch(SUPERSESSION_SCHEMA_V8)?;
@@ -1261,6 +1267,10 @@ fn validate_cache_shape(db: &Connection) -> Result<()> {
         return Ok(());
     }
     without_binding.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+    if actual == objects(&without_binding)? {
+        return Ok(());
+    }
+    without_binding.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
     control_ensure!(
         actual == objects(&without_binding)?,
         "incompatible_index: unknown cache object type, name or shape"
@@ -1284,6 +1294,13 @@ fn has_revision_release_debt(db: &Connection) -> Result<bool> {
 fn has_retention_fk_indexes(db: &Connection) -> Result<bool> {
     Ok(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_version_declarations_owner')",
+        [], |r| r.get(0),
+    )?)
+}
+
+fn has_revision_header_cover(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='native_revisions_header_cover')",
         [], |r| r.get(0),
     )?)
 }
@@ -1566,6 +1583,9 @@ fn install_supersessions(db: &Connection, now: i64) -> Result<()> {
     }
     if !has_retention_fk_indexes(db)? {
         db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+    }
+    if !has_revision_header_cover(db)? {
+        db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
     }
     if missing_supersessions {
         db.execute(
@@ -3645,6 +3665,75 @@ enum PairedManifestScope {
     // Authored revisions were checked when published. Recheck the head, its newly
     // superseded predecessor, and in-flight maintenance rather than every manifest.
     Changing,
+    // Private publication preflight only. Store::open has admitted the prior
+    // history; the same publication checks the new head under its writer lock
+    // before COMMIT. Never use this scope for a public status or staged index.
+    Preflight,
+}
+
+// One header query works before and after the additive v8 index is installed.
+// Once present, SQLite reads the narrow covering index instead of wide JSON rows.
+const HEADER_SQL: &str = "SELECT count(r.id),min(r.published_index_revision),max(r.published_index_revision),
+            coalesce(sum(CASE WHEN r.id IS NULL THEN 0 WHEN r.id='pin:v1:'||m.index_generation||':'||r.published_index_revision
+              AND r.source_set_id=?1 AND r.published_index_revision BETWEEN 1 AND m.index_revision
+              THEN 0 ELSE 1 END),0),m.index_revision
+         FROM index_metadata m LEFT JOIN native_revisions r ON true WHERE m.singleton=1";
+
+fn paired_manifest_query(scope: PairedManifestScope) -> String {
+    // Full admission walks every revision. During ordinary publication the
+    // small set of mutable keys drives primary-key lookups, not a history scan.
+    let candidates = match scope {
+        PairedManifestScope::Full => "SELECT id FROM native_revisions",
+        PairedManifestScope::Preflight => unreachable!("preflight cannot validate paired manifests"),
+        PairedManifestScope::Changing => "SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1
+           UNION SELECT 'pin:v1:'||index_generation||':'||(index_revision-1) FROM index_metadata WHERE singleton=1 AND index_revision>1
+           UNION SELECT revision_id FROM native_revision_supersessions WHERE state='pending'
+           UNION SELECT revision_id FROM native_revision_release_debt",
+    };
+    format!(
+        "WITH checked_ids(id) AS MATERIALIZED ({candidates})
+             SELECT EXISTS(SELECT 1 FROM checked_ids chosen
+             CROSS JOIN index_metadata h
+             LEFT JOIN native_revisions r ON r.id=chosen.id
+             LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
+             LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
+             WHERE h.singleton=1 AND (r.id IS NULL OR
+               (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
+                    AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL
+                         OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                              != json_array_length(r.source_inventory)))
+               OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
+                    AND s.revision_id IS NULL)
+               OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
+               OR (s.state='pending' AND debt.revision_id IS NULL)
+               OR (s.state='retained' AND (debt.revision_id IS NOT NULL
+                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                      AND i.input_key IN ('__pending_release:v1','__released:v1'))
+                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                       != json_array_length(r.source_inventory)))
+               OR (s.state='pending' AND (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
+                         WHERE i.revision_id=r.id AND i.input_key='__pending_release:v1'
+                           AND i.payload='pending_release:v1')
+                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                        AND i.input_key='__released:v1')
+                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                       > json_array_length(r.source_inventory)))
+               OR (s.state='released' AND (debt.revision_id IS NOT NULL
+                    OR (SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1
+                    OR NOT EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                         AND i.input_key='__released:v1' AND i.payload='released:v1')
+                    OR EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
+               OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
+                    AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
+                          OR s.state!='pending'))
+                         OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
+                          OR s.state!='released'))))))"
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAIRED_CHECK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn validate_paired_metadata(
@@ -3652,6 +3741,8 @@ fn validate_paired_metadata(
     root_id: &str,
     scope: PairedManifestScope,
 ) -> Result<()> {
+    #[cfg(test)]
+    PAIRED_CHECK_COUNT.with(|count| count.set(count.get() + 1));
     fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
         let mut rows = db
             .prepare(sql)?
@@ -3692,16 +3783,17 @@ fn validate_paired_metadata(
             ),
         "incompatible_index: missing native pair metadata"
     );
+    // The planner uses the narrow covering index once leader startup installs it.
     let (count, first, last, mismatched, current): (i64, Option<i64>, Option<i64>, i64, i64) =
-        db.query_row(
-            "SELECT count(r.id),min(r.published_index_revision),max(r.published_index_revision),
-                coalesce(sum(CASE WHEN r.id IS NULL THEN 0 WHEN r.id='pin:v1:'||m.index_generation||':'||r.published_index_revision
-                  AND r.source_set_id=?1 AND r.published_index_revision BETWEEN 1 AND m.index_revision
-                  THEN 0 ELSE 1 END),0),m.index_revision
-             FROM index_metadata m LEFT JOIN native_revisions r ON true WHERE m.singleton=1",
-            [&expected_source],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )?;
+        db.query_row(HEADER_SQL, [&expected_source], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
     // Released revisions retain their headers and an FK-bound release marker.
     // A missing header remains corruption, never permission to skip a pin.
     control_ensure!(
@@ -3736,48 +3828,8 @@ fn validate_paired_metadata(
         // Pending retains original inputs while its manifest may be partly drained.
         // A changed predecessor has just gained its supersession row; any pending
         // debt is also mutable. Only Store admission/replacement sweeps all history.
-        let malformed: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM native_revisions r
-             CROSS JOIN index_metadata h
-             LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
-             LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
-             WHERE (?1=1 OR r.id='pin:v1:'||h.index_generation||':'||h.index_revision
-                    OR r.published_index_revision=h.index_revision-1
-                    OR s.state='pending' OR debt.revision_id IS NOT NULL)
-               AND (
-               (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
-                    AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL
-                         OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                              != json_array_length(r.source_inventory)))
-               OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
-                    AND s.revision_id IS NULL)
-               OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
-               OR (s.state='pending' AND debt.revision_id IS NULL)
-               OR (s.state='retained' AND (debt.revision_id IS NOT NULL
-                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                      AND i.input_key IN ('__pending_release:v1','__released:v1'))
-                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                       != json_array_length(r.source_inventory)))
-               OR (s.state='pending' AND (NOT EXISTS(SELECT 1 FROM revision_capture_inputs i
-                         WHERE i.revision_id=r.id AND i.input_key='__pending_release:v1'
-                           AND i.payload='pending_release:v1')
-                    OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                        AND i.input_key='__released:v1')
-                    OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
-                       > json_array_length(r.source_inventory)))
-               OR (s.state='released' AND (debt.revision_id IS NOT NULL
-                    OR (SELECT count(*) FROM revision_capture_inputs i WHERE i.revision_id=r.id)!=1
-                    OR NOT EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                         AND i.input_key='__released:v1' AND i.payload='released:v1')
-                    OR EXISTS(SELECT 1 FROM revision_documents d WHERE d.revision_id=r.id)))
-               OR EXISTS(SELECT 1 FROM revision_capture_inputs i WHERE i.revision_id=r.id
-                    AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
-                          OR s.state!='pending'))
-                         OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
-                          OR s.state!='released'))))))",
-            [scope == PairedManifestScope::Full],
-            |row| row.get(0),
-        )?;
+        let malformed_sql = paired_manifest_query(scope);
+        let malformed: bool = db.query_row(&malformed_sql, [], |row| row.get(0))?;
         control_ensure!(
             !malformed,
             "incompatible_index: retained manifest/release mismatch"
@@ -4260,7 +4312,9 @@ fn validate_bounded_control(
     )?;
     let _: IndexStats = serde_json::from_str(&stats)?;
     let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
-    validate_paired_metadata(db, root_id, scope)?;
+    if scope != PairedManifestScope::Preflight {
+        validate_paired_metadata(db, root_id, scope)?;
+    }
     validate_reconcile_inventory(db)?;
     let warnings_bytes: Option<i64> = db
         .query_row(
@@ -5190,6 +5244,7 @@ impl Store {
                 db.execute_batch(SUPERSESSION_SCHEMA_V8)?;
                 db.execute_batch(RETENTION_SCHEMA_V8)?;
                 db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+                db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
                 let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
                 ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
                 db.execute(
@@ -5874,6 +5929,10 @@ impl Store {
         self.recovery_baseline_scoped(db, PairedManifestScope::Changing)
     }
 
+    fn recovery_baseline_preflight(&self, db: &Connection) -> Result<RecoveryBaseline> {
+        self.recovery_baseline_scoped(db, PairedManifestScope::Preflight)
+    }
+
     fn recovery_baseline_full(&self, db: &Connection) -> Result<RecoveryBaseline> {
         self.recovery_baseline_scoped(db, PairedManifestScope::Full)
     }
@@ -6140,6 +6199,14 @@ impl Store {
         let tx = storage_result(db.transaction())?;
         self.recovery_baseline(&tx)
     }
+    // Only publication callers may defer retained/header checks: the selected
+    // head is verified at open and the resulting head is checked before commit.
+    pub(crate) fn publication_index_baseline(&self) -> Result<RecoveryBaseline> {
+        self.ensure_not_recreate_pending()?;
+        let mut db = self.cache()?;
+        let tx = storage_result(db.transaction())?;
+        self.recovery_baseline_preflight(&tx)
+    }
     pub fn root_id(&self) -> &str {
         &self.identity.record_id
     }
@@ -6292,9 +6359,36 @@ impl Store {
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         let db = self.cache()?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-        let (selected, marker) = self.admit_evidence_control(&db)?;
+        self.verify_metadata_root(&db)
+            .map_err(|error| self.report_live_read_failure(error))?;
+        self.ensure_public_read_ready()?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         ensure!(
-            marker == leader.incarnation && selected.revision == committed_pin,
+            schema == DATABASE_SCHEMA_VERSION,
+            "index_not_ready: mandatory leader reconciliation not committed"
+        );
+        // The writer transaction already validated the new paired head before
+        // COMMIT. Attest its exact committed pin and marker without repeating
+        // the expensive manifest/header check. Ordinary public reads still run it.
+        let selected = ReadRevision::current(&db)?;
+        let (marker, head_exists): (Option<String>, bool) = db.query_row(
+            "SELECT m.reconciled_incarnation,EXISTS(
+                 SELECT 1 FROM native_revisions r
+                 WHERE r.id='pin:v1:'||m.index_generation||':'||m.index_revision
+                   AND r.published_index_revision=m.index_revision)
+             FROM index_metadata m WHERE m.singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let marker = marker
+            .context("incompatible_index: missing reconciled incarnation")
+            .and_then(|value| {
+                uuid::Uuid::parse_str(&value)
+                    .context("incompatible_index: invalid reconciled incarnation")
+            })?;
+        ensure!(
+            head_exists && marker == leader.incarnation && selected.pin == committed_pin,
             "index_not_ready: mandatory leader reconciliation not committed"
         );
         self.identity.verify()?;
@@ -6928,7 +7022,7 @@ impl Store {
     ) -> Result<T> {
         let db = self.cache()?;
         db.execute_batch("BEGIN DEFERRED")?;
-        let baseline = self.recovery_baseline(&db)?;
+        let baseline = self.recovery_baseline_preflight(&db)?;
         ensure!(
             baseline.compatible && baseline.pin().is_some_and(|p| p.index_revision > 0),
             "incompatible_index: prior publication is not a current head"
@@ -7125,14 +7219,13 @@ impl Store {
             expected.pin() == Some(selected.pin),
             "revision conflict: final inventory selected head changed"
         );
-        let baseline = self.recovery_baseline(&db)?;
+        let baseline = self.recovery_baseline_preflight(&db)?;
         ensure!(
             baseline.compatible
                 && baseline.pin == Some(selected.pin)
                 && baseline.witness == expected.witness,
             "revision conflict: final inventory baseline changed"
         );
-        validate_paired_metadata(&db, &self.identity.record_id, PairedManifestScope::Changing)?;
         validate_reconcile_inventory(&db)?;
         if !has_revision_producer_bindings(&db)? {
             return Ok(false);
@@ -7197,7 +7290,7 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |row| row.get(0)))?;
         ensure!(
             admitted_version == after
-                && self.recovery_baseline(&db)?.witness == expected.witness
+                && self.recovery_baseline_preflight(&db)?.witness == expected.witness
                 && ReadRevision::current(&db)?.pin == selected.pin,
             "revision conflict: final inventory changed at cutoff"
         );
@@ -7238,12 +7331,11 @@ impl Store {
         // Public reads are deliberately blocked while a leader is publishing.
         // Apply their paired metadata/inventory checks in this private fenced
         // snapshot instead of calling read_status, which requires public-ready.
-        let selected_baseline = self.recovery_baseline(&db)?;
+        let selected_baseline = self.recovery_baseline_preflight(&db)?;
         ensure!(
             selected_baseline.compatible && selected_baseline.pin == Some(selected.pin),
             "incompatible_index: selected Serve head is not validated"
         );
-        validate_paired_metadata(&db, &self.identity.record_id, PairedManifestScope::Changing)?;
         validate_reconcile_inventory(&db)?;
         let class_warning_bytes: Option<i64> = db
             .query_row(
@@ -7348,7 +7440,7 @@ impl Store {
         leader.verify()?;
         self.identity.verify()?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let current = self.recovery_baseline(&tx)?;
+        let current = self.recovery_baseline_preflight(&tx)?;
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |row| row.get(0)))?;
         ensure!(
@@ -8291,7 +8383,7 @@ impl Store {
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
         let current = match target {
             PublicationTarget::Live => self
-                .recovery_baseline(&tx)
+                .recovery_baseline_preflight(&tx)
                 .map_err(|error| self.report_live_read_failure(error))?,
             PublicationTarget::Stage(_) => self.recovery_baseline(&tx)?,
         };
@@ -8390,6 +8482,9 @@ impl Store {
             }
             if !has_retention_fk_indexes(&tx)? {
                 tx.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8)?;
+            }
+            if !has_revision_header_cover(&tx)? {
+                tx.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8)?;
             }
         } else {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
@@ -11273,6 +11368,52 @@ mod selected_manifest_query_plan_tests {
     }
 
     #[test]
+    fn header_and_changing_manifest_plan_avoid_wide_revision_scans() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V8).unwrap();
+        db.execute_batch(SUPERSESSION_SCHEMA_V8).unwrap();
+        db.execute_batch(RETENTION_SCHEMA_V8).unwrap();
+        db.execute_batch(RETENTION_FK_INDEX_SCHEMA_V8).unwrap();
+        db.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+            .unwrap();
+        // Existing v8 shapes remain accepted before the leader's additive upgrade.
+        validate_cache_shape(&db).unwrap();
+        db.execute_batch(REVISION_HEADER_INDEX_SCHEMA_V8).unwrap();
+        validate_cache_shape(&db).unwrap();
+        let header: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {HEADER_SQL}"))
+            .unwrap()
+            .query_map(["source-set:v1:test"], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            header
+                .iter()
+                .any(|step| step
+                    .contains("SCAN r USING COVERING INDEX native_revisions_header_cover")),
+            "header check must not load retained JSON: {header:?}"
+        );
+        let changing = paired_manifest_query(PairedManifestScope::Changing);
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {changing}"))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH r USING INDEX ") && step.contains("(id=?)")),
+            "changing manifest must lookup each revision key: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN r")),
+            "changing manifest scanned all revision headers: {plan:?}"
+        );
+    }
+
+    #[test]
     fn hot_pair_check_skips_stable_history_but_admission_checks_it() {
         use crate::index_coordinator::IndexJobCoordinator;
         use crate::indexer::IndexOptions;
@@ -11287,18 +11428,22 @@ mod selected_manifest_query_plan_tests {
         fs::write(&source, "class A { int run() { return 1; } }\n").unwrap();
         let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
         let session = first_job.session();
+        PAIRED_CHECK_COUNT.with(|count| count.set(0));
         let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+        assert_eq!(PAIRED_CHECK_COUNT.with(|count| count.get()), 1);
         fs::write(&source, "class A { int run() { return 2; } }\n").unwrap();
         let second =
             IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
                 .unwrap()
                 .run(&options, &cancel, |_| {})
                 .unwrap();
+        assert_eq!(PAIRED_CHECK_COUNT.with(|count| count.get()), 2);
         fs::write(&source, "class A { int run() { return 3; } }\n").unwrap();
         let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session)
             .unwrap()
             .run(&options, &cancel, |_| {})
             .unwrap();
+        assert_eq!(PAIRED_CHECK_COUNT.with(|count| count.get()), 3);
         assert_eq!(third.index_revision, first.index_revision + 2);
         let first_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
         let third_key = format!("pin:v1:{}:{}", third.index_generation, third.index_revision);

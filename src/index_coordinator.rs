@@ -104,7 +104,7 @@ impl IndexJobCoordinator {
                 publication.waited_for().as_micros()
             ),
         );
-        let expected = store.recovery_index_baseline()?;
+        let expected = store.publication_index_baseline()?;
         ensure!(
             requested.is_none_or(|pin| expected.pin() == Some(pin)),
             "revision conflict: prior index pin is not decodable or changed"
@@ -130,7 +130,7 @@ impl IndexJobCoordinator {
                 publication.waited_for().as_micros()
             ),
         );
-        let expected = store.recovery_index_baseline()?;
+        let expected = store.publication_index_baseline()?;
         Self::prepare_with_admitted_publication(store, requested, expected, session, publication)
     }
 
@@ -600,7 +600,7 @@ impl LeaderWork {
                 Ok(())
             };
             cutoff()?;
-            let baseline = store.recovery_index_baseline()?;
+            let baseline = store.publication_index_baseline()?;
             let unchanged = store.selected_capture_unchanged(
                 &captured,
                 session.leader_guard()?,
@@ -1262,7 +1262,7 @@ pub fn establish_serving_session(
                     publication.waited_for().as_micros()
                 ),
             );
-            let expected = store.recovery_index_baseline()?;
+            let expected = store.publication_index_baseline()?;
             let options = match explicit_options {
                 Some(options) => options.clone(),
                 None => store.recorded_index_options()?.unwrap_or_else(|| {
