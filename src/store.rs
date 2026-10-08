@@ -546,10 +546,34 @@ pub struct EvidenceResponse {
     db: IndexConnection,
     fence: ReadFence,
 }
+/// The idle permit's checkout witness contains no retained directory handle.
+#[derive(Clone)]
+struct PreHRootIdentity {
+    root: std::path::PathBuf,
+    record_id: String,
+    device: u64,
+    inode: u64,
+}
+impl PreHRootIdentity {
+    fn from_identity(identity: &topology::WorkspaceIdentity) -> Self {
+        Self {
+            root: identity.root.clone(),
+            record_id: identity.record_id.clone(),
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+    fn matches(&self, identity: &topology::WorkspaceIdentity) -> bool {
+        self.root == identity.root
+            && self.record_id == identity.record_id
+            && (self.device, self.inode) == (identity.device, identity.inode)
+    }
+}
+
 /// The transitional fence does not grant the Store's reconciled-leader claim authority.
 #[derive(Clone)]
 pub struct PreHReadPermit {
-    identity: Arc<topology::WorkspaceIdentity>,
+    identity: PreHRootIdentity,
     pin: IndexPin,
     predecessor: uuid::Uuid,
     epoch: Arc<AtomicU64>,
@@ -574,9 +598,7 @@ impl ReadFence {
                 if permit.epoch.load(Ordering::Acquire) != permit.captured_epoch {
                     return Err(topology::IndexNotReady::new("checkout epoch changed").into());
                 }
-                if permit.identity.root != store.identity.root
-                    || permit.identity.device != store.identity.device
-                    || permit.identity.inode != store.identity.inode
+                if !permit.identity.matches(&store.identity)
                     || session.incarnation() == permit.predecessor
                 {
                     return Err(
@@ -6631,9 +6653,7 @@ impl Store {
     ) -> Result<Arc<topology::LeaderSession>> {
         self.ensure_not_recreate_pending()?;
         self.identity.verify()?;
-        if self.identity.root != permit.identity.root
-            || self.identity.device != permit.identity.device
-            || self.identity.inode != permit.identity.inode
+        if !permit.identity.matches(&self.identity)
             || self.disposition() != RecoveryDisposition::Ready
         {
             return Err(topology::IndexNotReady::new("pre-H checkout unavailable").into());
@@ -6679,7 +6699,7 @@ impl Store {
             return Err(topology::IndexNotReady::new("checkout epoch changed").into());
         }
         Ok(PreHReadPermit {
-            identity: self.identity.clone(),
+            identity: PreHRootIdentity::from_identity(&self.identity),
             pin: status.revision,
             predecessor: *predecessor,
             epoch,

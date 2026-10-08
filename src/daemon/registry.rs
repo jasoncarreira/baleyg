@@ -1,5 +1,15 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
-use crate::store::topology::WorkspaceIdentity;
+use crate::store::{
+    PreHReadPermit, Store,
+    topology::{LeaderSession, TopologyRoots, WorkspaceIdentity},
+};
+use crate::{
+    http,
+    index_coordinator::{IndexJobCoordinator, establish_serving_session},
+    indexer::IndexOptions,
+    model::CancelFlag,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -48,8 +58,43 @@ impl SelectionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckoutOptions(pub serde_json::Value);
 
+#[derive(Clone)]
+struct CheckoutMetadata {
+    root: PathBuf,
+    root_key: String,
+    record_id: String,
+    device: u64,
+    inode: u64,
+}
+impl CheckoutMetadata {
+    fn from_identity(identity: &WorkspaceIdentity) -> Self {
+        Self {
+            root: identity.root.clone(),
+            root_key: identity.root_key.clone(),
+            record_id: identity.record_id.clone(),
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+    fn matches(&self, identity: &WorkspaceIdentity) -> bool {
+        self.root == identity.root
+            && self.root_key == identity.root_key
+            && self.record_id == identity.record_id
+            && (self.device, self.inode) == (identity.device, identity.inode)
+    }
+    fn rediscover(&self) -> anyhow::Result<WorkspaceIdentity> {
+        let identity = WorkspaceIdentity::discover_unattached(Some(&self.root), &self.root)?
+            .attach_existing_marker_readonly()?;
+        anyhow::ensure!(
+            self.matches(&identity),
+            "root_changed: checkout identity changed"
+        );
+        Ok(identity)
+    }
+}
+
 struct Entry {
-    identity: Arc<WorkspaceIdentity>,
+    identity: CheckoutMetadata,
     registration: Option<CheckoutOptions>,
     sessions: HashSet<u64>,
     released: bool,
@@ -59,11 +104,125 @@ struct Entry {
 #[derive(Default)]
 pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
+    roots: Option<TopologyRoots>,
+    runtimes: HashMap<String, Arc<CheckoutRuntime>>,
+    idle_permits: HashMap<String, PreHReadPermit>,
+    idle_epochs: HashMap<String, Arc<AtomicU64>>,
 }
 
 impl CheckoutRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Supply isolated roots in fixtures. The default uses the user's normal
+    /// topology only when a checkout is actually activated.
+    pub fn with_roots(roots: TopologyRoots) -> Self {
+        Self {
+            roots: Some(roots),
+            ..Self::default()
+        }
+    }
+
+    /// Activate an already attached checkout. Registration and global discovery
+    /// never call this method and therefore never open SQLite or acquire locks.
+    pub fn activate(&mut self, key: &str) -> anyhow::Result<Arc<CheckoutRuntime>> {
+        anyhow::ensure!(
+            tokio::runtime::Handle::try_current().is_ok(),
+            "checkout activation requires a Tokio runtime"
+        );
+        let entry = self
+            .entries
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("checkout not attached"))?;
+        anyhow::ensure!(
+            !entry.released && !entry.sessions.is_empty(),
+            "checkout not attached"
+        );
+        if let Some(runtime) = self.runtimes.get(key) {
+            return Ok(runtime.clone());
+        }
+        let identity = entry.identity.rediscover()?;
+        let roots = match &self.roots {
+            Some(roots) => roots.clone(),
+            None => TopologyRoots::production()?,
+        };
+        let store = Store::open(roots, identity)?;
+        let options = IndexOptions::new(entry.identity.root.clone());
+        // The HTTP state is a per-checkout native stream scheduler. The random
+        // internal token and placeholder address are never bound or exposed;
+        // browser provisioning owns the real listener and its configured token.
+        let scheduler = http::new(
+            store.clone(),
+            options.clone(),
+            format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            "127.0.0.1:1".parse()?,
+        )?;
+        let permit = self.idle_permits.remove(key);
+        let epoch = self
+            .idle_epochs
+            .remove(key)
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
+        let runtime = Arc::new(CheckoutRuntime {
+            resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources { store, scheduler }))),
+            epoch,
+            phase: std::sync::Mutex::new(RuntimePhase::Reconciling),
+            active: AtomicBool::new(true),
+            active_reads: Arc::new(AtomicUsize::new(0)),
+            last_error: std::sync::Mutex::new(None),
+            h_in_flight: AtomicBool::new(true),
+            pre_h_hook: std::sync::Mutex::new(None),
+        });
+        self.runtimes.insert(key.to_owned(), runtime.clone());
+        runtime.start(options, permit);
+        Ok(runtime)
+    }
+
+    pub fn runtime(&self, key: &str) -> Option<Arc<CheckoutRuntime>> {
+        self.runtimes.get(key).cloned()
+    }
+
+    /// The lifecycle owner calls this only after the idle deadline. A failed
+    /// queue probe is busy, never evidence that it is safe to release a leader.
+    fn release_runtime(&mut self, key: &str) -> anyhow::Result<bool> {
+        let Some(runtime) = self.runtimes.get(key).cloned() else {
+            return Ok(true);
+        };
+        let resources = runtime.resources()?;
+        if runtime.h_in_flight.load(Ordering::Acquire)
+            || runtime.catching_up()
+            || runtime.active_reads.load(Ordering::Acquire) != 0
+            || CheckoutRuntime::queue_pending(&resources)
+        {
+            return Ok(false);
+        }
+        let mut phase = runtime.phase.lock().unwrap();
+        CheckoutRuntime::refresh_phase(&mut phase, &resources);
+        if runtime.h_in_flight.load(Ordering::Acquire)
+            || matches!(*phase, RuntimePhase::Transitional(_, _))
+            || runtime.active_reads.load(Ordering::Acquire) != 0
+        {
+            return Ok(false);
+        }
+        runtime.epoch.fetch_add(1, Ordering::AcqRel);
+        let permit = runtime.release_permit(&phase, &resources)?;
+        runtime.active.store(false, Ordering::Release);
+        resources.scheduler.release_checkout_runtime();
+        *phase = RuntimePhase::Reconciling;
+        runtime.resources.lock().unwrap().take();
+        drop(phase);
+        drop(resources);
+        self.runtimes.remove(key);
+        if let Some(permit) = permit {
+            self.idle_epochs
+                .insert(key.to_owned(), runtime.epoch.clone());
+            self.idle_permits.insert(key.to_owned(), permit);
+        }
+        Ok(true)
     }
 
     pub fn known_roots(&self) -> Vec<(String, PathBuf)> {
@@ -98,10 +257,9 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         let key = &identity.root_key;
         if let Some(entry) = self.entries.get_mut(key) {
-            entry
-                .identity
-                .verify_readonly()
-                .map_err(|_| SelectionError::IdentityChanged)?;
+            if !entry.identity.matches(identity) {
+                return Err(SelectionError::IdentityChanged);
+            }
             if entry.registration.as_ref() == Some(&options) {
                 return Ok(());
             }
@@ -114,11 +272,7 @@ impl CheckoutRegistry {
         self.entries.insert(
             key.clone(),
             Entry {
-                identity: Arc::new(
-                    identity
-                        .verified_clone()
-                        .map_err(|_| SelectionError::IdentityChanged)?,
-                ),
+                identity: CheckoutMetadata::from_identity(identity),
                 registration: Some(options),
                 sessions: HashSet::new(),
                 released: true,
@@ -206,17 +360,43 @@ impl CheckoutRegistry {
         Ok(())
     }
 
-    /// Release is a separate lifecycle decision, never implied by disconnect.
-    /// The runtime calls this only after the idle delay and resource cleanup.
-    pub fn release(&mut self, key: &str) -> Result<bool, SelectionError> {
-        let entry = self
-            .entries
+    /// Probe only already-active checkouts. A failed queue probe remains busy;
+    /// never activate an inert registered checkout to refresh pending work.
+    pub fn refresh_pending_work(&mut self, key: &str) -> Result<bool, SelectionError> {
+        let pending = match self.runtimes.get(key) {
+            Some(runtime) => {
+                runtime.catching_up() || runtime.active_reads.load(Ordering::Acquire) != 0
+            }
+            None => {
+                return Ok(self
+                    .entries
+                    .get(key)
+                    .ok_or(SelectionError::Unavailable)?
+                    .pending_work);
+            }
+        };
+        self.entries
             .get_mut(key)
-            .ok_or(SelectionError::Unavailable)?;
+            .ok_or(SelectionError::Unavailable)?
+            .pending_work = pending;
+        Ok(pending)
+    }
+
+    /// Release is a separate lifecycle decision, never implied by disconnect.
+    /// The lifecycle owner calls this only after the idle delay.
+    pub fn release(&mut self, key: &str) -> Result<bool, SelectionError> {
+        self.refresh_pending_work(key)?;
+        let entry = self.entries.get(key).ok_or(SelectionError::Unavailable)?;
         if !entry.sessions.is_empty() || entry.pending_work {
             return Ok(false);
         }
-        entry.released = true;
+        if !self
+            .release_runtime(key)
+            .map_err(|_| SelectionError::Unavailable)?
+        {
+            return Ok(false);
+        }
+        self.entries.get_mut(key).unwrap().released = true;
         Ok(true)
     }
 
@@ -227,21 +407,20 @@ impl CheckoutRegistry {
     ) -> Result<Arc<WorkspaceIdentity>, SelectionError> {
         let at_capacity = self.active_count() >= MAX_ACTIVE_CHECKOUTS;
         if let Some(entry) = self.entries.get_mut(&identity.root_key) {
-            entry
-                .identity
-                .verify_readonly()
-                .map_err(|_| SelectionError::IdentityChanged)?;
-            if (entry.identity.device, entry.identity.inode) != (identity.device, identity.inode)
-                || entry.identity.record_id != identity.record_id
-            {
+            if !entry.identity.matches(identity) {
                 return Err(SelectionError::IdentityChanged);
             }
             if entry.released && at_capacity {
                 return Err(SelectionError::CheckoutCapacity);
             }
+            let checked = Arc::new(
+                identity
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            );
             entry.sessions.insert(session);
             entry.released = false;
-            return Ok(Arc::clone(&entry.identity));
+            return Ok(checked);
         }
         if at_capacity {
             return Err(SelectionError::CheckoutCapacity);
@@ -254,7 +433,7 @@ impl CheckoutRegistry {
         self.entries.insert(
             identity.root_key.clone(),
             Entry {
-                identity: Arc::clone(&identity),
+                identity: CheckoutMetadata::from_identity(&identity),
                 registration: None,
                 sessions: HashSet::from([session]),
                 released: false,
@@ -275,7 +454,7 @@ impl CheckoutRegistry {
 /// A selected result must pass this fence immediately before its answer is sent.
 /// Keeping the captured launch identity prevents later calls from silently
 /// treating a changed repository as the original launch repository.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectedCheckout {
     pub identity: Arc<WorkspaceIdentity>,
     launch: Arc<WorkspaceIdentity>,
@@ -309,6 +488,345 @@ impl std::ops::Deref for SelectedCheckout {
     type Target = WorkspaceIdentity;
     fn deref(&self) -> &Self::Target {
         &self.identity
+    }
+}
+
+/// Keeps a selected immutable snapshot alive through final workspace and
+/// revision checks; idle release cannot drop its owner before this guard drops.
+pub struct CheckoutEvidence {
+    response: crate::store::EvidenceResponse,
+    reads: Arc<AtomicUsize>,
+    selection: Option<SelectedCheckout>,
+}
+impl CheckoutEvidence {
+    pub fn finish<T>(&self, value: T) -> anyhow::Result<T> {
+        if let Some(selected) = &self.selection {
+            selected
+                .before_answer()
+                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+        }
+        let result = self.response.finish(value)?;
+        if let Some(selected) = &self.selection {
+            selected
+                .before_answer()
+                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+        }
+        Ok(result)
+    }
+}
+impl std::ops::Deref for CheckoutEvidence {
+    type Target = crate::store::EvidenceResponse;
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+impl Drop for CheckoutEvidence {
+    fn drop(&mut self) {
+        self.reads.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Resources are removed from the slot on release, even if a client retains
+/// the inert CheckoutRuntime handle after disconnect.
+struct ActiveResources {
+    store: Store,
+    scheduler: Arc<http::DaemonState>,
+}
+
+/// One activated checkout has its own native stream and no process-global leader.
+/// A failed H retains no claim authority; the worker retries while attached.
+pub struct CheckoutRuntime {
+    resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
+    epoch: Arc<AtomicU64>,
+    phase: std::sync::Mutex<RuntimePhase>,
+    active: AtomicBool,
+    active_reads: Arc<AtomicUsize>,
+    last_error: std::sync::Mutex<Option<String>>,
+    h_in_flight: AtomicBool,
+    pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+enum RuntimePhase {
+    Reconciling,
+    Transitional(PreHReadPermit, Arc<LeaderSession>),
+    Ready(Arc<LeaderSession>),
+}
+
+impl CheckoutRuntime {
+    fn resources(&self) -> anyhow::Result<Arc<ActiveResources>> {
+        self.resources
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout released"))
+    }
+
+    /// A retained runtime handle cannot keep the released Store or watcher alive.
+    pub fn has_active_resources(&self) -> bool {
+        self.resources.lock().unwrap().is_some()
+    }
+
+    /// Reconcile a captured phase with the scheduler's current *verified*
+    /// serving owner. A stale follower cannot describe an in-progress takeover
+    /// as ready; the new leader appears only after mandatory H commits.
+    fn refresh_phase(phase: &mut RuntimePhase, resources: &ActiveResources) {
+        if matches!(phase, RuntimePhase::Transitional(_, _)) {
+            return;
+        }
+        match resources.scheduler.checkout_serving_owner() {
+            Some(owner) => {
+                if !matches!(phase, RuntimePhase::Ready(previous) if Arc::ptr_eq(previous, &owner))
+                {
+                    *phase = RuntimePhase::Ready(owner);
+                }
+            }
+            None => *phase = RuntimePhase::Reconciling,
+        }
+    }
+
+    fn queue_pending(resources: &ActiveResources) -> bool {
+        if resources.scheduler.checkout_root_loss_retired() {
+            !matches!(resources.store.old_root_unfinished_request(), Ok(None))
+        } else {
+            !matches!(resources.store.earliest_unfinished_request(), Ok(None))
+        }
+    }
+
+    pub fn is_follower(&self) -> bool {
+        let Ok(resources) = self.resources() else {
+            return false;
+        };
+        let mut phase = self.phase.lock().unwrap();
+        Self::refresh_phase(&mut phase, &resources);
+        matches!(&*phase, RuntimePhase::Ready(session) if !session.is_leader())
+    }
+
+    #[doc(hidden)]
+    pub fn set_pre_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.pre_h_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[doc(hidden)]
+    pub fn set_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(resources) = self.resources() {
+            resources
+                .scheduler
+                .set_checkout_takeover_h_hook_for_tests(hook);
+        }
+    }
+
+    pub fn reconciliation_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
+
+    pub fn catching_up(&self) -> bool {
+        let Ok(resources) = self.resources() else {
+            return true;
+        };
+        let mut phase = self.phase.lock().unwrap();
+        Self::refresh_phase(&mut phase, &resources);
+        if self.h_in_flight.load(Ordering::Acquire) {
+            return true;
+        }
+        if resources.scheduler.checkout_root_loss_retired() {
+            return Self::queue_pending(&resources);
+        }
+        !matches!(*phase, RuntimePhase::Ready(_))
+            || resources.scheduler.checkout_watch_pending()
+            || Self::queue_pending(&resources)
+    }
+
+    /// Snapshot freshness and the read basis are sampled under the same phase
+    /// lock. The Store's own finish fence then validates the admitted revision.
+    pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
+        let mut phase = self.phase.lock().unwrap();
+        anyhow::ensure!(
+            self.active.load(Ordering::Acquire),
+            "index_not_ready: checkout released"
+        );
+        let resources = self.resources()?;
+        Self::refresh_phase(&mut phase, &resources);
+        let catching_up = self.h_in_flight.load(Ordering::Acquire)
+            || !matches!(*phase, RuntimePhase::Ready(_))
+            || resources.scheduler.checkout_watch_pending()
+            || Self::queue_pending(&resources);
+        let response = match &*phase {
+            RuntimePhase::Transitional(permit, leader) => resources
+                .store
+                .evidence_response_pre_h(permit, leader.clone())?,
+            RuntimePhase::Reconciling | RuntimePhase::Ready(_) => {
+                resources.store.evidence_response()?
+            }
+        };
+        self.active_reads.fetch_add(1, Ordering::AcqRel);
+        Ok((
+            CheckoutEvidence {
+                response,
+                reads: self.active_reads.clone(),
+                selection: None,
+            },
+            catching_up,
+        ))
+    }
+
+    pub fn evidence_for_selected(
+        &self,
+        selected: &SelectedCheckout,
+    ) -> anyhow::Result<(CheckoutEvidence, bool)> {
+        selected
+            .before_answer()
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        let (mut response, catching_up) = self.evidence_response()?;
+        selected
+            .before_answer()
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        response.selection = Some(selected.clone());
+        Ok((response, catching_up))
+    }
+
+    fn release_permit(
+        &self,
+        phase: &RuntimePhase,
+        resources: &ActiveResources,
+    ) -> anyhow::Result<Option<PreHReadPermit>> {
+        let RuntimePhase::Ready(session) = phase else {
+            return Ok(None);
+        };
+        if !session.is_leader() {
+            return Ok(None);
+        }
+        let response = resources.store.evidence_response()?;
+        Ok(Some(resources.store.pre_h_read_permit(
+            &response,
+            session,
+            self.epoch.clone(),
+        )?))
+    }
+
+    fn start(self: &Arc<Self>, options: IndexOptions, permit: Option<PreHReadPermit>) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let worker = runtime.clone();
+                let options = options.clone();
+                let permit = permit.clone();
+                let outcome =
+                    tokio::task::spawn_blocking(move || worker.reconcile(&options, permit)).await;
+                match outcome {
+                    Ok(Ok(session)) => {
+                        // Reconciliation cannot settle after release: release
+                        // requires the phase to be Ready, set only here.
+                        if let Ok(resources) = runtime.resources() {
+                            resources.scheduler.retain_serving_session(session.clone());
+                        } else {
+                            break;
+                        }
+                        *runtime.phase.lock().unwrap() = RuntimePhase::Ready(session);
+                        *runtime.last_error.lock().unwrap() = None;
+                        runtime.h_in_flight.store(false, Ordering::Release);
+                        break;
+                    }
+                    result => {
+                        {
+                            let mut failure = runtime.last_error.lock().unwrap();
+                            if failure.is_none() {
+                                *failure = Some(match result {
+                                    Ok(Err(error)) => format!("{error:#}"),
+                                    Err(error) => error.to_string(),
+                                    _ => unreachable!(),
+                                });
+                            }
+                        }
+                        if runtime.retire_lost_root_h() {
+                            runtime.h_in_flight.store(false, Ordering::Release);
+                            break;
+                        }
+                        // A transient H failure keeps the same elected owner and
+                        // valid predecessor permit for the next guarded attempt.
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Finish old-root durable work while the elected H owner is still held.
+    /// On an inconclusive queue write keep that owner and retry; never call an
+    /// empty ordinary old-root probe proof of completion.
+    fn retire_lost_root_h(&self) -> bool {
+        let Ok(resources) = self.resources() else {
+            return false;
+        };
+        if !resources.store.root_path_replaced().is_ok_and(|lost| lost) {
+            return false;
+        }
+        let mut phase = self.phase.lock().unwrap();
+        match &*phase {
+            RuntimePhase::Transitional(_, session) => {
+                if resources.store.fail_changed_root_requests(session).is_err() {
+                    return false;
+                }
+            }
+            _ if !matches!(resources.store.old_root_unfinished_request(), Ok(None)) => {
+                return false;
+            }
+            _ => {}
+        }
+        *phase = RuntimePhase::Reconciling;
+        true
+    }
+
+    fn reconcile(
+        &self,
+        options: &IndexOptions,
+        permit: Option<PreHReadPermit>,
+    ) -> anyhow::Result<Arc<LeaderSession>> {
+        let resources = self.resources()?;
+        let store = &resources.store;
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        if let Some(permit) = permit {
+            let retained = match &*self.phase.lock().unwrap() {
+                RuntimePhase::Transitional(_, session) if session.verify().is_ok() => {
+                    Some(session.clone())
+                }
+                _ => None,
+            };
+            match retained
+                .map(Ok)
+                .unwrap_or_else(|| store.leader_for_idle_reattach(&permit))
+            {
+                Ok(session) => {
+                    *self.phase.lock().unwrap() =
+                        RuntimePhase::Transitional(permit, session.clone());
+                    if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
+                        hook();
+                    }
+                    store
+                        .fail_changed_root_requests(&session)
+                        .map_err(|e| anyhow::anyhow!("pre-H root requests: {e:#}"))?;
+                    let selected = store
+                        .recorded_index_options()?
+                        .unwrap_or_else(|| options.clone());
+                    IndexJobCoordinator::prepare_with_session(store, None, session.clone())
+                        .map_err(|e| anyhow::anyhow!("pre-H preparation: {e:#}"))?
+                        .run_serving(&selected, &cancel, |_| {})
+                        .map_err(|e| anyhow::anyhow!("pre-H publication: {e:#}"))?;
+                    session.verify()?;
+                    return Ok(session);
+                }
+                Err(error) if crate::store::transient_storage_contention(&error) => {
+                    // An external standalone owner wins. Never try the stale
+                    // permit as a follower or claim its queued requests.
+                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
+                    return store.follower_session();
+                }
+                Err(_) => {
+                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
+                }
+            }
+        }
+        establish_serving_session(store, Some(options), &cancel)
     }
 }
 

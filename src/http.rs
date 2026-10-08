@@ -227,6 +227,8 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
+    checkout_runtime_stopped: AtomicBool,
+    checkout_takeover_h_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     maintenance_tick_started: AtomicBool,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
@@ -237,6 +239,7 @@ pub struct DaemonState {
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
+    maintenance_stream: Mutex<()>,
     leader_work: Mutex<
         Option<(
             std::sync::Weak<crate::store::topology::LeaderSession>,
@@ -390,6 +393,8 @@ pub fn new_with_dependency_options(
         acp,
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
+        checkout_runtime_stopped: AtomicBool::new(false),
+        checkout_takeover_h_hook: Mutex::new(None),
         maintenance_tick_started: AtomicBool::new(false),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
@@ -400,6 +405,7 @@ pub fn new_with_dependency_options(
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
+        maintenance_stream: Mutex::new(()),
         leader_work: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         empty_takeover_retry: AtomicBool::new(false),
@@ -433,6 +439,61 @@ impl DaemonState {
         }
         self.start_queue_tick();
     }
+    /// Stop the native stream before idle release; no queue worker may keep
+    /// the old leader or watcher alive after this returns.
+    pub fn release_checkout_runtime(&self) {
+        self.checkout_runtime_stopped.store(true, Ordering::Release);
+        let _stream = self.native_stream.lock().unwrap();
+        let _maintenance = self.maintenance_stream.lock().unwrap();
+        self.replace_serving_session(None);
+        *self.root_loss_session.lock().unwrap() = None;
+    }
+
+    /// A verified owner is available only after its H has committed, or as an
+    /// independently verified follower. A stale follower during takeover is not
+    /// a ready checkout even if its old Arc remains in the runtime.
+    pub fn checkout_serving_owner(&self) -> Option<Arc<crate::store::topology::LeaderSession>> {
+        let owner = self.serving_session.lock().unwrap().clone()?;
+        owner.verify().ok()?;
+        Some(owner)
+    }
+
+    pub fn checkout_root_loss_retired(&self) -> bool {
+        self.store.root_path_replaced().is_ok_and(|lost| lost)
+            && self.serving_session.lock().unwrap().is_none()
+            && self.root_loss_session.lock().unwrap().is_none()
+    }
+
+    /// Deterministically pause a takeover after election but before mandatory H.
+    #[doc(hidden)]
+    pub fn set_checkout_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.checkout_takeover_h_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// A pending watcher hint (including the periodic inventory deadline) keeps
+    /// the selected checkout in the catching-up state until its tick acknowledges it.
+    pub fn checkout_watch_pending(&self) -> bool {
+        let pending = {
+            let work = self.leader_work.lock().unwrap();
+            work.as_ref().map(|(_, scheduler)| {
+                let options = self
+                    .store
+                    .recorded_index_options()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| self.options.clone());
+                scheduler.accepted_watch_intent(&options)
+            })
+        };
+        pending.unwrap_or_else(|| {
+            self.serving_session
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|session| session.is_leader())
+        })
+    }
+
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
     #[doc(hidden)]
@@ -737,6 +798,13 @@ impl DaemonState {
     }
 
     fn maintenance_tick(&self) -> anyhow::Result<()> {
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _lane = self.maintenance_stream.lock().unwrap();
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         use crate::store::MaintenanceOutcome;
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
@@ -887,9 +955,15 @@ impl DaemonState {
     }
 
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.native_stream.lock().unwrap();
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(test)]
         self.test_queue_after_stream.run();
         // The old pathname must not reach a queue probe, recovery attempt or
@@ -1233,6 +1307,9 @@ impl DaemonState {
                             session.clone(),
                         )?;
                     let before = self.store.index_baseline()?;
+                    if let Some(hook) = self.checkout_takeover_h_hook.lock().unwrap().take() {
+                        hook();
+                    }
                     if let Err(error) = coordinator.run(
                         &takeover_options,
                         &Arc::new(AtomicBool::new(false)),
