@@ -4325,10 +4325,19 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(owner);
+        state.retain_serving_session_without_tick_for_tests(owner);
         let accepted = store.enqueue_request(&options, None).unwrap();
         store.fail_next_live_publish_commit_busy();
+        let retry_started = Instant::now();
         state.queue_tick().unwrap();
+        let retry_finished = Instant::now();
+        let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
+        assert!(
+            scheduled_retry.is_some_and(|when| {
+                when >= retry_started && when <= retry_finished + Duration::from_millis(250)
+            }),
+            "BUSY requeue must schedule its bounded 250ms retry"
+        );
         let deferred = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (deferred.seq, deferred.state.as_str()),
@@ -4336,13 +4345,8 @@ mod serving_holder_tests {
         );
         assert!(deferred.finished_at.is_none() && deferred.error_code.is_none());
         assert_eq!(store.index_baseline().unwrap(), old_pin);
-        assert!(
-            state
-                .recovery_retry_after
-                .lock()
-                .unwrap()
-                .is_some_and(|when| when > Instant::now())
-        );
+        *state.recovery_retry_after.lock().unwrap() =
+            Some(Instant::now() + Duration::from_secs(10));
         state.queue_tick().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
