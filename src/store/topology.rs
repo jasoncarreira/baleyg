@@ -674,6 +674,53 @@ impl WorkspaceIdentity {
         }
         Ok(())
     }
+    /// Resolve the common Git directory without creating any managed storage.
+    /// Both the held root and its pathname must still designate this checkout.
+    pub fn git_common_dir(&self) -> Result<PathBuf> {
+        self.verify_readonly()?;
+        ensure!(
+            self.git_dir.is_some(),
+            "not_checkout: missing Git directory"
+        );
+        let mut child = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let mut output = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .context("missing Git output")?
+            .take(4097)
+            .read_to_end(&mut output);
+        if read.is_err() || output.len() > 4096 {
+            let _ = child.kill();
+            let _ = child.wait();
+            read?;
+            bail!("unavailable: Git common directory exceeds path limit");
+        }
+        ensure!(
+            child.wait()?.success(),
+            "not_checkout: Git common directory unavailable"
+        );
+        let text = std::str::from_utf8(&output)?.trim_end_matches('\n');
+        ensure!(
+            !text.contains(['\r', '\n', '\0']),
+            "invalid Git common directory"
+        );
+        let path = PathBuf::from(text);
+        ensure!(path.is_absolute(), "invalid Git common directory");
+        let path = fs::canonicalize(path)?;
+        ensure!(metadata(&path)?.is_dir(), "invalid Git common directory");
+        self.verify_readonly()?;
+        Ok(path)
+    }
     pub fn git_dir(&self) -> Option<&Path> {
         self.git_dir.as_deref()
     }
