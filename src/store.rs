@@ -544,20 +544,84 @@ impl ReadRevision {
 pub struct EvidenceResponse {
     store: Store,
     db: IndexConnection,
-    follower: topology::FollowerGuard,
-    marker: uuid::Uuid,
+    fence: ReadFence,
+}
+/// The transitional fence does not grant the Store's reconciled-leader claim authority.
+#[derive(Clone)]
+pub struct PreHReadPermit {
+    identity: Arc<topology::WorkspaceIdentity>,
+    pin: IndexPin,
+    predecessor: uuid::Uuid,
+    epoch: Arc<AtomicU64>,
+    captured_epoch: u64,
+}
+enum ReadFence {
+    Current(topology::FollowerGuard, uuid::Uuid),
+    PreH {
+        session: Arc<topology::LeaderSession>,
+        permit: PreHReadPermit,
+    },
+}
+impl ReadFence {
+    fn verify(&self, store: &Store, db: Option<&Connection>) -> Result<()> {
+        store.identity.verify()?;
+        match self {
+            Self::Current(follower, marker) => follower.verify(*marker),
+            Self::PreH { session, permit } => {
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
+                if permit.epoch.load(Ordering::Acquire) != permit.captured_epoch {
+                    return Err(topology::IndexNotReady::new("checkout epoch changed").into());
+                }
+                if permit.identity.root != store.identity.root
+                    || permit.identity.device != store.identity.device
+                    || permit.identity.inode != store.identity.inode
+                    || session.incarnation() == permit.predecessor
+                {
+                    return Err(
+                        topology::IndexNotReady::new("pre-H root or leader mismatch").into(),
+                    );
+                }
+                session.leader_guard()?.verify().map_err(|error| {
+                    anyhow::anyhow!("store_unavailable: pre-H leader lock unavailable: {error:#}")
+                })?;
+                session.verify()?;
+                if let Some(db) = db {
+                    store.verify_pre_h_snapshot(db, permit).map_err(|error| {
+                        if store.disposition() != RecoveryDisposition::Ready {
+                            anyhow::anyhow!(
+                                "store_unavailable: pre-H index recovery pending: {error:#}"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
+                }
+                store.identity.verify()?;
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
+                Ok(())
+            }
+        }
+    }
 }
 impl EvidenceResponse {
     pub fn finish<T>(&self, value: T) -> Result<T> {
-        self.store.identity.verify()?;
-        self.follower.verify(self.marker)?;
+        self.fence.verify(&self.store, Some(&self.db))?;
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.store.read_status(&self.db)
+        self.store
+            .read_status_for(&self.db, matches!(self.fence, ReadFence::PreH { .. }))
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
-        self.store.read_revision(&self.db, Some(pin))?;
+        self.store.read_revision_for(
+            &self.db,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
         Ok(())
     }
     pub fn source_at(
@@ -565,7 +629,11 @@ impl EvidenceResponse {
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let selected = self.store.read_revision(&self.db, expected)?;
+        let selected = self.store.read_revision_for(
+            &self.db,
+            expected,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
         let source = self
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
@@ -581,22 +649,33 @@ impl EvidenceResponse {
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
         query.validate()?;
-        self.store.query_view_in(&self.db, query, None)
+        self.store.query_view_in_for(
+            &self.db,
+            query,
+            None,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
     }
-    /// Release the SQLite snapshot before slow response assembly or provider work.
-    /// The follower guard retains protected use and the snapshot's incarnation.
+    /// Ordinary reads release the snapshot before slow response assembly.
+    /// A transitional exact-pin fence retains its predecessor snapshot; T03
+    /// releases it after materialization so H may commit before finish.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
-        let Self {
-            store,
-            db,
-            follower,
-            marker,
-        } = self;
-        drop(db);
+        let Self { store, db, fence } = self;
+        let pre_h_snapshot_valid =
+            !matches!(fence, ReadFence::PreH { .. }) || fence.verify(&store, Some(&db)).is_ok();
+        let snapshot = if matches!(fence, ReadFence::PreH { .. })
+            && matches!(policy, EvidenceFencePolicy::ExactPin(_))
+        {
+            Some(db)
+        } else {
+            drop(db);
+            None
+        };
         EvidenceFence {
             store,
-            follower,
-            marker,
+            fence,
+            snapshot,
+            pre_h_snapshot_valid,
             policy,
         }
     }
@@ -609,21 +688,30 @@ pub enum EvidenceFencePolicy {
 }
 pub struct EvidenceFence {
     store: Store,
-    follower: topology::FollowerGuard,
-    marker: uuid::Uuid,
+    fence: ReadFence,
+    snapshot: Option<IndexConnection>,
+    pre_h_snapshot_valid: bool,
     policy: EvidenceFencePolicy,
 }
 impl EvidenceFence {
     pub fn finish<T>(&self, value: T) -> Result<T> {
-        self.store.identity.verify()?;
-        self.follower.verify(self.marker)?;
+        self.fence.verify(&self.store, self.snapshot.as_deref())?;
+        if !self.pre_h_snapshot_valid {
+            return Err(topology::IndexNotReady::new(
+                "pre-H snapshot changed during materialization",
+            )
+            .into());
+        }
         if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
-            self.store.with_evidence(|db| {
-                self.store.read_revision(db, Some(pin))?;
-                Ok(())
-            })?;
-            self.store.identity.verify()?;
-            self.follower.verify(self.marker)?;
+            if let Some(db) = &self.snapshot {
+                self.store.read_revision_for(db, Some(pin), true)?;
+            } else {
+                self.store.with_evidence(|db| {
+                    self.store.read_revision(db, Some(pin))?;
+                    Ok(())
+                })?;
+            }
+            self.fence.verify(&self.store, self.snapshot.as_deref())?;
         }
         Ok(value)
     }
@@ -6164,7 +6252,17 @@ impl Store {
     }
 
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        let status = self.read_public_control_status(db)?;
+        self.read_status_for(db, false)
+    }
+    fn read_status_for(&self, db: &Connection, pre_h: bool) -> Result<IndexStatus> {
+        let status = if pre_h {
+            self.verify_metadata_root(db)
+                .map_err(|error| self.report_live_read_failure(error))?;
+            self.decode_control_status_raw(db)
+                .map_err(|error| self.report_live_read_failure(error))?
+        } else {
+            self.read_public_control_status(db)?
+        };
         if status.evidence_format.is_none() {
             let schema: i64 =
                 storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
@@ -6525,6 +6623,141 @@ impl Store {
         self.identity.verify()?;
         follower.verify(marker)
     }
+    /// Reacquire without rewriting the predecessor metadata: mandatory H owns
+    /// the next marker publication. The permit never supplies claim authority.
+    pub fn leader_for_idle_reattach(
+        &self,
+        permit: &PreHReadPermit,
+    ) -> Result<Arc<topology::LeaderSession>> {
+        self.ensure_not_recreate_pending()?;
+        self.identity.verify()?;
+        if self.identity.root != permit.identity.root
+            || self.identity.device != permit.identity.device
+            || self.identity.inode != permit.identity.inode
+            || self.disposition() != RecoveryDisposition::Ready
+        {
+            return Err(topology::IndexNotReady::new("pre-H checkout unavailable").into());
+        }
+        let guard = self.roots.leader(&self.identity)?;
+        if guard.predecessor_incarnation != Some(permit.predecessor) {
+            return Err(topology::IndexNotReady::new("intervening leader").into());
+        }
+        self.recovery_required.store(true, Ordering::Release);
+        Ok(Arc::new(topology::LeaderSession::leader(
+            guard,
+            self.identity.clone(),
+        )))
+    }
+
+    /// Mint only from a normally admitted, finished complete head before idle release.
+    pub fn pre_h_read_permit(
+        &self,
+        response: &EvidenceResponse,
+        session: &topology::LeaderSession,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<PreHReadPermit> {
+        self.verify_reconciled_leader_claim(session)?;
+        let ReadFence::Current(_, predecessor) = &response.fence else {
+            return Err(topology::IndexNotReady::new("cannot mint from transitional read").into());
+        };
+        if response.store.identity.root != self.identity.root
+            || response.store.identity.device != self.identity.device
+            || response.store.identity.inode != self.identity.inode
+        {
+            return Err(topology::IndexNotReady::new("different checkout").into());
+        }
+        if *predecessor != session.incarnation() {
+            return Err(topology::IndexNotReady::new("not the reconciled checkout leader").into());
+        }
+        let captured_epoch = epoch.load(Ordering::Acquire);
+        let status = response.status()?;
+        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
+            return Err(topology::IndexNotReady::new("complete head required").into());
+        }
+        response.finish(())?;
+        if epoch.load(Ordering::Acquire) != captured_epoch {
+            return Err(topology::IndexNotReady::new("checkout epoch changed").into());
+        }
+        Ok(PreHReadPermit {
+            identity: self.identity.clone(),
+            pin: status.revision,
+            predecessor: *predecessor,
+            epoch,
+            captured_epoch,
+        })
+    }
+
+    fn verify_pre_h_snapshot(&self, db: &Connection, permit: &PreHReadPermit) -> Result<()> {
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))
+            .map_err(|error| {
+                if self.disposition() != RecoveryDisposition::Ready {
+                    anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+                } else {
+                    error
+                }
+            })?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Err(topology::IndexNotReady::new("pre-H schema changed").into());
+        }
+        let status = self.read_status_for(db, true)?;
+        let marker: Option<String> = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error.into())))?;
+        if status.revision != permit.pin
+            || status.evidence_format.is_none()
+            || marker.as_deref() != Some(permit.predecessor.to_string().as_str())
+        {
+            return Err(topology::IndexNotReady::new("pre-H predecessor changed").into());
+        }
+        Ok(())
+    }
+
+    /// Explicit transitional admission. Ordinary evidence_response stays strict.
+    pub fn evidence_response_pre_h(
+        &self,
+        permit: &PreHReadPermit,
+        session: Arc<topology::LeaderSession>,
+    ) -> Result<EvidenceResponse> {
+        self.ensure_not_recreate_pending()?;
+        if self.disposition() != RecoveryDisposition::Ready {
+            return Err(topology::IndexNotReady::new("recovery pending").into());
+        }
+        let guard = session.leader_guard()?;
+        if guard.predecessor_incarnation != Some(permit.predecessor) {
+            return Err(topology::IndexNotReady::new("intervening leader").into());
+        }
+        let fence = ReadFence::PreH {
+            session,
+            permit: permit.clone(),
+        };
+        fence.verify(self, None)?;
+        let db = self.cache().map_err(|error| {
+            let error = self.report_live_read_failure(error);
+            if self.disposition() != RecoveryDisposition::Ready {
+                anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+            } else {
+                error
+            }
+        })?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        fence.verify(self, Some(&db))?;
+        if self.disposition() != RecoveryDisposition::Ready {
+            return Err(topology::IndexNotReady::new("recovery pending").into());
+        }
+        Ok(EvidenceResponse {
+            store: self.clone(),
+            db,
+            fence,
+        })
+    }
+
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.ensure_not_recreate_pending()?;
         let db = self
@@ -6537,8 +6770,7 @@ impl Store {
         Ok(EvidenceResponse {
             store: self.clone(),
             db,
-            follower,
-            marker,
+            fence: ReadFence::Current(follower, marker),
         })
     }
     fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -8776,7 +9008,15 @@ impl Store {
     /// consumers. Only typed UUID/integer pin components enter these SQL literals;
     /// the caller never supplies SQL or a raw revision key.
     fn read_revision(&self, db: &Connection, expected: Option<IndexPin>) -> Result<ReadRevision> {
-        let head = self.read_status(db)?.revision;
+        self.read_revision_for(db, expected, false)
+    }
+    fn read_revision_for(
+        &self,
+        db: &Connection,
+        expected: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<ReadRevision> {
+        let head = self.read_status_for(db, pre_h)?.revision;
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation
@@ -10936,7 +11176,16 @@ impl Store {
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
     ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision(tx, expected_pin.copied())?;
+        self.query_view_in_for(tx, query, expected_pin, false)
+    }
+    fn query_view_in_for(
+        &self,
+        tx: &Connection,
+        query: &ViewQuery,
+        expected_pin: Option<&IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<ViewResult>> {
+        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_h)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
             .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {

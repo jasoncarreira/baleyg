@@ -334,6 +334,7 @@ impl TopologyRoots {
         }
         let mut file = file.context("leader lock pathname changed repeatedly")?;
         use_guard.verify()?;
+        let predecessor_incarnation = read_incarnation(&file).ok();
         before_write()?;
         let incarnation = Uuid::new_v4();
         file.seek(SeekFrom::Start(0))?;
@@ -346,6 +347,7 @@ impl TopologyRoots {
             file,
             path,
             incarnation,
+            predecessor_incarnation,
         })
     }
     pub fn follower(&self, identity: Arc<WorkspaceIdentity>) -> Result<FollowerGuard> {
@@ -1053,6 +1055,8 @@ pub struct LeaderGuard {
     file: File,
     path: PathBuf,
     pub incarnation: Uuid,
+    /// Sampled only while holding the newly acquired exclusive flock.
+    pub predecessor_incarnation: Option<Uuid>,
 }
 fn read_incarnation(file: &File) -> Result<Uuid> {
     // A cloned File shares its cursor with the held lock descriptor. Concurrent
