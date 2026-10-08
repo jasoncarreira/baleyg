@@ -171,19 +171,28 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::IdentityChanged);
         }
-        let selected = self.attach(session, &identity)?;
+        // Complete all fallible membership checks before reserving a session slot.
+        // A failed selection must not attach or consume capacity.
         let witness = SelectedCheckout {
             launch: Arc::new(
                 launch
                     .verified_clone()
                     .map_err(|_| SelectionError::IdentityChanged)?,
             ),
-            identity: selected,
+            identity: Arc::new(
+                identity
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
             launch_common,
             selected_common,
         };
         witness.before_answer()?;
-        Ok(witness)
+        let selected = self.attach(session, &identity)?;
+        Ok(SelectedCheckout {
+            identity: selected,
+            ..witness
+        })
     }
 
     /// Mark a known checkout busy even without an attached client. The runtime
@@ -281,10 +290,8 @@ impl SelectedCheckout {
         self.identity
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity(&self.launch).map_err(|_| SelectionError::IdentityChanged)?
-            != self.launch_common
-            || common_identity(&self.identity).map_err(|_| SelectionError::IdentityChanged)?
-                != self.selected_common
+        if common_identity(&self.launch)? != self.launch_common
+            || common_identity(&self.identity)? != self.selected_common
             || self.launch_common != self.selected_common
         {
             return Err(SelectionError::IdentityChanged);

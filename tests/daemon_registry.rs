@@ -100,6 +100,16 @@ fn selection_does_not_follow_symlinks_or_admit_other_repositories() {
         SelectionError::NotCheckout
     );
     assert_eq!(registry.active_count(), 0);
+    // A failed selection does not attach the rejected worktree or consume a slot.
+    registry.attach_launch(1, &launch_id).unwrap();
+    assert_eq!(
+        registry.select(1, &launch_id, &other).unwrap_err(),
+        SelectionError::DifferentRepository
+    );
+    assert_eq!(registry.active_count(), 1);
+    assert_eq!(registry.known_roots().len(), 1);
+    registry.disconnect(1);
+    assert_eq!(registry.active_count(), 1); // release is a separate decision
 }
 
 #[test]
@@ -231,6 +241,19 @@ fn linked_worktree_witness_refuses_common_directory_drift() {
         witness.before_answer().unwrap_err(),
         SelectionError::IdentityChanged
     );
+    fs::write(git_dir.join("commondir"), "missing-common-dir\n").unwrap();
+    let error = witness.before_answer().unwrap_err();
+    assert_eq!(error, SelectionError::Unavailable);
+    assert_eq!(error.reason(), "unavailable");
+    assert!(error.retryable());
+    registry.disconnect(1);
+    assert!(registry.release(&witness.root_key).unwrap());
+    registry.attach_launch(2, &launch_id).unwrap();
+    let failed = registry.select(2, &launch_id, &selected).unwrap_err();
+    assert_eq!(failed, SelectionError::Unavailable);
+    // Failed admission neither attaches this checkout nor consumes another slot.
+    assert_eq!(registry.active_count(), 1);
+    assert_eq!(registry.known_roots().len(), 2);
 }
 
 #[test]
@@ -259,4 +282,33 @@ fn stalled_git_common_directory_lookup_is_bounded() {
         "{error}"
     );
     assert!(start.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn inherited_stdout_does_not_extend_git_deadline() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("checkout");
+    fs::create_dir(&root).unwrap();
+    git(&["init", "-q"], &root);
+    let identity = identity(&root);
+    let script = base.join("wrapper-git");
+    // The wrapper is killed while its ordinary child still has stdout open.
+    fs::write(&script, "#!/bin/sh\n/bin/sleep 2 &\nwait\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let error = identity
+        .git_common_dir_with_executable(&script)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unavailable: Git common-directory lookup timed out"),
+        "{error}"
+    );
+    assert!(start.elapsed() < Duration::from_millis(1500));
 }

@@ -713,8 +713,9 @@ impl WorkspaceIdentity {
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // The killed Git child closes its pipe; the reader can now finish.
-                let _ = reader.join();
+                // A shell wrapper's descendant can still hold the inherited pipe.
+                // Drop the join handle: its bounded reader exits when that pipe closes.
+                drop(reader);
                 bail!("unavailable: Git common-directory lookup timed out");
             }
         };
