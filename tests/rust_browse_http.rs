@@ -195,3 +195,94 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     assert_eq!(retained["revision"], json!(pin));
     assert!(!sentinel.exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edits() {
+    use baleyg::index_coordinator;
+    use std::time::{Duration, Instant};
+
+    struct StopLoad(Arc<AtomicBool>);
+    impl Drop for StopLoad {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(&source, "pub fn value() -> i32 { -1 }\n").unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session);
+    let app = http::router(state);
+    let load_stop = StopLoad(Arc::new(AtomicBool::new(false)));
+    let mut load_thread = None;
+    for edit in 0..50 {
+        if edit == 25 {
+            let stop = load_stop.0.clone();
+            load_thread = Some(std::thread::spawn(move || {
+                let mut value = 1_u64;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    for _ in 0..2_000 {
+                        value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    }
+                    std::hint::black_box(value);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        let previous = store.status().unwrap().revision;
+        let text = format!("pub fn value() -> i32 {{ {edit} }}\n");
+        std::fs::write(&source, &text).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
+            assert_eq!(status_code, 200, "edit {edit}: {status}");
+            let (pin_code, pinned) = request(
+                &app,
+                "GET",
+                &format!(
+                    "/api/source?path=lib.rs&indexGeneration={}&indexRevision={}",
+                    previous.index_generation, previous.index_revision
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                pin_code, 200,
+                "edit {edit}, previous {previous:?}: {pinned}"
+            );
+            let (current_code, current) =
+                request(&app, "GET", "/api/source?path=lib.rs", Value::Null).await;
+            assert_eq!(current_code, 200, "edit {edit}: {current}");
+            if status["revision"]["indexRevision"]
+                .as_u64()
+                .is_some_and(|revision| revision > previous.index_revision)
+                && current["file"]["text"] == text
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "edit {edit} was not published: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    load_stop
+        .0
+        .store(true, std::sync::atomic::Ordering::Release);
+    load_thread.unwrap().join().unwrap();
+}

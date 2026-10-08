@@ -3368,15 +3368,37 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
                 || pin["indexGeneration"].as_str() != Some(expected_generation.as_str())
                 || second_row.3.as_ref() != Some(expected_generation)
                 || browser_row.3.as_ref() != Some(expected_generation)
-                || !observed_revision.is_some_and(|revision| {
-                    revision > own_row.4.unwrap() as u64
-                        && revision > browser_row.4.unwrap() as u64
-                        && revision > second_row.4.unwrap() as u64
-                })
             {
                 unavailable_status!("stale_or_wrong_root_status_200", Some(http_status), &body);
             }
-            break status;
+            let last_acked = [
+                own_row.4.unwrap(),
+                browser_row.4.unwrap(),
+                second_row.4.unwrap(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap() as u64;
+            match observed_revision {
+                Some(revision) if revision > last_acked => break status,
+                Some(revision) if revision == last_acked => {
+                    // The successor's validated prior head is readable while
+                    // mandatory H is still in progress. Do not mistake it for
+                    // H's COMMIT or for permission to claim the queued FIFO.
+                    if Instant::now() >= deadline {
+                        unavailable_status!(
+                            "prior_head_without_h_deadline",
+                            Some(http_status),
+                            &body
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    continue;
+                }
+                _ => {
+                    unavailable_status!("stale_or_wrong_root_status_200", Some(http_status), &body)
+                }
+            }
         }
         // Both exact typed BUSY responses can be transient while the verified
         // successor writes selected status. The direct SQLite BUSY mapping says

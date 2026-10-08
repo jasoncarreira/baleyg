@@ -1350,8 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn takeover_marker_refuses_old_read_then_reconciles_before_fifo_claim() {
-        use crate::store::topology::IndexNotReady;
+    fn takeover_marker_serves_prior_head_then_reconciles_before_fifo_claim() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("a.js"), "function old() {}\n").unwrap();
@@ -1389,16 +1388,21 @@ mod tests {
                     0
                 );
                 let follower = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-                let error = match follower.evidence_response() {
-                    Ok(_) => panic!("predecessor evidence served after successor marker"),
-                    Err(error) => error,
-                };
-                assert!(
-                    error
-                        .chain()
-                        .any(|cause| cause.downcast_ref::<IndexNotReady>().is_some()),
-                    "post-marker old selected read must refuse: {error:#}"
+                // The selected old pin remains readable under the new synced
+                // marker, but cannot grant the still-queued request a claim.
+                let response = follower.evidence_response().unwrap();
+                assert_eq!(response.status().unwrap().revision, old_pin);
+                assert_eq!(
+                    response
+                        .source_at("a.js", Some(old_pin))
+                        .unwrap()
+                        .unwrap()
+                        .1
+                        .text,
+                    "function old() {}\n"
                 );
+                response.finish(()).unwrap();
+                assert_eq!(store.current_request().unwrap().unwrap().state, "queued");
             }
             if phase.phase == "timing:publish" && !first_publish.swap(true, Ordering::AcqRel) {
                 assert_eq!(
@@ -2176,8 +2180,12 @@ mod tests {
         let (files, ops) = cancelled.expect("capture observed before cancel");
         assert_eq!(ops, expected(&files));
         assert_eq!(store.index_baseline().unwrap(), first);
-        let closed = store.status().unwrap_err();
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        // Cancellation before COMMIT must not close the still-valid prior head.
+        assert_eq!(store.status().unwrap().revision, first);
+        assert_eq!(
+            store.source_at("main.js", Some(first)).unwrap().unwrap().0,
+            first
+        );
     }
     #[test]
     fn reused_leader_session_is_bound_to_its_store_before_capture() {

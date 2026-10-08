@@ -3970,8 +3970,8 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     assert_eq!(deferred["id"], id);
     assert!(deferred["revision"].is_null(), "{deferred}");
     // The writer is still held. Neither the native pair nor the graph may
-    // change, and neither Status nor pinned source/packet may serve a false
-    // success from the failed publication attempt.
+    // change. The selected prior pin remains readable, while the job cannot
+    // report success from its failed publication attempt.
     let (generation, revision): (String, i64) = rusqlite::Connection::open(real_index_db(&home))
         .unwrap()
         .query_row(
@@ -4004,8 +4004,8 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         None,
     )
     .await;
-    assert_eq!(code, 503, "{current}");
-    assert_eq!(current["error"]["code"], "index_not_ready");
+    assert_eq!(code, 200, "{current}");
+    assert_eq!(current["revision"], pin);
     let (code, source_after) = real_api(
         &client,
         &url,
@@ -4015,8 +4015,8 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         None,
     )
     .await;
-    assert_eq!(code, 503, "{source_after}");
-    assert_eq!(source_after["error"]["code"], "index_not_ready");
+    assert_eq!(code, 200, "{source_after}");
+    assert_eq!(source_after, _source_before);
     let (code, packet_after) = real_api(
         &client,
         &url,
@@ -4026,8 +4026,8 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         None,
     )
     .await;
-    assert_eq!(code, 503, "{packet_after}");
-    assert_eq!(packet_after["error"]["code"], "index_not_ready");
+    assert_eq!(code, 200, "{packet_after}");
+    assert_eq!(packet_after, _packet_before);
     drop(writer); // Rolls back the external writer lock; the same accepted ACK now retries.
     let completed = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
@@ -4285,7 +4285,10 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
                         [],
                         |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
                     )
-                    .is_ok_and(|(reconciled, revision)| reconciled && revision == 1);
+                    // H may already be followed by the claimed FIFO result
+                    // before this 10 ms probe. Either committed head proves
+                    // publication while the stdout pipe still holds the child.
+                    .is_ok_and(|(reconciled, revision)| reconciled && revision >= 1);
                 drop(db);
                 // In this repository's enforced DELETE mode, removing the
                 // rollback journal is the commit point, after database sync.

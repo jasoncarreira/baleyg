@@ -1642,13 +1642,16 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
     drop(store);
     let cold = Store::open_for_tests(state.path(), root.path()).unwrap();
     let cold_leader = cold.leader().unwrap();
-    // Taking over the leader lock requires paired publication before public
-    // reads, even when the retained rows are intact after the crash window.
+    // The validated prior head and surviving retained pin remain readable
+    // before takeover publication; the released exact pin remains expired.
+    assert_eq!(cold.status().unwrap().revision, r3);
+    assert_eq!(cold.native_source_at(r2, &key).unwrap().unwrap(), source2);
+    assert!(cold.native_source_at(r3, &key).unwrap().is_none());
     assert!(
-        cold.status()
+        cold.native_source_at(r1, &key)
             .unwrap_err()
             .to_string()
-            .contains("reconciliation required")
+            .contains("pin_expired")
     );
 
     let identity =

@@ -5696,29 +5696,43 @@ impl Store {
             storage_result(db.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         before_write(&db)?;
         let tx = storage_result(db.transaction_with_behavior(TransactionBehavior::Immediate))?;
-        let compatible = self
+        let baseline = self
             .recovery_baseline(&tx)
-            .map_err(|error| self.report_live_read_failure(error))?
-            .compatible;
+            .map_err(|error| self.report_live_read_failure(error))?;
+        let prior_readable =
+            baseline.compatible && baseline.pin.is_some_and(|pin| pin.index_revision > 0);
         let locked_version: i64 =
             storage_result(tx.pragma_query_value(None, "data_version", |r| r.get(0)))?;
         ensure!(
             locked_version == admitted_version,
             "incompatible_index: cache changed after admission"
         );
-        if compatible {
+        if baseline.compatible {
             install_supersessions(&tx, self.retention_time()?.as_secs() as i64)?;
             let age = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             ensure!(age <= 9_007_199_254_740_991, "invalid_open_age");
-            storage_result(tx.execute(
-                "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
-                [age as i64],
-            ))?;
+            if prior_readable {
+                // Bind the validated published head to the newly synced lock
+                // incarnation for readers. This is not the mandatory H proof:
+                // claims still require a post-publication reconciled_leader.
+                storage_result(tx.execute(
+                    "UPDATE index_metadata SET last_opened_at=?1,reconciled_incarnation=?2 WHERE singleton=1",
+                    rusqlite::params![age as i64, leader.incarnation.to_string()],
+                ))?;
+            } else {
+                storage_result(tx.execute(
+                    "UPDATE index_metadata SET last_opened_at=?1 WHERE singleton=1",
+                    [age as i64],
+                ))?;
+            }
         }
         storage_result(tx.commit())?;
         drop(db);
         leader.verify()?;
         self.identity.verify()?;
+        if prior_readable && self.disposition() == RecoveryDisposition::Ready {
+            self.recovery_required.store(false, Ordering::Release);
+        }
         Ok(leader)
     }
     fn cache(&self) -> Result<IndexConnection> {
@@ -6456,9 +6470,11 @@ impl Store {
         ))
     }
     pub(crate) fn begin_leader_publication(&self, session: &topology::LeaderSession) -> Result<()> {
-        self.verify_leader_session(session)?;
-        self.recovery_required.store(true, Ordering::Release);
-        Ok(())
+        // A routine capture does not invalidate the committed head. Public
+        // readers keep their own selected snapshot while the writer prepares
+        // the next revision; only actual recovery closes that read path.
+        // Claim authority still requires the separate reconciled-leader proof.
+        self.verify_leader_session(session)
     }
     pub fn follower_session(&self) -> Result<Arc<topology::LeaderSession>> {
         let db = self
@@ -11410,6 +11426,173 @@ mod selected_manifest_query_plan_tests {
         assert!(
             !plan.iter().any(|step| step.starts_with("SCAN r")),
             "changing manifest scanned all revision headers: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn new_leader_serves_valid_prior_head_through_mandatory_reconciliation() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(
+            work.path().join("A.java"),
+            "class A { int run() { return 1; } }\n",
+        )
+        .unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let pin = job
+            .run(
+                &IndexOptions::new(work.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let new_session = reopened.leader_session().unwrap();
+        let before_h = reopened.status();
+        let pinned = reopened.source_at("A.java", Some(pin));
+        assert!(
+            reopened
+                .verify_reconciled_leader_claim(&new_session)
+                .is_err(),
+            "read admission must not mint mandatory H claim authority"
+        );
+        assert_eq!(before_h.unwrap().revision, pin);
+        assert_eq!(pinned.unwrap().unwrap().0, pin);
+        assert_eq!(reopened.source_at("A.java", None).unwrap().unwrap().0, pin);
+
+        fs::write(
+            work.path().join("A.java"),
+            "class A { int run() { return 2; } }\n",
+        )
+        .unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let signal = abort.clone();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        reopened.set_publication_before_commit_hook_for_tests(move || {
+            arrived_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            signal.store(true, Ordering::Release);
+        });
+        let h =
+            IndexJobCoordinator::prepare_with_session(&reopened, Some(pin), new_session.clone())
+                .unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let worker = std::thread::spawn(move || h.run(&options, &abort, |_| {}));
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("mandatory H did not reach the writer-transaction barrier");
+        let during = reopened.status();
+        let pinned_during = reopened.source_at("A.java", Some(pin));
+        let unpinned_during = reopened.source_at("A.java", None);
+        let premature_claim = reopened.verify_reconciled_leader_claim(&new_session);
+        release_tx.send(()).unwrap();
+        let failed = worker.join().unwrap().unwrap_err();
+        assert!(failed.to_string().contains("cancelled"), "{failed:#}");
+        assert_eq!(during.unwrap().revision, pin);
+        assert_eq!(pinned_during.unwrap().unwrap().0, pin);
+        assert_eq!(unpinned_during.unwrap().unwrap().0, pin);
+        assert!(premature_claim.is_err(), "H cannot claim before COMMIT");
+        assert_eq!(reopened.status().unwrap().revision, pin);
+        assert_eq!(reopened.source_at("A.java", None).unwrap().unwrap().0, pin);
+        assert!(
+            reopened
+                .verify_reconciled_leader_claim(&new_session)
+                .is_err()
+        );
+
+        // Only a successful retry may select the new head and mint claim proof.
+        let next =
+            IndexJobCoordinator::prepare_with_session(&reopened, Some(pin), new_session.clone())
+                .unwrap()
+                .run(
+                    &IndexOptions::new(work.path().to_owned()),
+                    &Arc::new(AtomicBool::new(false)),
+                    |_| {},
+                )
+                .unwrap();
+        assert!(next.index_revision > pin.index_revision);
+        reopened
+            .verify_reconciled_leader_claim(&new_session)
+            .unwrap();
+        assert_eq!(reopened.status().unwrap().revision, next);
+        assert_eq!(
+            reopened.source_at("A.java", Some(pin)).unwrap().unwrap().0,
+            pin
+        );
+        assert_eq!(
+            reopened.source_at("A.java", None).unwrap().unwrap().1.text,
+            "class A { int run() { return 2; } }\n"
+        );
+    }
+
+    #[test]
+    fn routine_publication_keeps_prior_pinned_and_unpinned_reads_available() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("A.java");
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        fs::write(&source, "class A { int run() { return 1; } }\n").unwrap();
+        let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = first_job.session();
+        let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+        fs::write(&source, "class A { int run() { return 2; } }\n").unwrap();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store.set_publication_before_commit_hook_for_tests(move || {
+            arrived_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let job = IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+            .unwrap();
+        let publisher = std::thread::spawn(move || job.run(&options, &cancel, |_| {}));
+        arrived_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("publication did not reach the writer-transaction barrier");
+        let during_status = store.status();
+        let during_pinned = store.source_at("A.java", Some(first));
+        let during_unpinned = store.source_at("A.java", None);
+        release_tx.send(()).unwrap();
+        let next = publisher.join().unwrap().unwrap();
+        assert_eq!(next.index_revision, first.index_revision + 1);
+        assert_eq!(during_status.unwrap().revision, first);
+        assert_eq!(during_pinned.unwrap().unwrap().0, first);
+        assert_eq!(during_unpinned.unwrap().unwrap().0, first);
+        assert_eq!(store.status().unwrap().revision, next);
+        assert_eq!(
+            store.source_at("A.java", Some(first)).unwrap().unwrap().0,
+            first
+        );
+        // A failed publication must leave the last committed head available.
+        fs::write(&source, "class A { int run() { return 3; } }\n").unwrap();
+        let abort = Arc::new(AtomicBool::new(false));
+        let signal = abort.clone();
+        store.set_publication_before_commit_hook_for_tests(move || {
+            signal.store(true, Ordering::Release);
+        });
+        let failure =
+            IndexJobCoordinator::prepare_with_session(&store, Some(next), session.clone())
+                .unwrap()
+                .run(&IndexOptions::new(work.path().to_owned()), &abort, |_| {})
+                .unwrap_err();
+        assert!(failure.to_string().contains("cancelled"), "{failure:#}");
+        assert_eq!(store.status().unwrap().revision, next);
+        assert_eq!(store.source_at("A.java", None).unwrap().unwrap().0, next);
+        assert_eq!(
+            store.source_at("A.java", Some(first)).unwrap().unwrap().0,
+            first
         );
     }
 
