@@ -1,5 +1,8 @@
 //! Queue rows are durable independently of the native index and only the held leader may claim.
-use baleyg::{indexer::IndexOptions, store::Store};
+use baleyg::{
+    indexer::IndexOptions,
+    store::{MaintenanceQueueState, QueueProbeAdmission, Store},
+};
 use std::fs;
 
 #[test]
@@ -85,7 +88,13 @@ fn durable_fifo_and_incarnation_fence() {
     assert!(b.seq > a.seq);
     assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
     assert!(store.request_by_id(&a.id).unwrap().is_some());
-    let owner = store.leader_session().unwrap();
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     let first = store.claim_request(&owner).unwrap().unwrap();
     assert_eq!(first.id, a.id);
     assert_eq!(first.state, "running");
@@ -123,7 +132,15 @@ fn published_pin_before_completion_crash_child() {
     let proof = std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
-    let owner = store.leader_session().unwrap();
+    // The parent's committed H belongs to its old incarnation. This child
+    // must commit its own H before it may claim the durable running gap.
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     let claimed = store.claim_request(&owner).unwrap().unwrap();
     assert_eq!(claimed.state, "running");
     let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -334,7 +351,10 @@ fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes()
         .unwrap();
     cli.join().unwrap();
     assert_eq!(old.request_by_id(&ack.id).unwrap().unwrap().state, "done");
-    assert_eq!(pin.index_revision, 1, "recreated generation first pin");
+    assert_eq!(
+        pin.index_revision, 2,
+        "recreation and explicit claim need separate publications"
+    );
 }
 
 #[test]
@@ -362,7 +382,7 @@ fn request_rejects_symlink_to_captured_workspace() {
 }
 
 #[test]
-fn first_cli_takeover_capture_satisfies_fifo_head_once() {
+fn first_cli_takeover_reconciles_then_claims_fifo_head() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function seed() {}\n").unwrap();
@@ -371,7 +391,10 @@ fn first_cli_takeover_capture_satisfies_fifo_head_once() {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (pin, session) =
         baleyg::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
-    assert_eq!(pin.index_revision, 1);
+    assert_eq!(
+        pin.index_revision, 2,
+        "takeover and explicit claim need separate publications"
+    );
     assert!(session.is_leader());
     assert_eq!(store.status().unwrap().revision, pin);
     let head = store.current_request().unwrap().unwrap();
@@ -502,7 +525,13 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
     let options = IndexOptions::new(root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
-    let owner = store.leader_session().unwrap();
+    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(store.claim_request(&owner).unwrap().unwrap().id, first.id);
     fs::rename(&root, parent.path().join("old-workspace")).unwrap();
     assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 2);
@@ -923,4 +952,778 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
     );
     assert!(!queue.exists());
     assert_eq!(fs::read(&index).unwrap(), index_before);
+}
+
+#[test]
+fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (baseline, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (first.id.clone(), "mode:unchanged".into()),
+            (second.id.clone(), "mode:unchanged".into()),
+        ],
+        "both claimed requests must take the guarded unchanged path"
+    );
+    let a = store.request_by_id(&first.id).unwrap().unwrap();
+    let b = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!((a.state.as_str(), b.state.as_str()), ("done", "done"));
+    assert_eq!(
+        a.revision.unwrap().index_revision,
+        baseline.index_revision + 1
+    );
+    assert_eq!(
+        b.revision.unwrap().index_revision,
+        baseline.index_revision + 2
+    );
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let manifest_count: i64 = db
+        .query_row("SELECT count(*) FROM revision_documents", [], |r| r.get(0))
+        .unwrap();
+    let document_count: i64 = db
+        .query_row("SELECT count(*) FROM document_versions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(manifest_count, 3);
+    assert_eq!(
+        document_count, 1,
+        "unchanged claimed work must reuse immutable measured facts"
+    );
+}
+
+#[test]
+fn changed_claimed_source_uses_native_fallback_not_unchanged() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    fs::write(workspace.path().join("a.js"), "function b() {}\n").unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |_, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push(p.phase);
+            }
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec!["mode:full"],
+        "declaration change is not #67 local"
+    );
+    assert_eq!(
+        store.request_by_id(&request.id).unwrap().unwrap().state,
+        "done"
+    );
+}
+
+#[test]
+fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
+    use baleyg::index_coordinator::{drain_requests, reconcile_workspace};
+    use std::sync::{Arc, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (head, leader) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    db.execute(
+        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
+        [b"function b() {}\n".as_slice()],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(drain_requests(&store, &leader).unwrap(), 1);
+    let row = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(row.state, "failed", "guard failure must not ACK done");
+    assert!(row.revision.is_none());
+    assert_eq!(
+        store.index_baseline().unwrap(),
+        head,
+        "selected pair must remain unchanged"
+    );
+}
+
+#[test]
+fn changed_capture_input_and_options_take_full_claimed_fallback() {
+    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    fs::write(workspace.path().join(".gitignore"), "absent.js\n").unwrap();
+    let input_request = store.enqueue_request(&options, None).unwrap();
+    let mut other_options = options.clone();
+    other_options.max_file_bytes = 1024;
+    let option_request = store.enqueue_request(&other_options, None).unwrap();
+    let modes = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed(&store, &owner, |id, p| {
+            if p.phase.starts_with("mode:") {
+                modes.lock().unwrap().push((id.to_owned(), p.phase));
+            }
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        modes.into_inner().unwrap(),
+        vec![
+            (input_request.id.clone(), "mode:full".into()),
+            (option_request.id.clone(), "mode:full".into()),
+        ],
+        "new ignore input and changed options cannot reuse selected facts via unchanged path"
+    );
+    for request in [input_request, option_request] {
+        assert_eq!(
+            store.request_by_id(&request.id).unwrap().unwrap().state,
+            "done"
+        );
+    }
+}
+
+#[test]
+fn executable_drift_claim_child() {
+    let Ok(state) = std::env::var("BALEYG_DRIFT_CLAIM_STATE") else {
+        return;
+    };
+    use baleyg::index_coordinator::{drain_requests_observed_with_native, reconcile_workspace};
+    use baleyg::native_evidence::FullNativeStage;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    let workspace =
+        std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_PROOF").unwrap());
+    let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
+    let options = IndexOptions::new(workspace);
+    let stage = std::env::var("BALEYG_DRIFT_CLAIM_STAGE").unwrap_or_else(|_| "old".into());
+    if stage == "new" {
+        let previous = store.index_baseline().unwrap();
+        let modes = Mutex::new(Vec::new());
+        let (fresh, _session) = reconcile_workspace(
+            &store,
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            |progress| {
+                if progress.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(progress.phase);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.index_generation, previous.index_generation);
+        assert_eq!(fresh.index_revision, previous.index_revision + 1);
+        for path in ["a.js", "b.js"] {
+            assert!(store.source_at(path, Some(previous)).unwrap().is_some());
+            assert!(store.source_at(path, Some(fresh)).unwrap().is_some());
+        }
+        let db =
+            rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+        let id = format!("pin:v1:{}:{}", fresh.index_generation, fresh.index_revision);
+        let (producer_sha, binding_sha): (String, String) = db.query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [&id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let manifests: i64 = db
+            .query_row(
+                "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(manifests, 2);
+        let result = serde_json::json!({"modes":modes.into_inner().unwrap(),
+            "producerSha":producer_sha,"bindingSha":binding_sha,
+            "generation":fresh.index_generation.to_string(),"revision":fresh.index_revision,
+            "selectedDocuments":manifests});
+        fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
+        return;
+    }
+    assert_eq!(stage, "old");
+    let (old, owner) =
+        reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    println!("DRIFT_BASELINE_READY");
+    std::io::stdout().flush().unwrap();
+    let mut signal = [0u8; 1];
+    std::io::stdin().read_exact(&mut signal).unwrap();
+    assert_eq!(signal[0], b'!');
+    let request = store.enqueue_request(&options, None).unwrap();
+    let inode_before =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    let modes = Mutex::new(Vec::new());
+    let native_events = Mutex::new(Vec::new());
+    assert_eq!(
+        drain_requests_observed_with_native(
+            &store,
+            &owner,
+            |_, p| {
+                if p.phase.starts_with("mode:") {
+                    modes.lock().unwrap().push(p.phase);
+                }
+            },
+            |id, key, stage| {
+                native_events.lock().unwrap().push((
+                    id.to_owned(),
+                    key.path.clone(),
+                    match stage {
+                        FullNativeStage::Measured => "measured",
+                        FullNativeStage::Validated => "validated",
+                    },
+                ));
+            }
+        )
+        .unwrap(),
+        1
+    );
+    let done = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(done.state, "done");
+    let fresh = done.revision.unwrap();
+    assert_eq!(store.status().unwrap().revision, fresh);
+    assert_eq!(fresh.index_generation, old.index_generation);
+    assert_eq!(fresh.index_revision, old.index_revision + 1);
+    for path in ["a.js", "b.js"] {
+        assert!(
+            store.source_at(path, Some(old)).unwrap().is_some(),
+            "both old pinned sources stay readable"
+        );
+        assert!(
+            store.source_at(path, Some(fresh)).unwrap().is_some(),
+            "full measurement must select both fresh sources"
+        );
+    }
+    let db =
+        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
+    let selected: (String, String) = db
+        .query_row(
+            "SELECT producer_sha,binding_sha FROM revision_producer_bindings WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                fresh.index_generation, fresh.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let old_manifests: i64 = db
+        .query_row(
+            "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                old.index_generation, old.index_revision
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((manifests, old_manifests), (2, 2));
+    let inode_after =
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(store.request_db_path()).unwrap());
+    assert_eq!(
+        inode_after, inode_before,
+        "requests.db must not be recreated"
+    );
+    let result = serde_json::json!({"modes":modes.into_inner().unwrap(),"producerSha":selected.0,
+        "bindingSha":selected.1,"generation":fresh.index_generation.to_string(),
+        "revision":fresh.index_revision,"requestId":request.id,"queueInode":inode_after,
+        "nativeEvents":native_events.into_inner().unwrap()});
+    fs::write(proof, serde_json::to_vec(&result).unwrap()).unwrap();
+}
+
+fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let padding = "x".repeat(145_000);
+    let local = |value| {
+        format!(
+            "function local() {{ return {value}; /*{padding}*/ }}\nfunction checked() {{ const local=1, other=2; return local+other; }}\n"
+        )
+    };
+    fs::write(workspace.path().join("a.js"), local("1")).unwrap();
+    fs::write(
+        workspace.path().join("b.js"),
+        "function stable() { return 3; }\n",
+    )
+    .unwrap();
+    let binary = state.path().join("native-drift-requests");
+    fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
+    let old_hash = hex::encode(Sha256::digest(fs::read(&binary).unwrap()));
+    let proof = state.path().join("drift-proof.json");
+    let mut child = Command::new(&binary)
+        .arg("--exact")
+        .arg("executable_drift_claim_child")
+        .arg("--nocapture")
+        .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
+        .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
+        .env("BALEYG_DRIFT_CLAIM_PROOF", &proof)
+        .env("BALEYG_DRIFT_CLAIM_STAGE", "old")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            stdout.read_line(&mut line).unwrap() > 0,
+            "child exited before baseline ready"
+        );
+        if line.contains("DRIFT_BASELINE_READY") {
+            break;
+        }
+    }
+    let executing_hash = if drift {
+        // Replace the binary pathname atomically while the old inode executes.
+        // The next normal claimed capture hashes the changed current_exe pathname.
+        let replacement = state.path().join("native-drift-replacement");
+        fs::copy(&binary, &replacement).unwrap();
+        let mut bytes = fs::OpenOptions::new()
+            .append(true)
+            .open(&replacement)
+            .unwrap();
+        bytes.write_all(b"BALEYG-TEST-PRODUCER-DRIFT-V1").unwrap();
+        bytes.sync_all().unwrap();
+        drop(bytes);
+        fs::rename(&replacement, &binary).unwrap();
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    } else {
+        hex::encode(Sha256::digest(fs::read(&binary).unwrap()))
+    };
+    if body_edit {
+        fs::write(workspace.path().join("a.js"), local("2")).unwrap();
+    }
+    child.stdin.take().unwrap().write_all(b"!").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "drift child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
+    assert_eq!(
+        result["modes"],
+        serde_json::json!([if body_edit {
+            "mode:local"
+        } else {
+            "mode:unchanged"
+        }]),
+        "the old running image remains the producer after its pathname is replaced"
+    );
+    assert_eq!(
+        result["nativeEvents"],
+        serde_json::json!([]),
+        "the unchanged running producer must not remeasure both documents"
+    );
+    assert_eq!(
+        result["producerSha"], old_hash,
+        "old-process facts must bind to the old running image, never the replacement pathname"
+    );
+    assert_eq!(result["bindingSha"].as_str().unwrap().len(), 64);
+    assert_eq!(result["revision"], 2);
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let row = store
+        .request_by_id(result["requestId"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, "done");
+    assert_eq!(row.revision.unwrap().index_revision, 2);
+    assert_eq!(
+        row.revision.unwrap().index_generation.to_string(),
+        result["generation"]
+    );
+    if drift {
+        assert_ne!(old_hash, executing_hash);
+        let next_proof = state.path().join("drift-proof-new.json");
+        let next = Command::new(&binary)
+            .arg("--exact")
+            .arg("executable_drift_claim_child")
+            .arg("--nocapture")
+            .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
+            .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
+            .env("BALEYG_DRIFT_CLAIM_PROOF", &next_proof)
+            .env("BALEYG_DRIFT_CLAIM_STAGE", "new")
+            .output()
+            .unwrap();
+        assert!(
+            next.status.success(),
+            "new image failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&next.stdout),
+            String::from_utf8_lossy(&next.stderr)
+        );
+        let remeasured: serde_json::Value =
+            serde_json::from_slice(&fs::read(&next_proof).unwrap()).unwrap();
+        assert_eq!(remeasured["modes"], serde_json::json!(["mode:full"]));
+        assert_eq!(remeasured["producerSha"], executing_hash);
+        assert_eq!(remeasured["generation"], result["generation"]);
+        assert_eq!(remeasured["revision"], 3);
+        assert_eq!(remeasured["selectedDocuments"], 2);
+        assert_eq!(remeasured["bindingSha"].as_str().unwrap().len(), 64);
+    }
+}
+
+#[test]
+fn unchanged_explicit_claim_with_real_executable_drift_remeasures_every_document() {
+    asserted_claim_under_real_executable_drift(false, true);
+}
+
+#[test]
+fn body_edit_explicit_claim_with_real_executable_drift_cannot_use_local_reuse() {
+    asserted_claim_under_real_executable_drift(true, true);
+}
+
+#[test]
+fn same_body_edit_without_executable_drift_is_proven_local_control() {
+    asserted_claim_under_real_executable_drift(true, false);
+}
+
+/// The parent holds the probe open while this separate process admits durable
+/// work or an exclusive queue writer. No timing or polling is needed.
+#[test]
+fn maintenance_probe_external_child() {
+    let Ok(mode) = std::env::var("BALEYG_TEST_MAINTENANCE_PROBE_CHILD") else {
+        return;
+    };
+    let state = std::path::Path::new(&std::env::var("BALEYG_PROBE_STATE").unwrap()).to_path_buf();
+    let workspace =
+        std::path::Path::new(&std::env::var("BALEYG_PROBE_WORKSPACE").unwrap()).to_path_buf();
+    let store = Store::open_for_tests(&state, &workspace).unwrap();
+    if mode == "enqueue" {
+        store
+            .enqueue_request(&IndexOptions::new(workspace), None)
+            .unwrap();
+    } else if mode == "exclusive" || mode == "wal" || mode == "journal" {
+        let db = rusqlite::Connection::open(store.request_db_path()).unwrap();
+        db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        if mode == "exclusive" {
+            db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        } else if mode == "journal" {
+            db.execute_batch("BEGIN IMMEDIATE; UPDATE queue_identity SET root_key=root_key||'x'")
+                .unwrap();
+        } else {
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; UPDATE queue_identity SET root_key=root_key;").unwrap();
+        }
+        use std::io::{Read, Write};
+        std::io::stdout().write_all(b"@").unwrap();
+        std::io::stdout().flush().unwrap();
+        let mut release = [0];
+        std::io::stdin().read_exact(&mut release).unwrap();
+        if mode == "exclusive" || mode == "journal" {
+            db.execute_batch("ROLLBACK").unwrap();
+        }
+    } else {
+        panic!("unknown probe child mode: {mode}");
+    }
+}
+
+fn maintenance_probe_child(
+    mode: &str,
+    state: &std::path::Path,
+    workspace: &std::path::Path,
+) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("maintenance_probe_external_child")
+        .arg("--nocapture")
+        .env("BALEYG_TEST_MAINTENANCE_PROBE_CHILD", mode)
+        .env("BALEYG_PROBE_STATE", state)
+        .env("BALEYG_PROBE_WORKSPACE", workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn maintenance_probe_virgin_appearance_and_v0_are_unknown() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert!(matches!(probe, QueueProbeAdmission::AbsentVirgin(_)));
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external FIFO failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
+    drop(probe);
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Pending
+    );
+
+    // A different fresh workspace with an interrupted first queue creator
+    // must never initialize that version-zero inode from the probe.
+    let other_state = tempfile::tempdir().unwrap();
+    let other_workspace = tempfile::tempdir().unwrap();
+    fs::write(other_workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let other = Store::open_for_tests(other_state.path(), other_workspace.path()).unwrap();
+    let path = other.request_db_path();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    drop(db);
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert_eq!(
+        other.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn maintenance_probe_external_fifo_busy_and_inode_replacement() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    let options = IndexOptions::new(workspace.path().to_owned());
+    let (_, leader) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &options,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        |_| {},
+    )
+    .unwrap();
+    let request = store.enqueue_request(&options, None).unwrap();
+    let claimed = store.claim_request(&leader).unwrap().unwrap();
+    assert_eq!(request.id, claimed.id);
+    store
+        .finish_request(&leader, &claimed, Err(anyhow::anyhow!("test failure")))
+        .unwrap();
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert!(matches!(probe, QueueProbeAdmission::Ready(_)));
+    assert_eq!(probe.check(), MaintenanceQueueState::Clear);
+    let output = maintenance_probe_child("enqueue", state.path(), workspace.path())
+        .wait_with_output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "external FIFO failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
+    drop(probe);
+
+    // A writer's EXCLUSIVE lock must cause immediate Unknown, not the normal
+    // queue opener's three-second busy wait. The pipe is a deterministic hold.
+    let mut child = maintenance_probe_child("exclusive", state.path(), workspace.path());
+    let mut ready = [0];
+    // The Rust test harness may print its own preamble before the marker.
+    loop {
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        if ready == *b"@" {
+            break;
+        }
+    }
+    let busy = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(busy.check(), MaintenanceQueueState::Unknown);
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    let path = store.request_db_path();
+    let old = path.with_extension("old-queue");
+    fs::rename(&path, &old).unwrap();
+    fs::copy(&old, &path).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(probe.check(), MaintenanceQueueState::Unknown);
+}
+
+/// WAL is an ordinary unsupported queue format, not an attacker. Even a
+/// read-only SQLite open may create shared-memory sidecars for WAL: reject it
+/// before opening, without changing queue/index bytes or sidecar names/bytes.
+#[test]
+fn maintenance_probe_rejects_wal_with_and_without_sidecars_without_mutation() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+        .unwrap();
+    let path = store.request_db_path();
+    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        state.path().join("cache"),
+        state.path().join("data"),
+    );
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    let index_path = roots.index_db(&identity);
+    let sidecar_bytes = || {
+        ["-journal", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let sidecar = path.with_file_name(format!(
+                    "{}{}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    suffix
+                ));
+                match fs::read(&sidecar) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("unexpected sidecar read error: {error}"),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut child = maintenance_probe_child("wal", state.path(), workspace.path());
+    let mut ready = [0];
+    loop {
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        if ready == *b"@" {
+            break;
+        }
+    }
+    let with_sidecars = sidecar_bytes();
+    assert!(with_sidecars[1].is_some() && with_sidecars[2].is_some());
+    let main_before = fs::read(&path).unwrap();
+    assert_eq!(&main_before[18..20], &[2, 2]);
+    let index_before = fs::read(&index_path).unwrap();
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), main_before);
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(sidecar_bytes(), with_sidecars);
+
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+    let without_sidecars = sidecar_bytes();
+    assert_eq!(without_sidecars, vec![None, None, None]);
+    let main_before = fs::read(&path).unwrap();
+    assert_eq!(&main_before[18..20], &[2, 2]);
+    let index_before = fs::read(&index_path).unwrap();
+    assert_eq!(
+        store.open_maintenance_queue_probe().unwrap().check(),
+        MaintenanceQueueState::Unknown
+    );
+    assert_eq!(fs::read(&path).unwrap(), main_before);
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(sidecar_bytes(), without_sidecars);
+}
+
+#[test]
+fn maintenance_probe_detects_uncommitted_journal_after_initial_guard() {
+    use std::io::{Read, Write};
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
+    let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+    store
+        .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
+        .unwrap();
+    // An initial pending queue would return Pending on the unchanged-version
+    // fast path. A held uncommitted writer must instead force Unknown.
+    let probe = store.open_maintenance_queue_probe().unwrap();
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
+    let queue = store.request_db_path();
+    let journal = queue.with_file_name(format!(
+        "{}-journal",
+        queue.file_name().unwrap().to_string_lossy()
+    ));
+    let mut held = None;
+    let mut while_held = None;
+    let state_at_check = probe.check_with_hook(|| {
+        let mut child = maintenance_probe_child("journal", state.path(), workspace.path());
+        let mut ready = [0];
+        loop {
+            child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut ready)
+                .unwrap();
+            if ready == *b"@" {
+                break;
+            }
+        }
+        assert!(
+            journal.exists(),
+            "writer must create rollback journal before version read"
+        );
+        while_held = Some((fs::read(&queue).unwrap(), fs::read(&journal).unwrap()));
+        held = Some(child);
+    });
+    assert_eq!(state_at_check, MaintenanceQueueState::Unknown);
+    assert_eq!(
+        (fs::read(&queue).unwrap(), fs::read(&journal).unwrap()),
+        while_held.unwrap(),
+        "maintenance probe cannot mutate held writer database or journal"
+    );
+    let mut child = held.unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"R").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(probe.check(), MaintenanceQueueState::Pending);
 }

@@ -470,7 +470,13 @@ fn incompatible_index_refuses_without_touching_legacy_state() {
     let db = rusqlite::Connection::open(&index).unwrap();
     db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
-    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    let before = std::fs::read(&index).unwrap();
+    let error = Store::open_for_tests(state.path(), work.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported newer schema"),
+        "{error:#}"
+    );
+    assert_eq!(std::fs::read(&index).unwrap(), before);
     assert_eq!(std::fs::read(legacy).unwrap(), b"untouched legacy bytes");
 }
 #[test]
@@ -1100,7 +1106,11 @@ fn refuses_unversioned_existing_index_without_migration() {
     let db = rusqlite::Connection::open(&index).unwrap();
     db.pragma_update(None, "user_version", 1).unwrap();
     drop(db);
-    assert!(crate::common::open_store(state.path(), work.path()).is_err());
+    let deferred = Store::open_for_tests(state.path(), work.path()).unwrap();
+    assert!(
+        deferred.status().is_err(),
+        "unversioned disposable index must not serve"
+    );
     assert!(index.exists());
 }
 
@@ -1251,11 +1261,13 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
         .unwrap();
     drop(db);
     let bytes = std::fs::read(&path).unwrap();
+    let reopened = Store::open_for_tests(state.path(), work.path()).unwrap();
     assert!(
-        Store::open_for_tests(state.path(), work.path())
+        reopened
+            .status()
             .unwrap_err()
             .to_string()
-            .contains("incompatible_index: unknown cache object")
+            .contains("incompatible_index")
     );
     assert!(
         store
@@ -1271,19 +1283,19 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
             .to_string()
             .contains("incompatible_index")
     );
+    let rejected = store
+        .publish_native(
+            &captured.0,
+            &captured.2,
+            &captured.1,
+            &leader,
+            before,
+            &cancel(),
+        )
+        .unwrap_err();
     assert!(
-        store
-            .publish_native(
-                &captured.0,
-                &captured.2,
-                &captured.1,
-                &leader,
-                before,
-                &cancel()
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        rejected.to_string().contains("revision conflict"),
+        "{rejected:#}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     let db = rusqlite::Connection::open(&path).unwrap();

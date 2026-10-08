@@ -432,17 +432,14 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     assert_eq!(old_pin, first);
     let original = old_file.text;
     let original_hash = hex::encode(Sha256::digest(original.as_bytes()));
-    let assert_public_closed = || {
-        let status_error = store.status().unwrap_err();
-        assert!(
-            status_error.to_string().contains("index_not_ready"),
-            "{status_error:#}"
-        );
-        let source_error = store.source_at("main.js", Some(first)).unwrap_err();
-        assert!(
-            source_error.to_string().contains("index_not_ready"),
-            "{source_error:#}"
-        );
+    let assert_prior_head_served = || {
+        assert_eq!(store.status().unwrap().revision, first);
+        for selected in [Some(first), None] {
+            let (served_pin, served_source) =
+                store.source_at("main.js", selected).unwrap().unwrap();
+            assert_eq!(served_pin, first);
+            assert_eq!(served_source.text, original);
+        }
     };
     let index = index_dir(state.path()).join("index.db");
     let persisted_source = || {
@@ -507,7 +504,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     );
     cancel.store(false, Ordering::Release);
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (
@@ -534,7 +531,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         .unwrap_err();
     assert!(error.to_string().contains("drift"), "{error:#}");
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (
@@ -556,7 +553,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
         "stale pair must refuse before work"
     );
     assert_eq!(store.index_baseline().unwrap(), first);
-    assert_public_closed();
+    assert_prior_head_served();
     assert_eq!(
         persisted_source(),
         (
@@ -733,11 +730,78 @@ fn sqlite_snapshot(
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
+    // The selected v9 evidence is the 28 base tables plus four release-control
+    // tables. Supersession state and the paired producer bindings are additive.
+    // Check exact names, not just a count: an unknown table must not escape the
+    // independent cold-source comparison.
+    const REQUIRED_V9_TABLES: [&str; 32] = [
+        "native_producers",
+        "native_producer_languages",
+        "native_producer_inputs",
+        "native_source_sets",
+        "native_source_set_languages",
+        "native_source_set_dependencies",
+        "native_revisions",
+        "revision_capture_inputs",
+        "document_versions",
+        "graph_projections",
+        "graph_nodes",
+        "graph_calls",
+        "graph_regions",
+        "class_projections",
+        "classes",
+        "class_relations",
+        "revision_documents",
+        "native_version_coverage_roles",
+        "native_version_declarations",
+        "native_version_declaration_ancestors",
+        "native_version_own_signature_types",
+        "native_version_ancestor_signature_types",
+        "native_version_headers",
+        "native_version_header_items",
+        "native_version_parameters",
+        "native_version_calls",
+        "native_version_control_regions",
+        "native_version_call_regions",
+        "native_revision_release_debt",
+        "native_release_candidate_versions",
+        "native_release_candidate_graphs",
+        "native_release_candidate_classes",
+    ];
+    let required: std::collections::BTreeSet<_> = REQUIRED_V9_TABLES.into_iter().collect();
+    let actual: std::collections::BTreeSet<_> = tables.iter().map(String::as_str).collect();
+    let optional = [
+        "native_revision_supersessions",
+        "native_binding_epoch",
+        "revision_producer_bindings",
+    ];
+    assert_eq!(required.len(), 32, "v9 mandatory table list must be unique");
     assert!(
-        matches!(tables.len(), 28 | 30),
-        "compare exact legacy or extended v8 shape"
+        required.is_subset(&actual),
+        "missing v9 evidence tables: {:?}",
+        required.difference(&actual).collect::<Vec<_>>()
     );
-    if tables.len() == 30 {
+    assert!(
+        actual
+            .difference(&required)
+            .all(|table| optional.contains(table)),
+        "unexpected v9 evidence table: {:?}",
+        actual.difference(&required).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        actual.len(),
+        32 + optional
+            .iter()
+            .filter(|name| actual.contains(*name))
+            .count(),
+        "exact v9 base and optional table count"
+    );
+    assert_eq!(
+        actual.contains("native_binding_epoch"),
+        actual.contains("revision_producer_bindings"),
+        "producer binding tables must be paired"
+    );
+    if tables.contains(&"native_binding_epoch".to_string()) {
         let (first, bound): (i64, i64) = db
             .query_row(
                 "SELECT (SELECT first_revision FROM native_binding_epoch),
@@ -757,13 +821,16 @@ fn sqlite_snapshot(
         // Generation-specific control provenance is checked via pinned reads,
         // not compared to a cold oracle with a different generation UUID.
         .filter(|table| !matches!(table.as_str(),
-            "native_binding_epoch" | "revision_producer_bindings"))
+            "native_binding_epoch" | "revision_producer_bindings" | "native_revision_supersessions"))
         .map(|table| {
             // Select the complete revision projection, not all archived rows.
             // Every table remains in the independent cold-source comparison.
             let (where_clause, alias) = match table.as_str() {
                 "native_revisions" => ("id=?1", ""),
-                "revision_capture_inputs" | "revision_documents" => ("revision_id=?1", ""),
+                "revision_capture_inputs" | "revision_documents"
+                | "native_revision_release_debt" | "native_release_candidate_versions"
+                | "native_release_candidate_graphs" | "native_release_candidate_classes" =>
+                    ("revision_id=?1", ""),
                 "native_source_sets" => ("id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
                 "native_source_set_languages" | "native_source_set_dependencies" =>
                     ("source_set_id=(SELECT source_set_id FROM native_revisions WHERE id=?1)", ""),
@@ -778,7 +845,7 @@ fn sqlite_snapshot(
                     ("projection_id IN (SELECT class_projection_id FROM revision_documents WHERE revision_id=?1)", ""),
                 name if name.starts_with("native_version_") =>
                     ("version_id IN (SELECT document_version_id FROM revision_documents WHERE revision_id=?1)", ""),
-                _ => panic!("unhandled v8 evidence table: {table}"),
+                _ => panic!("unhandled v9 evidence table: {table}"),
             };
             // Producer descriptor columns differ: only the parent table uses id/version.
             let where_clause = if table == "native_producers" {
@@ -805,6 +872,22 @@ fn sqlite_snapshot(
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
+            // A retained old pin may carry its own pending debt. Compare those
+            // rows raw; only the currently published head must be empty.
+            if pin.index_revision as i64 == published_revision
+                && matches!(
+                    table.as_str(),
+                    "native_revision_release_debt"
+                        | "native_release_candidate_versions"
+                        | "native_release_candidate_graphs"
+                        | "native_release_candidate_classes"
+                )
+            {
+                assert!(
+                    rows.is_empty(),
+                    "selected current head must not have pending release control rows in {table}"
+                );
+            }
             if table == "native_revisions" {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], format!("t:{revision_id}"));
@@ -945,7 +1028,7 @@ fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_tok
             cold_pin,
             true
         ),
-        "all 28 selected v8 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated"
+        "all selected v9 evidence tables: source/hash, revision, coverage, provenance, IDs, ordered native children, graph, class/warnings/truncated, and empty current-head release control"
     );
     assert_eq!(sqlite_snapshot(&path, before, false), old_rows);
     assert_eq!(parsed_graph, cold.graph_at(Some(cold_pin)).unwrap());
@@ -1208,6 +1291,43 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
         local_phases.iter().any(|phase| phase == "mode:local"),
         "a successful local edit must take the measured local branch: {local_phases:?}"
     );
+    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+        Some(workspace.path()),
+        workspace.path(),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(
+        state
+            .path()
+            .join("cache/indexes")
+            .join(identity.root_key)
+            .join("index.db"),
+    )
+    .unwrap();
+    let stamp: i64 = db
+        .query_row(
+            "SELECT superseded_at FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                first.index_generation, first.index_revision
+            )],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stamp > 0, "local publication stamps its predecessor");
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM native_revision_supersessions WHERE revision_id=?1",
+            [format!(
+                "pin:v1:{}:{}",
+                local.index_generation, local.index_revision
+            )],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+
     assert_eq!(
         store.source_at("local.js", Some(first)).unwrap().unwrap().1,
         old_source
@@ -1612,7 +1732,7 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
     assert_eq!(
         r2,
         sqlite_snapshot(&fresh_path, cold_pin, true),
-        "current r2 must equal a full independent cold build, including every selected v8 table"
+        "current r2 must equal a full independent cold build, including every selected v9 evidence table"
     );
     let metadata = |path: &Path| {
         let db = rusqlite::Connection::open(path).unwrap();

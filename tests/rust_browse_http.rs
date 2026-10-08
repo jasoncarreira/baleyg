@@ -164,7 +164,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     assert_eq!(source["file"]["text"], text);
     // A new publication needs a live root again; the previous reads used cached source.
     std::fs::write(workspace.join("lib.rs"), text).unwrap();
-    let (refreshed_graph, refreshed_native, refreshed_capture) = index_workspace_bundle(
+    let (refreshed_graph, _refreshed_native, _refreshed_capture) = index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
         &cancel,
@@ -173,16 +173,36 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     .unwrap();
     assert_eq!(refreshed_graph.files, graph.files);
     assert_eq!(refreshed_graph.calls, graph.calls);
-    store
-        .publish_native(
-            &refreshed_graph,
-            &refreshed_capture,
-            &refreshed_native,
-            session.leader_guard().unwrap(),
-            pin,
-            &cancel,
-        )
-        .unwrap();
+    // The live daemon owns publication after retention. Queue the next
+    // revision through it rather than opening a second writer while its tick
+    // may have an active SQLite transaction.
+    let (code, job) = request(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(code, 202, "{job}");
+    let id = job["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (code, result) =
+                request(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            assert_eq!(code, 200, "{result}");
+            if !result["finishedAt"].is_null() {
+                break result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed["state"], "done", "{completed}");
+    assert_eq!(
+        completed["revision"]["indexGeneration"],
+        pin.index_generation.to_string()
+    );
+    assert!(
+        completed["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|revision| revision > pin.index_revision),
+        "queue did not publish a successor: {completed}"
+    );
     std::fs::remove_file(workspace.join("lib.rs")).unwrap();
     let (code, retained) = request(
         &app,
@@ -194,4 +214,95 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     assert_eq!(code, 200, "{retained}");
     assert_eq!(retained["revision"], json!(pin));
     assert!(!sentinel.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edits() {
+    use baleyg::index_coordinator;
+    use std::time::{Duration, Instant};
+
+    struct StopLoad(Arc<AtomicBool>);
+    impl Drop for StopLoad {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(&source, "pub fn value() -> i32 { -1 }\n").unwrap();
+    let options = IndexOptions::new(workspace.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let store = common::open_store(&temp.path().join("state"), &workspace).unwrap();
+    let session =
+        index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        TOKEN.into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session(session);
+    let app = http::router(state);
+    let load_stop = StopLoad(Arc::new(AtomicBool::new(false)));
+    let mut load_thread = None;
+    for edit in 0..50 {
+        if edit == 25 {
+            let stop = load_stop.0.clone();
+            load_thread = Some(std::thread::spawn(move || {
+                let mut value = 1_u64;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    for _ in 0..2_000 {
+                        value = value.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    }
+                    std::hint::black_box(value);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        let previous = store.status().unwrap().revision;
+        let text = format!("pub fn value() -> i32 {{ {edit} }}\n");
+        std::fs::write(&source, &text).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let (status_code, status) = request(&app, "GET", "/api/status", Value::Null).await;
+            assert_eq!(status_code, 200, "edit {edit}: {status}");
+            let (pin_code, pinned) = request(
+                &app,
+                "GET",
+                &format!(
+                    "/api/source?path=lib.rs&indexGeneration={}&indexRevision={}",
+                    previous.index_generation, previous.index_revision
+                ),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(
+                pin_code, 200,
+                "edit {edit}, previous {previous:?}: {pinned}"
+            );
+            let (current_code, current) =
+                request(&app, "GET", "/api/source?path=lib.rs", Value::Null).await;
+            assert_eq!(current_code, 200, "edit {edit}: {current}");
+            if status["revision"]["indexRevision"]
+                .as_u64()
+                .is_some_and(|revision| revision > previous.index_revision)
+                && current["file"]["text"] == text
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "edit {edit} was not published: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    load_stop
+        .0
+        .store(true, std::sync::atomic::Ordering::Release);
+    load_thread.unwrap().join().unwrap();
 }

@@ -10,13 +10,229 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
-    path::Path,
+    os::unix::fs::{FileExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
+/// A single maintenance unit's existing-only queue admission. Unknown is a
+/// priority signal: never begin (or commit) maintenance on uncertain queue data.
+pub enum QueueProbeAdmission {
+    AbsentVirgin(MaintenanceQueueProbe),
+    Ready(MaintenanceQueueProbe),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceQueueState {
+    Clear,
+    Pending,
+    Unknown,
+}
+
+/// Keeps the protected SH use lock and one read-only SQLite connection alive
+/// only until the current maintenance unit finishes. No SQLite read transaction
+/// is held between checks; data_version is meaningful only on this connection.
+pub struct MaintenanceQueueProbe {
+    identity: Arc<super::topology::WorkspaceIdentity>,
+    witness: Arc<Mutex<Option<(u64, u64)>>>,
+    path: PathBuf,
+    file: Option<Arc<fs::File>>,
+    db: Option<super::ProtectedSqliteConnection>,
+    _guard: UseGuard,
+    inode: Option<(u64, u64)>,
+    baseline: i64,
+    initial_pending: bool,
+}
+
+impl QueueProbeAdmission {
+    pub fn check(&self) -> MaintenanceQueueState {
+        self.check_with_hook(|| {})
+    }
+
+    /// Deterministic contention fixture: runs after the first pathname and
+    /// sidecar checks, before reading data_version. Never use a blocking hook
+    /// in a live maintenance unit.
+    #[doc(hidden)]
+    pub fn check_with_hook(&self, after_first_guard: impl FnOnce()) -> MaintenanceQueueState {
+        match self {
+            Self::Unknown => MaintenanceQueueState::Unknown,
+            Self::AbsentVirgin(probe) | Self::Ready(probe) => {
+                probe.check_with_barrier(after_first_guard)
+            }
+        }
+    }
+}
+
+impl MaintenanceQueueProbe {
+    fn pathname_unchanged(&self) -> bool {
+        if self.identity.verify_readonly().is_err() || self._guard.verify().is_err() {
+            return false;
+        }
+        let named = match fs::symlink_metadata(&self.path) {
+            Ok(named) => Some(named),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return false,
+        };
+        match (self.inode, named) {
+            (None, None) => self.witness.lock().is_ok_and(|w| w.is_none()),
+            (Some(inode), Some(named)) => {
+                named.is_file()
+                    && !named.file_type().is_symlink()
+                    && (named.dev(), named.ino()) == inode
+                    && self
+                        .witness
+                        .lock()
+                        .is_ok_and(|w| w.is_none_or(|old| old == inode))
+            }
+            _ => false,
+        }
+    }
+
+    pub fn check(&self) -> MaintenanceQueueState {
+        self.check_with_barrier(|| {})
+    }
+
+    fn fence_unchanged(&self, db: Option<&rusqlite::Connection>, version: Option<i64>) -> bool {
+        // Sample the second data_version BEFORE the last filesystem check:
+        // an uncommitted writer can create a rollback journal while SQLite
+        // reads a version that does not change until COMMIT.
+        db.is_none_or(|db| {
+            db.is_autocommit()
+                && version.is_some_and(|version| queue_data_version(db) == Ok(version))
+        }) && self
+            .file
+            .as_ref()
+            .is_none_or(|file| queue_delete_header(file))
+            && self.pathname_unchanged()
+            && !queue_sidecar_exists(&self.path)
+    }
+
+    fn check_with_barrier(&self, after_first_guard: impl FnOnce()) -> MaintenanceQueueState {
+        if !self.pathname_unchanged() || queue_sidecar_exists(&self.path) {
+            return MaintenanceQueueState::Unknown;
+        }
+        let Some(db) = &self.db else {
+            after_first_guard();
+            return if self.fence_unchanged(None, None) {
+                MaintenanceQueueState::Clear
+            } else {
+                MaintenanceQueueState::Unknown
+            };
+        };
+        if !self
+            .file
+            .as_ref()
+            .is_some_and(|file| queue_delete_header(file))
+            || !db.is_autocommit()
+        {
+            return MaintenanceQueueState::Unknown;
+        }
+        after_first_guard();
+        let Ok(version) = queue_data_version(db) else {
+            return MaintenanceQueueState::Unknown;
+        };
+        if version == self.baseline {
+            // An uncommitted rollback writer does not change data_version.
+            // Check journal/identity/header/autocommit AFTER this read too,
+            // then sample data_version once more before returning Clear.
+            return if self.fence_unchanged(Some(db), Some(version)) {
+                if self.initial_pending {
+                    MaintenanceQueueState::Pending
+                } else {
+                    MaintenanceQueueState::Clear
+                }
+            } else {
+                MaintenanceQueueState::Unknown
+            };
+        }
+        let Ok(pending) = unfinished_exists(db) else {
+            return MaintenanceQueueState::Unknown;
+        };
+        if !self.fence_unchanged(Some(db), Some(version)) {
+            return MaintenanceQueueState::Unknown;
+        }
+        if pending {
+            MaintenanceQueueState::Pending
+        } else {
+            MaintenanceQueueState::Clear
+        }
+    }
+}
+
+fn queue_sidecar_exists(path: &Path) -> bool {
+    // A rollback journal may be hot or in use. SQLite can create WAL shared
+    // memory files even when the main database is opened read-only; reject
+    // any WAL/SHM BEFORE opening SQLite, not only after its first query.
+    ["-journal", "-wal", "-shm"].into_iter().any(|suffix| {
+        let sidecar = path.with_file_name(format!(
+            "{}{}",
+            path.file_name().unwrap().to_string_lossy(),
+            suffix
+        ));
+        !matches!(fs::symlink_metadata(sidecar), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn queue_delete_header(file: &fs::File) -> bool {
+    let mut header = [0; 20];
+    matches!(file.read_at(&mut header, 0), Ok(20))
+        && &header[..16] == b"SQLite format 3\0"
+        && header[18] == 1
+        && header[19] == 1
+}
+
+fn queue_data_version(db: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    db.pragma_query_value(None, "data_version", |row| row.get(0))
+}
+
+fn unfinished_exists(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM requests INDEXED BY requests_state_seq WHERE state IN ('queued','running') LIMIT 1)",
+        [],
+        |row| row.get(0),
+    )
+}
+
 const SCHEMA: &str = "CREATE TABLE requests (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, root_device TEXT NOT NULL, root_inode TEXT NOT NULL, options_json TEXT NOT NULL, expected_generation TEXT, expected_revision INTEGER, state TEXT NOT NULL CHECK(state IN ('queued','running','done','failed')), claim_incarnation TEXT, result_generation TEXT, result_revision INTEGER, error_code TEXT, submitted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, CHECK ((expected_generation IS NULL) = (expected_revision IS NULL)), CHECK ((result_generation IS NULL) = (result_revision IS NULL)), CHECK ((state='queued' AND claim_incarnation IS NULL AND started_at IS NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='running' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL AND result_generation IS NULL AND error_code IS NULL) OR (state='done' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NOT NULL AND error_code IS NULL) OR (state='failed' AND claim_incarnation IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL AND result_generation IS NULL AND error_code IS NOT NULL))); CREATE INDEX requests_state_seq ON requests(state,seq); CREATE INDEX requests_root_state_seq ON requests(root_device,root_inode,state,seq); CREATE TABLE queue_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), root_spelling TEXT NOT NULL, root_key TEXT NOT NULL); PRAGMA user_version=1";
+
+/// GC must not turn the queue's version pragma into permission to unlink an
+/// unknown schema. Compare every object, including SQLite-generated indexes.
+pub(crate) fn validate_gc_queue(db: &Connection, spelling: &str, key: &str) -> Result<()> {
+    type SchemaObject = (String, String, String, Option<String>);
+    fn objects(db: &Connection) -> Result<Vec<SchemaObject>> {
+        Ok(db
+            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")?
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    ensure!(
+        objects(db)? == objects(&expected)?,
+        "incompatible_queue: unknown GC schema"
+    );
+    let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    ensure!(version == 1, "incompatible_queue: GC schema version");
+    let count: i64 = db.query_row("SELECT count(*) FROM queue_identity", [], |row| row.get(0))?;
+    ensure!(count == 1, "incompatible_queue: GC identity cardinality");
+    let identity: (String, String) = db.query_row(
+        "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        identity == (spelling.to_owned(), key.to_owned()),
+        "incompatible_queue: GC identity"
+    );
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    ensure!(integrity == "ok", "incompatible_queue: GC integrity");
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +270,16 @@ impl CompletionOutcome {
             Err(error) if error.to_string().starts_with("revision conflict") => {
                 Self::Failed("revision_conflict")
             }
-            Err(_) => Self::Failed("index_failed"),
+            Err(error) => {
+                // A terminal row intentionally retains only a stable error code.
+                // Opt-in diagnostics preserve the cause in either process's log
+                // without letting a broken stderr change the terminal outcome.
+                if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "index-phase request_failure={error:#}");
+                }
+                Self::Failed("index_failed")
+            }
         })
     }
     fn matches_terminal(&self, row: &Request) -> bool {
@@ -160,15 +385,130 @@ impl Store {
     pub fn request_db_path(&self) -> std::path::PathBuf {
         self.roots.requests_db(&self.identity)
     }
-    fn request_connection(&self) -> Result<(UseGuard, Connection)> {
+    /// Admit only an existing, known-clean queue for one short maintenance
+    /// unit. Never create the queue, recover its journal, wait three seconds,
+    /// run quick_check, or acquire a SQLite writer lock.
+    pub fn open_maintenance_queue_probe(&self) -> Result<QueueProbeAdmission> {
+        Ok(self
+            .try_open_maintenance_queue_probe()
+            .unwrap_or(QueueProbeAdmission::Unknown))
+    }
+
+    fn try_open_maintenance_queue_probe(&self) -> Result<QueueProbeAdmission> {
+        self.identity.verify_readonly()?;
+        let guard = self.roots.index_use_existing_readonly(&self.identity)?;
+        let path = self.request_db_path();
+        let probe = |file, db, inode, baseline, initial_pending| MaintenanceQueueProbe {
+            identity: self.identity.clone(),
+            witness: self.request_file_witness.clone(),
+            path: path.clone(),
+            file,
+            _guard: guard,
+            db,
+            inode,
+            baseline,
+            initial_pending,
+        };
+        // Even an absent main pathname does not make orphan sidecars benign.
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        let named = match fs::symlink_metadata(&path) {
+            Ok(named) => named,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                ensure!(
+                    self.request_file_witness.lock().unwrap().is_none(),
+                    "incompatible_queue: previously observed requests.db disappeared"
+                );
+                let empty = probe(None, None, None, 0, false);
+                return Ok(if empty.pathname_unchanged() {
+                    QueueProbeAdmission::AbsentVirgin(empty)
+                } else {
+                    QueueProbeAdmission::Unknown
+                });
+            }
+            Err(err) => return Err(err.into()),
+        };
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && named.uid() == unsafe { libc::geteuid() }
+                && named.mode() & 0o777 == 0o600
+                && named.nlink() == 1,
+            "unsafe requests.db"
+        );
+        let inode = (named.dev(), named.ino());
+        ensure!(
+            self.request_file_witness
+                .lock()
+                .unwrap()
+                .is_none_or(|old| old == inode),
+            "incompatible_queue: requests.db inode replaced"
+        );
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        // Register a process-lifetime witness before SQLite opens. Never close
+        // another descriptor on an inode while a SQLite connection may hold
+        // POSIX record locks on it.
+        let file = super::retained_sqlite_file(&path, false, false, true)?;
+        let held = file.metadata()?;
+        ensure!(
+            (held.dev(), held.ino()) == inode,
+            "unsafe requests.db changed"
+        );
+        ensure!(
+            queue_delete_header(&file),
+            "storage_busy: queue journal format"
+        );
+        ensure!(!queue_sidecar_exists(&path), "storage_busy: queue sidecar");
+        let db = super::protected_sqlite_open(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.busy_timeout(std::time::Duration::ZERO)?;
+        ensure!(db.is_autocommit(), "storage_busy: queue snapshot active");
+        let journal_mode: String = db.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        ensure!(
+            journal_mode == "delete",
+            "storage_busy: queue journal format"
+        );
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(version == 1, "storage_busy: unknown or virgin queue schema");
+        let queue_identity: (String, String) = db.query_row(
+            "SELECT root_spelling,root_key FROM queue_identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        ensure!(
+            queue_identity == (self.workspace_root.clone(), self.identity.root_key.clone()),
+            "root_key_collision: requests.db belongs to different root"
+        );
+        let baseline = queue_data_version(&db)?;
+        let pending = unfinished_exists(&db)?;
+        ensure!(
+            baseline == queue_data_version(&db)?,
+            "storage_busy: queue changed during maintenance admission"
+        );
+        let opened = probe(Some(file), Some(db), Some(inode), baseline, pending);
+        if !opened.pathname_unchanged()
+            || queue_sidecar_exists(&path)
+            || !opened
+                .file
+                .as_ref()
+                .is_some_and(|file| queue_delete_header(file))
+        {
+            return Ok(QueueProbeAdmission::Unknown);
+        }
+        Ok(QueueProbeAdmission::Ready(opened))
+    }
+    fn request_connection(&self) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // A replacement-root follower may accept before it owns the leader lock,
         // but it must never recreate a missing queue containing old-root ACKs.
-        self.request_connection_for_root_loss(false, self.is_root_replaced())
+        self.request_connection_for_root_loss(false, self.is_root_replaced(), None)
     }
     /// Read an already-admitted queue without creating requests.db or its schema.
     /// A vanished queue we previously observed is not equivalent to a virgin Ready index.
-    fn existing_request_connection(&self) -> Result<Option<(UseGuard, Connection)>> {
-        match self.request_connection_for_root_loss(false, true) {
+    fn existing_request_connection(
+        &self,
+    ) -> Result<Option<(UseGuard, super::ProtectedSqliteConnection)>> {
+        match self.request_connection_for_root_loss(false, true, None) {
             Ok(pair) => Ok(Some(pair)),
             Err(error)
                 if error
@@ -188,7 +528,8 @@ impl Store {
         &self,
         old_root: bool,
         existing_only: bool,
-    ) -> Result<(UseGuard, Connection)> {
+        verified_owner: Option<&LeaderSession>,
+    ) -> Result<(UseGuard, super::ProtectedSqliteConnection)> {
         // Root-loss paths keep their existing queue admission barriers.
         #[cfg(test)]
         self.test_queue_before_shared_hook.run();
@@ -220,7 +561,7 @@ impl Store {
         // Only the local Arc is released. The process-wide check handle must
         // remain open while any SQLite connection may hold fcntl locks.
         drop(file);
-        let mut db = Connection::open_with_flags(
+        let mut db = super::protected_sqlite_open(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
@@ -231,29 +572,70 @@ impl Store {
         // another process initializing the same private file. Even read-only callers
         // still open SQLite normally (hot-journal recovery), validate user_version,
         // root singleton and quick_check before interpreting any row.
-        let version: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let version: i64 =
+            super::storage_result(db.pragma_query_value(None, "user_version", |r| r.get(0)))?;
         if version == 0 {
-            // A concurrent first writer creates the private file before its
-            // schema transaction commits. Existing-only readers must neither
-            // initialize it nor mistake that transient for an incompatible ACK.
+            // Ordinary existing-only readers never initialize a queue: they
+            // cannot prove whether a live first writer or a durable ACK owns
+            // this inode. Only the current-root Ready owner holding verified EX
+            // may recover an existing private virgin file before mandatory H.
             ensure!(
-                !existing_only,
+                !existing_only || verified_owner.is_some(),
                 "storage_busy: requests.db initialization in progress"
             );
-            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let locked_version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            ensure!(
+                self.request_file_witness.lock().unwrap().is_none(),
+                "incompatible_queue: previously observed requests.db lost its schema"
+            );
+            if let Some(owner) = verified_owner {
+                ensure!(
+                    existing_only && !old_root && self.is_ready_disposition(),
+                    "storage_busy: only current Ready owner may recover virgin queue"
+                );
+                self.verify_leader_session(owner)?;
+            }
+            // IMMEDIATE waits at most the existing three-second SQLite busy
+            // timeout. A concurrent initializer can win; re-read while holding
+            // the writer lock instead of assuming an unlocked v0 is orphaned.
+            let tx = super::storage_result(
+                db.transaction_with_behavior(TransactionBehavior::Immediate),
+            )?;
+            if let Some(owner) = verified_owner {
+                self.verify_leader_session(owner)?;
+            }
+            let locked_version: i64 =
+                super::storage_result(tx.pragma_query_value(None, "user_version", |r| r.get(0)))?;
             if locked_version == 0 {
-                let count: i64 = tx.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r|r.get(0))?;
-                ensure!(count == 0, "incompatible_queue: unexpected schema");
-                tx.execute_batch(SCHEMA)?;
-                tx.execute(
+                let integrity: String =
+                    super::storage_result(tx.query_row("PRAGMA quick_check(1)", [], |r| r.get(0)))?;
+                ensure!(
+                    integrity == "ok",
+                    "incompatible_queue: virgin integrity check failed"
+                );
+                // Count ALL sqlite_master entries, not only user tables: an
+                // unexpected view/trigger/index or SQLite-owned object is not
+                // an empty queue and must never be overwritten as bootstrap.
+                let objects: i64 = super::storage_result(tx.query_row(
+                    "SELECT count(*) FROM sqlite_master",
+                    [],
+                    |r| r.get(0),
+                ))?;
+                ensure!(objects == 0, "incompatible_queue: unexpected virgin schema");
+                if let Some(owner) = verified_owner {
+                    self.verify_leader_session(owner)?;
+                }
+                super::storage_result(tx.execute_batch(SCHEMA))?;
+                super::storage_result(tx.execute(
                     "INSERT INTO queue_identity VALUES (1,?1,?2)",
                     params![self.workspace_root, self.identity.root_key],
-                )?;
+                ))?;
             } else {
                 ensure!(locked_version == 1, "incompatible_queue: schema version");
             }
-            tx.commit()?;
+            if let Some(owner) = verified_owner {
+                self.verify_leader_session(owner)?;
+            }
+            super::storage_result(tx.commit())?;
         } else {
             ensure!(version == 1, "incompatible_queue: schema version");
         }
@@ -431,7 +813,11 @@ impl Store {
                 }
             }
         }
-        let (_guard, mut db) = self.request_connection_for_root_loss(old_root, true)?;
+        let (_guard, mut db) = self.request_connection_for_root_loss(
+            old_root,
+            true,
+            (!old_root && self.is_ready_disposition()).then_some(session),
+        )?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if old_root {
             self.verify_old_root_queue_leader(session)?;
@@ -509,7 +895,9 @@ impl Store {
         )
     }
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
-        self.verify_leader_session(session)?;
+        // EX ownership alone is not authority to claim. The same incarnation
+        // must first commit and attest its selected post-acquisition H.
+        self.verify_reconciled_leader_claim(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         self.verify_leader_session(session)?;
@@ -522,6 +910,7 @@ impl Store {
         {
             return Ok(None);
         }
+        self.verify_reconciled_leader_claim(session)?;
         tx.execute("UPDATE requests SET state='running',claim_incarnation=?1,started_at=?2 WHERE seq=?3 AND state IN ('queued','running')", params![session.incarnation().to_string(),now(),row.seq])?;
         let claimed = tx.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
@@ -914,6 +1303,64 @@ mod root_failure_tests {
         assert!(store.is_ready_disposition());
         assert_eq!(store.fail_changed_root_requests(&owner).unwrap(), 0);
         assert!(!store.request_db_path().exists());
+    }
+
+    #[test]
+    fn current_owner_refuses_virgin_version_with_unknown_view_without_replacing_inode() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), root.path()).unwrap();
+        let path = store.request_db_path();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .unwrap();
+        let original = (
+            file.metadata().unwrap().dev(),
+            file.metadata().unwrap().ino(),
+        );
+        drop(file);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE VIEW untrusted AS SELECT 1")
+            .unwrap();
+        assert_eq!(
+            db.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            0
+        );
+        drop(db);
+        let owner = store.leader_session().unwrap();
+        let error = store.fail_changed_root_requests(&owner).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "incompatible_queue: unexpected virgin schema"
+        );
+        drop(owner);
+        let named = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (named.dev(), named.ino()),
+            original,
+            "refusal must not replace queue inode"
+        );
+        let read =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let version: i64 = read
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0, "refusal must not initialize unknown schema");
+        let view: String = read
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(view, "untrusted");
     }
 
     #[test]
