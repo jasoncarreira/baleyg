@@ -1793,13 +1793,17 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
+    let daemon_log = temp.path().join("follower-daemon-stderr.log");
     let daemon = cli(&root, &home, "serve")
         .arg("--bind")
         .arg(address.to_string())
         .arg("--token-file")
         .arg(&token)
+        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            fs::File::create(&daemon_log).unwrap(),
+        ))
         .spawn()
         .unwrap();
     let mut daemon = Server(daemon);
@@ -1826,10 +1830,30 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
         );
         std::thread::sleep(Duration::from_millis(10));
     };
+    let failed_claim = || -> String {
+        let Some(path) = request_db_under(&home) else {
+            return "requests.db absent".into();
+        };
+        let sql = "SELECT state,error_code,claim_incarnation FROM requests ORDER BY seq LIMIT 1";
+        let row =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|db| {
+                    db.query_row(sql, [], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                });
+        format!("{row:?}")
+    };
     assert!(
         cli_exit.success(),
-        "actual CLI failed: {}",
-        fs::read_to_string(&cli_log).unwrap()
+        "actual CLI failed: {}\nclaimed row: {}\ndaemon log: {}",
+        fs::read_to_string(&cli_log).unwrap(),
+        failed_claim(),
+        fs::read_to_string(&daemon_log).unwrap_or_else(|error| error.to_string())
     );
     let cli_result: serde_json::Value =
         serde_json::from_slice(&fs::read(&cli_output).unwrap()).unwrap();
