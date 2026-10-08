@@ -765,6 +765,40 @@ impl Store {
         self.verify_request_root(&row)?;
         Ok(row)
     }
+    /// An idle old-root runtime may retire only after its own durable queue is
+    /// proven drained. Ordinary request reads require the live root; this one
+    /// uses the same protected existing-only queue path as root-loss failure.
+    pub fn old_root_unfinished_request(&self) -> Result<Option<Request>> {
+        ensure!(
+            self.identity.root_path_replaced()?,
+            "root_changed: old root required"
+        );
+        let (_guard, db) = match self.request_connection_for_root_loss(true, true, None) {
+            Ok(pair) => pair,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                ensure!(
+                    self.request_file_witness.lock().unwrap().is_none(),
+                    "incompatible_queue: accepted requests.db disappeared"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let row = db.query_row(
+            &format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') AND root_device=?1 AND root_inode=?2 ORDER BY seq LIMIT 1"),
+            params![self.identity.device.to_string(), self.identity.inode.to_string()],
+            read,
+        ).optional()?;
+        ensure!(
+            self.identity.root_path_replaced()?,
+            "root_changed: old root restored"
+        );
+        Ok(row)
+    }
     pub fn current_request(&self) -> Result<Option<Request>> {
         let Some((_guard, db)) = self.existing_request_connection()? else {
             return Ok(None);
