@@ -5000,12 +5000,19 @@ impl Store {
             &roots.cache.join("indexes").join(format!("{key}.lock")),
         )?;
         let path = dir.join("index.db");
-        let _witness = retained_sqlite_file(&path, false, false, true)?;
-        let db = protected_sqlite_open(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        db.busy_timeout(Duration::ZERO)?;
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let absent = requests::queue_absent_without_sidecars(&dir.join("requests.db"));
+                guard.verify()?;
+                return Ok(!absent);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // SQLite may recover a hot journal or create shared-memory files even
+        // through a read-only connection. Check all sidecars before opening it.
+        reject_sidecars(&path, true)?;
+        let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
         let (spelling, device, inode): (String, String, String) = db.query_row(
             "SELECT root_spelling,root_device,root_inode FROM index_metadata WHERE singleton=1",
             [],

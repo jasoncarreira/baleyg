@@ -1013,6 +1013,9 @@ impl CheckoutRuntime {
                 }
             }
         }
+        if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
+            hook();
+        }
         establish_serving_session(store, Some(options), &cancel)
     }
 }

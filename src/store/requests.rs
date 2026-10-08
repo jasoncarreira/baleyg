@@ -162,6 +162,11 @@ impl MaintenanceQueueProbe {
     }
 }
 
+pub(crate) fn queue_absent_without_sidecars(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        && !queue_sidecar_exists(path)
+}
+
 fn queue_sidecar_exists(path: &Path) -> bool {
     // A rollback journal may be hot or in use. SQLite can create WAL shared
     // memory files even when the main database is opened read-only; reject

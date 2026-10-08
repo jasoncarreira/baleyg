@@ -278,6 +278,73 @@ fn startup_orphan_queue_blocks_idle_exit_without_any_client() {
     assert!(!restarted.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
 }
 
+#[test]
+fn empty_interrupted_index_exits_but_unknown_queue_does_not() {
+    let (base, id, _, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let dir = base.path().join("cache/indexes").join(&id.root_key);
+    drop(store);
+    fs::remove_file(dir.join("index.db")).unwrap();
+    let queue = dir.join("requests.db");
+    if queue.exists() {
+        fs::remove_file(&queue).unwrap();
+    }
+    let mut registry = CheckoutRegistry::with_roots_at(roots.clone(), now);
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    fs::write(&queue, b"not a queue").unwrap();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(fs::read(&queue).unwrap(), b"not a queue");
+    fs::remove_file(&queue).unwrap();
+    let sidecar = dir.join("requests.db-wal");
+    fs::write(&sidecar, b"unfinished queue").unwrap();
+    let mut registry = CheckoutRegistry::with_roots_at(
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data")),
+        now,
+    );
+    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(fs::read(&sidecar).unwrap(), b"unfinished queue");
+}
+
+#[test]
+fn orphan_scan_refuses_hot_index_sidecars_and_wal_header_without_creation() {
+    use std::os::unix::fs::FileExt;
+    let (base, id, _, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    drop(store);
+    let dir = base.path().join("cache/indexes").join(&id.root_key);
+    let index = dir.join("index.db");
+    let names = || {
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    for suffix in ["-journal", "-wal"] {
+        let sidecar = dir.join(format!("index.db{suffix}"));
+        fs::write(&sidecar, b"unfinished journal").unwrap();
+        let before = names();
+        let mut registry = CheckoutRegistry::with_roots_at(roots.clone(), now);
+        assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+        assert_eq!(names(), before);
+        assert_eq!(fs::read(&sidecar).unwrap(), b"unfinished journal");
+        fs::remove_file(sidecar).unwrap();
+    }
+    let file = fs::OpenOptions::new().write(true).open(&index).unwrap();
+    file.write_at(&[2, 2], 18).unwrap();
+    drop(file);
+    let before = names();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(names(), before);
+}
+
 #[cfg(unix)]
 fn open_descriptors(path: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
@@ -360,8 +427,109 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
     registry.attach_launch(2, &id).unwrap();
     let resumed = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    resumed.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("mandatory H did not reach pause");
     assert!(resumed.catching_up());
+    // Err carries no CheckoutEvidence, so there is no admitted basis to report.
+    let error = match resumed.evidence_response() {
+        Ok(_) => panic!("a head was admitted without the prior-head permit"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .downcast_ref::<baleyg::store::topology::IndexNotReady>()
+            .is_some(),
+        "{error:#}"
+    );
+    resume_tx.send(()).unwrap();
     ready(&resumed).await;
+    let (response, catching_up) = resumed.evidence_response().unwrap();
+    assert!(!catching_up);
+    response.finish(()).unwrap();
+}
+
+#[tokio::test]
+async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
+    let (base, id, mut registry, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let options = baleyg::indexer::IndexOptions::new(id.root.clone());
+    let initial = store.enqueue_request(&options, None).unwrap();
+    // Retain the protected read-only queue connection and shared use guard
+    // while a second thread performs a real durable queue write.
+    let reader = store.open_maintenance_queue_probe().unwrap();
+    assert!(matches!(
+        reader,
+        baleyg::store::QueueProbeAdmission::Ready(_)
+    ));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let (written_tx, written_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let writer_store = store.clone();
+    let writer = std::thread::spawn(move || {
+        let first = writer_store.enqueue_request(&options, None).unwrap();
+        written_tx.send(first.id).unwrap();
+        resume_rx.recv().unwrap();
+    });
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(id) = written_rx.try_recv() {
+                break id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(store.request_by_id(&first).unwrap().is_some());
+    let active = std::iter::once(id.root_key.clone()).collect();
+    let (active_read, _) = runtime.evidence_response().unwrap();
+    assert!(!baleyg::store::Store::orphan_queues_pending(
+        &roots, &active
+    ));
+    registry.disconnect_at(1, now);
+    let busy = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
+    assert!(busy.released.is_empty());
+    assert!(!busy.exit);
+    assert!(runtime.has_active_resources());
+    let _ = reader.check();
+    drop(reader);
+    active_read.finish(()).unwrap();
+    drop(active_read);
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while store
+            .request_by_id(&first)
+            .unwrap()
+            .is_none_or(|request| request.finished_at.is_none())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(store.request_by_id(&first).unwrap().unwrap().state, "done");
+    assert_eq!(
+        store.request_by_id(&initial.id).unwrap().unwrap().state,
+        "done"
+    );
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
 }
 
 #[tokio::test]
