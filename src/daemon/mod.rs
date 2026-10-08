@@ -148,3 +148,25 @@ impl Drop for SocketOwner {
         }
     }
 }
+
+/// Drive idle release while a daemon owns the registry. The caller retains its
+/// socket/listener guard and closes control connections when this returns.
+/// Polling also observes work draining after an expired deadline without
+/// resetting either clock. The command entry point wires this into its task.
+pub async fn run_idle_lifecycle(
+    registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+) -> Result<(), registry::SelectionError> {
+    let mut ticks = tokio::time::interval(std::time::Duration::from_millis(250));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        if registry
+            .lock()
+            .await
+            .advance(std::time::Instant::now())?
+            .exit
+        {
+            return Ok(());
+        }
+    }
+}
