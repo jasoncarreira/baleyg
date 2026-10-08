@@ -1010,7 +1010,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
 }
 
 #[tokio::test]
-async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
+async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
     use std::os::{
         fd::AsRawFd,
         unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -1140,7 +1140,7 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
 
     // Repair the *same persisted-option input* without POST, CLI index, restart,
     // or a new daemon. A failed first H must trigger a bounded, request-free
-    // takeover. The initial HTTP 503 above never counts as serving success.
+    // takeover. The initial HTTP 503 and a valid prior head do not prove H.
     let queue = request_db_under(&home).unwrap();
     type DurableRow = (i64, String, String, Option<String>, Option<i64>);
     let durable_rows =
@@ -1215,17 +1215,43 @@ async fn failed_mandatory_takeover_must_not_serve_stale_selected_status() {
             reqwest::StatusCode::OK,
             "unexpected post-repair serving response {code}: {body:?}"
         );
+        assert_eq!(body["workspaceRoot"], old["workspaceRoot"]);
         assert_eq!(
             body["revision"]["indexGeneration"],
             old["revision"]["indexGeneration"]
         );
-        assert!(
-            body["revision"]["indexRevision"].as_u64().is_some_and(
-                |revision| revision > old["revision"]["indexRevision"].as_u64().unwrap()
+        let prior_revision = old["revision"]["indexRevision"].as_u64().unwrap();
+        match body["revision"]["indexRevision"].as_u64() {
+            Some(revision) if revision > prior_revision => break body,
+            Some(revision) if revision == prior_revision => {
+                // A repaired successor can serve the authenticated prior head
+                // before mandatory H commits. Prove a new live EX before
+                // waiting for the new pin; this 200 is not H success.
+                let marker = fs::read(&leader_lock).unwrap();
+                assert_ne!(marker, new_marker, "failed-H incarnation still serves");
+                let probe = fs::OpenOptions::new()
+                    .read(true)
+                    .open(&leader_lock)
+                    .unwrap();
+                assert_ne!(
+                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0,
+                    "prior head served without successor EX"
+                );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "repaired successor never committed H: prior_pin={:?} body={body:?} rows={:?} stderr={:?}",
+                    old["revision"],
+                    durable_rows(),
+                    fs::read_to_string(&stderr_path).unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => panic!(
+                "repaired successor served wrong pin: prior={:?} body={body:?}",
+                old["revision"]
             ),
-            "daemon served stale old pin after repair: {body:?}"
-        );
-        break body;
+        }
     };
     assert_eq!(
         successor.0.id(),
