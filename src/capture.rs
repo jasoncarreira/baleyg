@@ -496,6 +496,17 @@ fn running_executable() -> Result<Arc<RunningExecutable>> {
         .map_err(|message| anyhow::anyhow!(message.clone()))
 }
 
+/// A changed source inventory invalidates only this captured snapshot. A FIFO
+/// owner may retry the same accepted row after proving no publication committed.
+#[derive(Debug)]
+pub(crate) struct WorkspaceInventoryDrift;
+impl std::fmt::Display for WorkspaceInventoryDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("workspace inventory drift")
+    }
+}
+impl std::error::Error for WorkspaceInventoryDrift {}
+
 /// Bytes and complete admission inventory are retained until the final cutoff.
 /// No source is physically opened again during validation.
 pub struct Capture {
@@ -746,7 +757,9 @@ impl Capture {
             "workspace root drift"
         );
         let (inventory, _) = walk(&self.root, cancel)?;
-        ensure!(inventory == self.inventory, "workspace inventory drift");
+        if inventory != self.inventory {
+            return Err(WorkspaceInventoryDrift.into());
+        }
         for (path, expected) in &self.inputs {
             check(cancel)?;
             if path == &self.executable_path

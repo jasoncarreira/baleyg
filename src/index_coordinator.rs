@@ -850,14 +850,23 @@ fn drain_requests_observed_with_cancel(
             !cancel.load(Ordering::Acquire),
             "index wait interrupted; accepted request remains running for verified reclaim"
         );
-        if outcome
-            .as_ref()
-            .is_err_and(crate::store::transient_storage_contention)
+        let capture_drift = outcome.as_ref().is_err_and(|error| {
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::capture::WorkspaceInventoryDrift>()
+                    .is_some()
+            })
+        });
+        if capture_drift
+            || outcome
+                .as_ref()
+                .is_err_and(crate::store::transient_storage_contention)
         {
-            // The failed COMMIT might be ambiguous. Authenticate both the
-            // durable terminal row and the current pin before returning the
-            // SAME seq to queued; a changed pin remains running for a fresh
-            // leader reconciliation, never an invented terminal ACK.
+            // An invalidated capture cannot publish. A failed busy COMMIT can
+            // be ambiguous. For either one, authenticate the claim and exact
+            // unchanged pin before returning the SAME seq to queued. A changed
+            // pin stays running for verified successor recovery, never an
+            // invented terminal ACK or a duplicate native publication.
             let before = match before_publish {
                 Some(pin) => pin,
                 None => store.recovery_index_baseline()?.pin(),
@@ -1347,6 +1356,63 @@ mod tests {
                 Some(session.incarnation().to_string())
             );
         });
+    }
+
+    #[test]
+    fn claimed_request_requeues_same_fifo_row_after_capture_inventory_drift() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("a.js");
+        fs::write(&source, "function before() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let options = IndexOptions::new(workspace.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (prior, owner) = reconcile_workspace(&store, &options, &cancel, |_| {}).unwrap();
+        let request = store.enqueue_request(&options, None).unwrap();
+        let edited = AtomicBool::new(false);
+        let first = drain_requests_observed_with_native(
+            &store,
+            &owner,
+            |id, phase| {
+                if id == request.id && phase.phase == "scan" && !edited.swap(true, Ordering::AcqRel)
+                {
+                    // Capture has the old source, but its final inventory check
+                    // must observe this edit and reject that snapshot.
+                    fs::write(&source, "function after() {}\n").unwrap();
+                }
+            },
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert!(edited.load(Ordering::Acquire));
+        assert_eq!(first, 0);
+        assert_eq!(store.status().unwrap().revision, prior);
+        let pending = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(pending.seq, request.seq);
+        assert_eq!(pending.state, "queued");
+        assert!(pending.claim_incarnation.is_none() && pending.error_code.is_none());
+        assert!(owner.is_leader() && owner.verify().is_ok());
+
+        let second =
+            drain_requests_observed_with_native(&store, &owner, |_, _| {}, |_, _, _| {}).unwrap();
+        assert_eq!(second, 1);
+        let done = store.request_by_id(&request.id).unwrap().unwrap();
+        assert_eq!(done.seq, request.seq);
+        assert_eq!(done.state, "done");
+        let committed = done.revision.unwrap();
+        assert_eq!(committed.index_generation, prior.index_generation);
+        assert!(committed.index_revision > prior.index_revision);
+        let response = store.evidence_response().unwrap();
+        assert_eq!(
+            response
+                .source_at("a.js", Some(committed))
+                .unwrap()
+                .unwrap()
+                .1
+                .text,
+            "function after() {}\n"
+        );
+        response.finish(()).unwrap();
     }
 
     #[test]
