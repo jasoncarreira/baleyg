@@ -210,6 +210,7 @@ impl CheckoutRegistry {
             last_error: std::sync::Mutex::new(None),
             h_in_flight: AtomicBool::new(true),
             pre_h_hook: std::sync::Mutex::new(None),
+            release_permit_fault: AtomicBool::new(false),
         });
         self.runtimes.insert(key.to_owned(), runtime.clone());
         runtime.start(options, permit);
@@ -243,7 +244,7 @@ impl CheckoutRegistry {
             return Ok(false);
         }
         runtime.epoch.fetch_add(1, Ordering::AcqRel);
-        let permit = runtime.release_permit(&phase, &resources)?;
+        let permit = runtime.release_permit(&phase, &resources).ok().flatten();
         runtime.active.store(false, Ordering::Release);
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
@@ -607,39 +608,8 @@ impl CheckoutRegistry {
             Ok(roots) => roots,
             Err(_) => return true,
         };
-        let indexes = roots.cache.join("indexes");
-        let dirs = match fs::read_dir(&indexes) {
-            Ok(dirs) => dirs,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
-            Err(_) => return true,
-        };
-        for dir in dirs {
-            let Ok(dir) = dir else { return true };
-            let Ok(ty) = dir.file_type() else { return true };
-            if !ty.is_dir() {
-                continue;
-            }
-            let path = dir.path().join("requests.db");
-            if !path.exists() {
-                continue;
-            }
-            let pending = (|| -> rusqlite::Result<bool> {
-                let db = rusqlite::Connection::open_with_flags(
-                    path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )?;
-                db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM requests WHERE state IN ('queued','running'))",
-                    [],
-                    |row| row.get(0),
-                )
-            })();
-            if !matches!(pending, Ok(false)) {
-                return true;
-            }
-        }
-        false
+        let active: HashSet<String> = self.runtimes.keys().cloned().collect();
+        Store::orphan_queues_pending(&roots, &active)
     }
 
     pub fn idle_exit_deadline(&self) -> Option<Instant> {
@@ -752,6 +722,7 @@ pub struct CheckoutRuntime {
     last_error: std::sync::Mutex<Option<String>>,
     h_in_flight: AtomicBool,
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    release_permit_fault: AtomicBool,
 }
 
 enum RuntimePhase {
@@ -893,6 +864,11 @@ impl CheckoutRuntime {
         Ok((response, catching_up))
     }
 
+    #[doc(hidden)]
+    pub fn fail_next_release_permit_for_tests(&self) {
+        self.release_permit_fault.store(true, Ordering::Release);
+    }
+
     fn release_permit(
         &self,
         phase: &RuntimePhase,
@@ -901,6 +877,9 @@ impl CheckoutRuntime {
         let RuntimePhase::Ready(session) = phase else {
             return Ok(None);
         };
+        if self.release_permit_fault.swap(false, Ordering::AcqRel) {
+            anyhow::bail!("index_not_ready: no admissible prior head");
+        }
         if !session.is_leader() {
             return Ok(None);
         }

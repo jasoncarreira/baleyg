@@ -340,3 +340,82 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
     assert!(source.text.contains("changed"));
     response.finish(()).unwrap();
 }
+
+#[tokio::test]
+async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h() {
+    let (_base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let old = registry.activate(&id.root_key).unwrap();
+    ready(&old).await;
+    old.fail_next_release_permit_for_tests();
+    registry.disconnect_at(1, now);
+    assert_eq!(
+        registry
+            .advance(now + CHECKOUT_RELEASE_DELAY)
+            .unwrap()
+            .released,
+        vec![id.root_key.clone()]
+    );
+    assert!(!old.has_active_resources());
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    registry.attach_launch(2, &id).unwrap();
+    let resumed = registry.activate(&id.root_key).unwrap();
+    assert!(resumed.catching_up());
+    ready(&resumed).await;
+}
+
+#[tokio::test]
+async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drain() {
+    let (base, id, mut registry, now) = fixture();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots, identity(&id.root)).unwrap();
+    let options = baleyg::indexer::IndexOptions::new(id.root.clone());
+    let first = store.enqueue_request(&options, None).unwrap();
+    let second = store.enqueue_request(&options, None).unwrap();
+    assert!(first.seq < second.seq);
+    assert_eq!(
+        store.earliest_unfinished_request().unwrap().unwrap().id,
+        first.id
+    );
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    registry.disconnect_at(1, now);
+    let deadline = now + DAEMON_IDLE_DELAY;
+    let busy = registry.advance(deadline).unwrap();
+    assert!(busy.released.is_empty());
+    assert!(!busy.exit);
+    assert!(runtime.has_active_resources());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let a = store.request_by_id(&first.id).unwrap().unwrap();
+            let b = store.request_by_id(&second.id).unwrap().unwrap();
+            if a.finished_at.is_some() && b.finished_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let first_done = store.request_by_id(&first.id).unwrap().unwrap();
+    let second_done = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!(first_done.state, "done");
+    assert_eq!(second_done.state, "done");
+    let first_revision = first_done.revision.unwrap();
+    let second_revision = second_done.revision.unwrap();
+    assert_eq!(
+        first_revision.index_generation,
+        second_revision.index_generation
+    );
+    assert!(first_revision.index_revision < second_revision.index_revision);
+    let drained = registry.advance(deadline).unwrap();
+    assert_eq!(drained.released, vec![id.root_key.clone()]);
+    assert!(drained.exit);
+}
