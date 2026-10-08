@@ -170,3 +170,164 @@ pub async fn run_idle_lifecycle(
         }
     }
 }
+
+/// Browser HTTP is absent until explicit serve registration succeeds. The
+/// provisioner belongs to the elected daemon, not a checkout attachment.
+pub struct BrowserProvisioner {
+    listener: Option<tokio::net::TcpListener>,
+    browser: Option<crate::http::ProvisionedBrowser>,
+    requested_bind: Option<std::net::SocketAddr>,
+    token_path: Option<PathBuf>,
+    token_inode: Option<(u64, u64)>,
+    token: Option<String>,
+    effective_address: Option<std::net::SocketAddr>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for BrowserProvisioner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserProvisioner {
+    pub fn new() -> Self {
+        Self {
+            listener: None,
+            browser: None,
+            requested_bind: None,
+            token_path: None,
+            token_inode: None,
+            token: None,
+            effective_address: None,
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn address(&self) -> Option<std::net::SocketAddr> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            self.effective_address
+        }
+    }
+
+    pub fn router(&self) -> Option<axum::Router> {
+        self.browser
+            .clone()
+            .map(crate::http::ProvisionedBrowser::router)
+    }
+
+    /// Call under the daemon's provisioning mutex. All conflicts are checked
+    /// before touching registration, listener or another checkout's settings.
+    pub async fn register_serve(
+        &mut self,
+        registry: &std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        identity: &crate::store::topology::WorkspaceIdentity,
+        options: registry::CheckoutOptions,
+        bind: std::net::SocketAddr,
+        token_file: &Path,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        anyhow::ensure!(
+            bind.ip().is_loopback(),
+            "only loopback bind addresses are supported"
+        );
+        let parent = token_file
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("token file needs a parent"))?;
+        let file = token_file
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
+        let token_path = parent.canonicalize()?.join(file);
+        {
+            let checked = registry.lock().await;
+            checked
+                .can_register(identity, &options)
+                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        }
+        if let Some(original) = self.requested_bind {
+            anyhow::ensure!(self.address().is_some(), "browser listener closed");
+            anyhow::ensure!(
+                bind == original,
+                "serve bind conflicts with running listener"
+            );
+            anyhow::ensure!(
+                self.token_path.as_ref() == Some(&token_path),
+                "serve token file conflicts with running listener"
+            );
+            let metadata = fs::metadata(&token_path)?;
+            anyhow::ensure!(
+                self.token_inode == Some((metadata.dev(), metadata.ino())),
+                "serve token file identity changed"
+            );
+            let token = crate::auth::load_or_create_token(&token_path)?;
+            anyhow::ensure!(
+                self.token.as_ref() == Some(&token),
+                "serve token contents changed"
+            );
+            registry
+                .lock()
+                .await
+                .register(identity, options)
+                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            return self
+                .address()
+                .ok_or_else(|| anyhow::anyhow!("browser listener closed"));
+        }
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        let address = listener.local_addr()?;
+        let token = crate::auth::load_or_create_token(&token_path)?;
+        let metadata = fs::metadata(&token_path)?;
+        let browser =
+            crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
+        registry
+            .lock()
+            .await
+            .register(identity, options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        self.listener = Some(listener);
+        self.effective_address = Some(address);
+        self.browser = Some(browser);
+        self.requested_bind = Some(bind);
+        self.token_path = Some(token_path);
+        self.token_inode = Some((metadata.dev(), metadata.ino()));
+        self.token = Some(token);
+        Ok(address)
+    }
+
+    /// Start serving without consuming the provisioner. New explicit serve
+    /// registrations can still compare against its retained bind and token.
+    /// The caller monitors the task and closes serve control on idle exit.
+    pub fn spawn_until_idle(
+        &mut self,
+        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let browser = self
+            .browser
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let closed = self.closed.clone();
+        Ok(tokio::spawn(async move {
+            let server = axum::serve(listener, browser.router());
+            let result = tokio::select! {
+                outcome = server => outcome.map_err(anyhow::Error::from),
+                outcome = run_idle_lifecycle(registry) => outcome.map_err(|error| anyhow::anyhow!("{}", error.reason())),
+            };
+            closed.store(true, std::sync::atomic::Ordering::Release);
+            result
+        }))
+    }
+
+    /// Convenience for a single serve control owner; socket dispatch should
+    /// instead keep this provisioner and monitor the spawned task.
+    pub async fn serve_until_idle(
+        mut self,
+        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    ) -> anyhow::Result<()> {
+        self.spawn_until_idle(registry)?.await?
+    }
+}

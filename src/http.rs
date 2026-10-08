@@ -1667,19 +1667,29 @@ async fn db<T: Send + 'static>(
         })?
         .map_err(Into::into)
 }
-async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) -> Response {
+async fn guard(State(s): State<Arc<DaemonState>>, req: Request, next: Next) -> Response {
+    guard_common(&s.token, &s.hosts, &s.origins, req, next).await
+}
+
+async fn guard_common(
+    token: &str,
+    hosts: &[String],
+    origins: &[String],
+    mut req: Request,
+    next: Next,
+) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let origin = headers.get(header::ORIGIN);
     let mut response = if headers.get_all(header::HOST).iter().count() != 1
-        || !host.is_some_and(|h| s.hosts.iter().any(|v| v == h))
+        || !host.is_some_and(|h| hosts.iter().any(|v| v == h))
     {
         error(StatusCode::FORBIDDEN, "invalid_host", "Host is not allowed")
     } else if headers.get_all(header::ORIGIN).iter().count() > 1
         || origin.is_some_and(|h| {
             !h.to_str()
                 .ok()
-                .is_some_and(|v| s.origins.iter().any(|o| o == v))
+                .is_some_and(|v| origins.iter().any(|o| o == v))
         })
     {
         error(
@@ -1693,7 +1703,7 @@ async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) 
                 .get(header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|h| h.strip_prefix("Bearer "))
-                .is_some_and(|t| bool::from(t.as_bytes().ct_eq(s.token.as_bytes()))))
+                .is_some_and(|t| bool::from(t.as_bytes().ct_eq(token.as_bytes()))))
     {
         error(
             StatusCode::UNAUTHORIZED,
@@ -6724,4 +6734,70 @@ mod maintenance_telemetry_tests {
         assert_eq!((stats.successful_units, stats.preemptions), (1, 1));
         assert!(stats.deferred_since.is_none());
     }
+}
+
+/// The socket-only daemon has no HTTP state. This router is constructed only
+/// after a validated explicit serve registration binds a loopback listener.
+#[derive(Clone)]
+pub struct ProvisionedBrowser {
+    registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    token: String,
+    hosts: Vec<String>,
+    origins: Vec<String>,
+}
+
+impl ProvisionedBrowser {
+    pub fn new(
+        registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+        token: String,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            address.ip().is_loopback() && address.port() != 0,
+            "bound loopback address required"
+        );
+        anyhow::ensure!(valid_token(&token), "invalid bearer token");
+        let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+        let origins = hosts.iter().map(|host| format!("http://{host}")).collect();
+        Ok(Self {
+            registry,
+            token,
+            hosts,
+            origins,
+        })
+    }
+
+    pub fn router(self) -> Router {
+        let state = Arc::new(self);
+        Router::new()
+            .route("/", get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], include_str!("../web/index.html")) }))
+            .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/app.js")) }))
+            .route("/shell.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/shell.js")) }))
+            .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../web/style.css")) }))
+            .route("/classes.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/classes.js")) }))
+            .route("/classes.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../web/classes.css")) }))
+            .route("/fonts/jetbrains-mono-latin.woff2", get(|| async { ([(header::CONTENT_TYPE, "font/woff2")], &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..]) }))
+            .route("/fonts/space-grotesk-latin.woff2", get(|| async { ([(header::CONTENT_TYPE, "font/woff2")], &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..]) }))
+            .route("/fonts/JetBrainsMono-OFL.txt", get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], include_str!("../web/fonts/JetBrainsMono-OFL.txt")) }))
+            .route("/fonts/SpaceGrotesk-OFL.txt", get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], include_str!("../web/fonts/SpaceGrotesk-OFL.txt")) }))
+            .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+            .route("/healthz", get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }))
+            .route("/api/checkouts", get(|State(state): State<Arc<Self>>| async move {
+                Json(json!({"checkouts":state.registry.lock().await.known_roots().iter().map(|(key, root)| json!({"rootKey":key,"workspaceRoot":root})).collect::<Vec<_>>() }))
+            }))
+            .route("/api/daemon/status", get(|State(state): State<Arc<Self>>| async move {
+                let registry = state.registry.lock().await;
+                Json(json!({"activeCheckouts":registry.active_count()}))
+            }))
+            .layer(middleware::from_fn_with_state(state.clone(), provision_guard))
+            .with_state(state)
+    }
+}
+
+async fn provision_guard(
+    State(state): State<Arc<ProvisionedBrowser>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    guard_common(&state.token, &state.hosts, &state.origins, req, next).await
 }
