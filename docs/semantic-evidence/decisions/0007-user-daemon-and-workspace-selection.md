@@ -22,7 +22,7 @@ Agent clients start a stdio MCP server per session, and subagents share their pa
 - **CLI commands** use the daemon when it's running. Without it, they keep working standalone under the existing per-checkout leader lock.
 - **The browser** is served by the daemon on one loopback port with the existing token auth.
   - The page lists the checkouts the daemon knows: active ones, plus any with an existing index.
-  - Every browser API request names its checkout, for example in the URL path. There is no implicit default when more than one exists.
+  - Every checkout-scoped browser API request names its checkout (for example in the URL path); global listing, health and daemon-status requests name none. There is no implicit default when more than one checkout exists.
 
 ### 2. Per-call workspace selection (amends #24)
 
