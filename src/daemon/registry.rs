@@ -52,6 +52,8 @@ struct Entry {
     identity: Arc<WorkspaceIdentity>,
     registration: Option<CheckoutOptions>,
     sessions: HashSet<u64>,
+    released: bool,
+    pending_work: bool,
 }
 
 #[derive(Default)]
@@ -77,7 +79,7 @@ impl CheckoutRegistry {
     pub fn active_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| !entry.sessions.is_empty())
+            .filter(|entry| !entry.released || entry.pending_work)
             .count()
     }
 
@@ -103,7 +105,7 @@ impl CheckoutRegistry {
             if entry.registration.as_ref() == Some(&options) {
                 return Ok(());
             }
-            if !entry.sessions.is_empty() {
+            if !entry.released || entry.pending_work || !entry.sessions.is_empty() {
                 return Err(SelectionError::RegistrationConflict);
             }
             entry.registration = Some(options);
@@ -119,6 +121,8 @@ impl CheckoutRegistry {
                 ),
                 registration: Some(options),
                 sessions: HashSet::new(),
+                released: true,
+                pending_work: false,
             },
         );
         Ok(())
@@ -142,7 +146,7 @@ impl CheckoutRegistry {
         session: u64,
         launch: &WorkspaceIdentity,
         selected: &Path,
-    ) -> Result<Arc<WorkspaceIdentity>, SelectionError> {
+    ) -> Result<SelectedCheckout, SelectionError> {
         launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
@@ -167,7 +171,44 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::IdentityChanged);
         }
-        self.attach(session, &identity)
+        let selected = self.attach(session, &identity)?;
+        let witness = SelectedCheckout {
+            launch: Arc::new(
+                launch
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            identity: selected,
+            launch_common,
+            selected_common,
+        };
+        witness.before_answer()?;
+        Ok(witness)
+    }
+
+    /// Mark a known checkout busy even without an attached client. The runtime
+    /// supplies the actual queue/in-flight state and clears it after work drains.
+    pub fn set_pending_work(&mut self, key: &str, pending: bool) -> Result<(), SelectionError> {
+        let entry = self
+            .entries
+            .get_mut(key)
+            .ok_or(SelectionError::Unavailable)?;
+        entry.pending_work = pending;
+        Ok(())
+    }
+
+    /// Release is a separate lifecycle decision, never implied by disconnect.
+    /// The runtime calls this only after the idle delay and resource cleanup.
+    pub fn release(&mut self, key: &str) -> Result<bool, SelectionError> {
+        let entry = self
+            .entries
+            .get_mut(key)
+            .ok_or(SelectionError::Unavailable)?;
+        if !entry.sessions.is_empty() || entry.pending_work {
+            return Ok(false);
+        }
+        entry.released = true;
+        Ok(true)
     }
 
     fn attach(
@@ -186,10 +227,11 @@ impl CheckoutRegistry {
             {
                 return Err(SelectionError::IdentityChanged);
             }
-            if entry.sessions.is_empty() && at_capacity {
+            if entry.released && at_capacity {
                 return Err(SelectionError::CheckoutCapacity);
             }
             entry.sessions.insert(session);
+            entry.released = false;
             return Ok(Arc::clone(&entry.identity));
         }
         if at_capacity {
@@ -206,6 +248,8 @@ impl CheckoutRegistry {
                 identity: Arc::clone(&identity),
                 registration: None,
                 sessions: HashSet::from([session]),
+                released: false,
+                pending_work: false,
             },
         );
         Ok(identity)
@@ -216,6 +260,48 @@ impl CheckoutRegistry {
         for entry in self.entries.values_mut() {
             entry.sessions.remove(&session);
         }
+    }
+}
+
+/// A selected result must pass this fence immediately before its answer is sent.
+/// Keeping the captured launch identity prevents later calls from silently
+/// treating a changed repository as the original launch repository.
+#[derive(Debug)]
+pub struct SelectedCheckout {
+    pub identity: Arc<WorkspaceIdentity>,
+    launch: Arc<WorkspaceIdentity>,
+    launch_common: (u64, u64),
+    selected_common: (u64, u64),
+}
+impl SelectedCheckout {
+    pub fn before_answer(&self) -> Result<(), SelectionError> {
+        self.launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        self.identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        if common_identity(&self.launch).map_err(|_| SelectionError::IdentityChanged)?
+            != self.launch_common
+            || common_identity(&self.identity).map_err(|_| SelectionError::IdentityChanged)?
+                != self.selected_common
+            || self.launch_common != self.selected_common
+        {
+            return Err(SelectionError::IdentityChanged);
+        }
+        self.launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        self.identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        Ok(())
+    }
+}
+impl std::ops::Deref for SelectedCheckout {
+    type Target = WorkspaceIdentity;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
     }
 }
 

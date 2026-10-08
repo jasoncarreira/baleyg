@@ -64,8 +64,11 @@ fn selected_worktree_is_attributed_and_retained_until_disconnect() {
     assert_ne!(chosen.root_key, launch_id.root_key);
     assert_eq!(registry.active_count(), 2);
     registry.disconnect(1);
-    assert_eq!(registry.active_count(), 0);
+    assert_eq!(registry.active_count(), 2);
     assert_eq!(registry.known_roots().len(), 2);
+    assert!(registry.release(&chosen.root_key).unwrap());
+    assert!(registry.release(&launch_id.root_key).unwrap());
+    assert_eq!(registry.active_count(), 0);
 }
 
 #[test]
@@ -139,6 +142,34 @@ fn inert_registration_and_capacity() {
         SelectionError::RegistrationConflict
     );
     registry.disconnect(0);
+    assert_eq!(registry.active_count(), MAX_ACTIVE_CHECKOUTS);
+    assert_eq!(
+        registry
+            .attach_launch(999, &identities[MAX_ACTIVE_CHECKOUTS])
+            .unwrap_err(),
+        SelectionError::CheckoutCapacity
+    );
+    let replacement = CheckoutOptions(serde_json::json!({"provider":"other"}));
+    assert_eq!(
+        registry
+            .register(&identities[0], replacement.clone())
+            .unwrap_err(),
+        SelectionError::RegistrationConflict
+    );
+    registry
+        .set_pending_work(&identities[0].root_key, true)
+        .unwrap();
+    assert!(!registry.release(&identities[0].root_key).unwrap());
+    assert_eq!(
+        registry
+            .register(&identities[0], replacement.clone())
+            .unwrap_err(),
+        SelectionError::RegistrationConflict
+    );
+    registry
+        .set_pending_work(&identities[0].root_key, false)
+        .unwrap();
+    assert!(registry.release(&identities[0].root_key).unwrap());
     registry
         .attach_launch(999, &identities[MAX_ACTIVE_CHECKOUTS])
         .unwrap();
@@ -149,4 +180,83 @@ fn inert_registration_and_capacity() {
             CheckoutOptions(serde_json::json!({"provider":"other"})),
         )
         .unwrap();
+}
+
+#[test]
+fn linked_worktree_witness_refuses_common_directory_drift() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let launch = base.join("launch");
+    let selected = base.join("selected");
+    let foreign = base.join("foreign");
+    fs::create_dir(&launch).unwrap();
+    fs::create_dir(&foreign).unwrap();
+    git(&["init", "-q"], &launch);
+    git(&["init", "-q"], &foreign);
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ],
+        &launch,
+    );
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "selected",
+            selected.to_str().unwrap(),
+        ],
+        &launch,
+    );
+    let launch_id = identity(&launch);
+    let mut registry = CheckoutRegistry::new();
+    let witness = registry.select(1, &launch_id, &selected).unwrap();
+    witness.before_answer().unwrap();
+    let git_dir = witness.git_dir().unwrap();
+    fs::write(
+        git_dir.join("commondir"),
+        format!("{}\n", foreign.join(".git").display()),
+    )
+    .unwrap();
+    assert_eq!(
+        witness.before_answer().unwrap_err(),
+        SelectionError::IdentityChanged
+    );
+}
+
+#[test]
+fn stalled_git_common_directory_lookup_is_bounded() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        time::{Duration, Instant},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("checkout");
+    fs::create_dir(&root).unwrap();
+    git(&["init", "-q"], &root);
+    let identity = identity(&root);
+    let script = base.join("stalled-git");
+    fs::write(&script, "#!/bin/sh\nexec /bin/sleep 5\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let start = Instant::now();
+    let error = identity
+        .git_common_dir_with_executable(&script)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unavailable: Git common-directory lookup timed out"),
+        "{error}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(3));
 }
