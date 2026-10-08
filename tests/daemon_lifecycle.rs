@@ -462,74 +462,142 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
 
 #[tokio::test]
 async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
+    use baleyg::store::MaintenanceQueueState;
+
     let (base, id, mut registry, now) = fixture();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
     let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
     let options = baleyg::indexer::IndexOptions::new(id.root.clone());
-    let initial = store.enqueue_request(&options, None).unwrap();
-    // Retain the protected read-only queue connection and shared use guard
-    // while a second thread performs a real durable queue write.
+    let first = store.enqueue_request(&options, None).unwrap();
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "queued"
+    );
     let reader = store.open_maintenance_queue_probe().unwrap();
     assert!(matches!(
         reader,
         baleyg::store::QueueProbeAdmission::Ready(_)
     ));
+    assert_eq!(reader.check(), MaintenanceQueueState::Pending);
+
     registry.attach_launch(1, &id).unwrap();
     let runtime = registry.activate(&id.root_key).unwrap();
-    ready(&runtime).await;
-    let (written_tx, written_rx) = std::sync::mpsc::sync_channel(1);
-    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    // H must not claim the accepted row before the contention scan. Install
+    // the hook before yielding to the spawned reconciliation worker.
+    let (h_entered_tx, h_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (h_resume_tx, h_resume_rx) = std::sync::mpsc::sync_channel(1);
+    let h_resume_rx = std::sync::Mutex::new(h_resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        h_entered_tx.send(()).unwrap();
+        h_resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while h_entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("mandatory H did not reach pause");
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "queued"
+    );
+
+    let (writer_entered_tx, writer_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (writer_resume_tx, writer_resume_rx) = std::sync::mpsc::sync_channel(1);
     let writer_store = store.clone();
     let writer = std::thread::spawn(move || {
-        let first = writer_store.enqueue_request(&options, None).unwrap();
-        written_tx.send(first.id).unwrap();
-        resume_rx.recv().unwrap();
+        writer_store.enqueue_request_after_insert_for_tests(&options, None, || {
+            writer_entered_tx.send(()).unwrap();
+            writer_resume_rx.recv().unwrap();
+        })
     });
-    let first = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(id) = written_rx.try_recv() {
-                break id;
-            }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while writer_entered_rx.try_recv().is_err() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap();
-    assert!(store.request_by_id(&first).unwrap().is_some());
+    .expect("protected queue writer did not enter its transaction");
+    // The retained reader observes the rollback journal of the live writer,
+    // rather than a writer thread that is merely waiting after its commit.
+    assert_eq!(reader.check(), MaintenanceQueueState::Unknown);
     let active = std::iter::once(id.root_key.clone()).collect();
-    let (active_read, _) = runtime.evidence_response().unwrap();
-    assert!(!baleyg::store::Store::orphan_queues_pending(
-        &roots, &active
-    ));
     registry.disconnect_at(1, now);
-    let busy = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
-    assert!(busy.released.is_empty());
-    assert!(!busy.exit);
+    // SQLite busy retries must run off the Tokio scheduler while the writer
+    // waits on its channel. The scanner sees both the active and orphan views
+    // of the SAME root before the transaction is allowed to commit.
+    let (active_pending, orphan_pending, tick, returned_registry) =
+        tokio::task::spawn_blocking(move || {
+            let active_pending = baleyg::store::Store::orphan_queues_pending(&roots, &active);
+            let orphan_pending =
+                baleyg::store::Store::orphan_queues_pending(&roots, &Default::default());
+            let tick = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
+            (active_pending, orphan_pending, tick, registry)
+        })
+        .await
+        .unwrap();
+    registry = returned_registry;
+    assert!(
+        !active_pending,
+        "an active root must not enter the orphan scanner"
+    );
+    assert!(
+        orphan_pending,
+        "the live writer and accepted row are not clear orphan work"
+    );
+    assert!(tick.released.is_empty());
+    assert!(!tick.exit);
     assert!(runtime.has_active_resources());
-    let _ = reader.check();
+    assert_eq!(reader.check(), MaintenanceQueueState::Unknown);
+
+    writer_resume_tx.send(()).unwrap();
+    let second = tokio::task::spawn_blocking(move || writer.join().unwrap().unwrap())
+        .await
+        .unwrap();
+    assert!(first.seq < second.seq);
+    assert_eq!(
+        store.request_by_id(&first.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(
+        store.request_by_id(&second.id).unwrap().unwrap().state,
+        "queued"
+    );
+    assert_eq!(
+        store.earliest_unfinished_request().unwrap().unwrap().id,
+        first.id
+    );
     drop(reader);
-    active_read.finish(()).unwrap();
-    drop(active_read);
-    resume_tx.send(()).unwrap();
-    writer.join().unwrap();
+    h_resume_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
-        while store
-            .request_by_id(&first)
-            .unwrap()
-            .is_none_or(|request| request.finished_at.is_none())
-        {
-            tokio::task::yield_now().await;
+        loop {
+            let a = store.request_by_id(&first.id).unwrap().unwrap();
+            let b = store.request_by_id(&second.id).unwrap().unwrap();
+            if a.finished_at.is_some() && b.finished_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(store.request_by_id(&first).unwrap().unwrap().state, "done");
+    assert!(store.earliest_unfinished_request().unwrap().is_none());
+    let first_done = store.request_by_id(&first.id).unwrap().unwrap();
+    let second_done = store.request_by_id(&second.id).unwrap().unwrap();
+    assert_eq!(first_done.state, "done");
+    assert_eq!(second_done.state, "done");
     assert_eq!(
-        store.request_by_id(&initial.id).unwrap().unwrap().state,
-        "done"
+        first_done.revision.unwrap().index_generation,
+        second_done.revision.unwrap().index_generation
     );
-    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert!(
+        first_done.revision.unwrap().index_revision < second_done.revision.unwrap().index_revision
+    );
+    let drained = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
+    assert_eq!(drained.released, vec![id.root_key.clone()]);
+    assert!(drained.exit);
 }
 
 #[tokio::test]

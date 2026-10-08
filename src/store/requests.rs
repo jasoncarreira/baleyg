@@ -691,6 +691,26 @@ impl Store {
         expected: Option<IndexPin>,
         after_write_lock: impl FnOnce(),
     ) -> Result<Request> {
+        self.enqueue_request_with_hooks(options, expected, after_write_lock, || {})
+    }
+    /// Pause a real protected queue write after INSERT but before COMMIT. The
+    /// rollback journal is live here; the row is not yet accepted or visible.
+    #[doc(hidden)]
+    pub fn enqueue_request_after_insert_for_tests(
+        &self,
+        options: &IndexOptions,
+        expected: Option<IndexPin>,
+        after_insert: impl FnOnce(),
+    ) -> Result<Request> {
+        self.enqueue_request_with_hooks(options, expected, || {}, after_insert)
+    }
+    fn enqueue_request_with_hooks(
+        &self,
+        options: &IndexOptions,
+        expected: Option<IndexPin>,
+        after_write_lock: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) -> Result<Request> {
         self.identity.verify()?;
         let selected = std::fs::symlink_metadata(&options.workspace_root)?;
         ensure!(
@@ -718,6 +738,7 @@ impl Store {
         let root_inode = self.identity.inode.to_string();
         tx.execute("INSERT INTO requests (id,root_device,root_inode,options_json,expected_generation,expected_revision,state,submitted_at) VALUES (?1,?2,?3,?4,?5,?6,'queued',?7)", params![id,root_device,root_inode,encoded,expected.map(|p|p.index_generation.to_string()),expected.map(|p|p.index_revision as i64),submitted_at])?;
         let seq = tx.last_insert_rowid();
+        after_insert();
         tx.commit()?;
         self.identity.verify()?;
         // Return the exact accepted row constructed under the INSERT transaction.
