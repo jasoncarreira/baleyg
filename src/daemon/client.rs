@@ -20,17 +20,24 @@ impl CallError {
     }
 }
 
+/// The starter reports election loss separately from unexpected startup failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    Started,
+    ElectionInProgress,
+}
+
 /// Start is invoked only after a failed initial connect. Concurrent starters may both
 /// invoke it; the daemon's flock elects exactly one listener.
 pub fn connect_or_start(
     socket: &Path,
-    mut start: impl FnMut() -> io::Result<()>,
+    mut start: impl FnMut() -> io::Result<StartOutcome>,
     timeout: Duration,
 ) -> io::Result<UnixStream> {
     if let Ok(stream) = UnixStream::connect(socket) {
         return Ok(stream);
     }
-    start()?;
+    let _ = start()?; // An election loser waits for the winner within the same deadline.
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(stream) = UnixStream::connect(socket) {

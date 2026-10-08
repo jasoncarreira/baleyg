@@ -1,4 +1,4 @@
-use baleyg::daemon::client::{self, CallError};
+use baleyg::daemon::client::{self, CallError, StartOutcome};
 use baleyg::daemon::protocol::{self, Reply, Request};
 use baleyg::daemon::{SocketOwner, SocketPaths};
 use serde_json::json;
@@ -6,7 +6,7 @@ use std::io::{self, Cursor};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -154,7 +154,7 @@ fn no_listener_is_typed_unavailable_and_demand_start_is_socket_only() {
             // Socket startup does not create an HTTP listener or checkout index.
             assert!(!paths.run.parent().unwrap().join("indexes").exists());
             held = Some(guard);
-            Ok(())
+            Ok(StartOutcome::Started)
         },
         Duration::from_millis(200),
     );
@@ -169,4 +169,75 @@ fn no_listener_is_typed_unavailable_and_demand_start_is_socket_only() {
         .unwrap_err(),
         CallError::DaemonUnavailable
     );
+}
+
+#[test]
+fn nested_cold_start_does_not_activate_a_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = SocketPaths::new(&temp.path().join("one/two/three/baleyg"));
+    let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
+    for dir in [
+        temp.path().join("one"),
+        temp.path().join("one/two"),
+        temp.path().join("one/two/three"),
+        paths.run.parent().unwrap().to_path_buf(),
+        paths.run.clone(),
+    ] {
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert!(!paths.run.parent().unwrap().join("indexes").exists());
+    assert!(UnixStream::connect(&paths.socket).is_ok());
+    drop(owner);
+}
+
+#[test]
+fn two_demand_starters_both_connect_after_one_election() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = paths(&temp);
+    let before_start = Arc::new(Barrier::new(3));
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let clients: Vec<_> = (0..2)
+        .map(|_| {
+            let paths = paths.clone();
+            let before_start = before_start.clone();
+            let owners = owners.clone();
+            let outcomes = outcomes.clone();
+            thread::spawn(move || {
+                client::connect_or_start(
+                    &paths.socket,
+                    || {
+                        // Both clients failed the initial connect before either begins election.
+                        before_start.wait();
+                        let outcome = match SocketOwner::acquire(&paths)? {
+                            Some(owner) => {
+                                owners.lock().unwrap().push(owner);
+                                StartOutcome::Started
+                            }
+                            None => StartOutcome::ElectionInProgress,
+                        };
+                        outcomes.lock().unwrap().push(outcome);
+                        Ok(outcome)
+                    },
+                    Duration::from_secs(2),
+                )
+            })
+        })
+        .collect();
+    before_start.wait();
+    let streams: Vec<_> = clients
+        .into_iter()
+        .map(|client| client.join().unwrap())
+        .collect();
+    assert!(
+        streams.iter().all(Result::is_ok),
+        "both starters must connect"
+    );
+    assert_eq!(owners.lock().unwrap().len(), 1);
+    let outcomes = outcomes.lock().unwrap();
+    assert!(outcomes.contains(&StartOutcome::Started));
+    assert!(outcomes.contains(&StartOutcome::ElectionInProgress));
 }

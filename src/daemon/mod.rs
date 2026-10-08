@@ -27,13 +27,34 @@ impl SocketPaths {
     }
 
     fn prepare(&self) -> io::Result<()> {
-        // The private data directory is created by the same topology as the index store.
-        for dir in [&self.run.parent().unwrap().to_path_buf(), &self.run] {
+        // Existing system ancestors are not managed by Baleyg. Create each missing
+        // component privately, even when the data directory itself is not present.
+        let mut missing = Vec::new();
+        let mut ancestor = self.run.as_path();
+        while !ancestor.exists() {
+            missing.push(ancestor.to_path_buf());
+            ancestor = ancestor.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "daemon directory has no ancestor",
+                )
+            })?;
+        }
+        let metadata = fs::symlink_metadata(ancestor)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe daemon ancestor",
+            ));
+        }
+        for dir in missing.iter().rev() {
             match fs::DirBuilder::new().mode(0o700).create(dir) {
                 Ok(()) => (),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
                 Err(error) => return Err(error),
             }
+        }
+        for dir in [self.run.parent().unwrap(), self.run.as_path()] {
             let metadata = fs::symlink_metadata(dir)?;
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
