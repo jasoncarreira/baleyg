@@ -4951,6 +4951,94 @@ impl Store {
             && probe.check() == MaintenanceQueueState::Clear
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(priority)).unwrap_or(false)
     }
+    /// Inspect only already published, inactive index queues. Unknown paths or
+    /// unreadable identities keep the daemon alive rather than abandoning work.
+    pub fn orphan_queues_pending(
+        roots: &topology::TopologyRoots,
+        active: &std::collections::HashSet<String>,
+    ) -> bool {
+        let parent = roots.cache.join("indexes");
+        let dirs = match std::fs::read_dir(&parent) {
+            Ok(dirs) => dirs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        for entry in dirs {
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else {
+                return true;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
+                return true;
+            };
+            if active.contains(&key) {
+                continue;
+            }
+            if Self::orphan_queue_pending_at(roots, &key).unwrap_or(true) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn orphan_queue_pending_at(roots: &topology::TopologyRoots, key: &str) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        ensure!(
+            key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid index key"
+        );
+        let dir = roots.cache.join("indexes").join(key);
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "unsafe index directory"
+        );
+        let guard = topology::UseGuard::acquire_existing_readonly(
+            &roots.cache.join("indexes").join(format!("{key}.lock")),
+        )?;
+        let path = dir.join("index.db");
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let absent = requests::queue_absent_without_sidecars(&dir.join("requests.db"));
+                guard.verify()?;
+                return Ok(!absent);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // SQLite may recover a hot journal or create shared-memory files even
+        // through a read-only connection. Check all sidecars before opening it.
+        reject_sidecars(&path, true)?;
+        let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
+        let (spelling, device, inode): (String, String, String) = db.query_row(
+            "SELECT root_spelling,root_device,root_inode FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        drop(db);
+        ensure!(
+            hex::encode(Sha256::digest(spelling.as_bytes())) == key,
+            "index identity mismatch"
+        );
+        let root = Path::new(&spelling);
+        let identity = topology::WorkspaceIdentity::discover_unattached(Some(root), root)?
+            .attach_existing_marker_readonly()?;
+        ensure!(
+            identity.root_key == key
+                && identity.device == device.parse::<u64>()?
+                && identity.inode == inode.parse::<u64>()?,
+            "index root changed"
+        );
+        guard.verify()?;
+        let store = Self::unopened(roots.clone(), identity)?;
+        let pending = store.open_maintenance_queue_probe()?.check() != MaintenanceQueueState::Clear;
+        guard.verify()?;
+        Ok(pending)
+    }
+
     pub fn open(
         roots: topology::TopologyRoots,
         identity: topology::WorkspaceIdentity,

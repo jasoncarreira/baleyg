@@ -16,9 +16,19 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 pub const MAX_ACTIVE_CHECKOUTS: usize = 64;
+pub const BROWSER_IDLE_DELAY: Duration = Duration::from_secs(15 * 60);
+pub const CHECKOUT_RELEASE_DELAY: Duration = Duration::from_secs(15 * 60);
+pub const DAEMON_IDLE_DELAY: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LifecycleTick {
+    pub released: Vec<String>,
+    pub exit: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionError {
@@ -99,28 +109,52 @@ struct Entry {
     sessions: HashSet<u64>,
     released: bool,
     pending_work: bool,
+    external_work: bool,
+    browser_until: Option<Instant>,
+    release_at: Option<Instant>,
 }
 
-#[derive(Default)]
 pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
     roots: Option<TopologyRoots>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
     idle_permits: HashMap<String, PreHReadPermit>,
     idle_epochs: HashMap<String, Arc<AtomicU64>>,
+    idle_exit_at: Option<Instant>,
+}
+
+impl Default for CheckoutRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CheckoutRegistry {
     pub fn new() -> Self {
-        Self::default()
+        Self::starting_at(Instant::now())
+    }
+
+    pub fn starting_at(now: Instant) -> Self {
+        Self {
+            entries: HashMap::new(),
+            roots: None,
+            runtimes: HashMap::new(),
+            idle_permits: HashMap::new(),
+            idle_epochs: HashMap::new(),
+            idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
+        }
     }
 
     /// Supply isolated roots in fixtures. The default uses the user's normal
     /// topology only when a checkout is actually activated.
     pub fn with_roots(roots: TopologyRoots) -> Self {
+        Self::with_roots_at(roots, Instant::now())
+    }
+
+    pub fn with_roots_at(roots: TopologyRoots, now: Instant) -> Self {
         Self {
             roots: Some(roots),
-            ..Self::default()
+            ..Self::starting_at(now)
         }
     }
 
@@ -136,7 +170,7 @@ impl CheckoutRegistry {
             .get(key)
             .ok_or_else(|| anyhow::anyhow!("checkout not attached"))?;
         anyhow::ensure!(
-            !entry.released && !entry.sessions.is_empty(),
+            !entry.released && (!entry.sessions.is_empty() || entry.browser_until.is_some()),
             "checkout not attached"
         );
         if let Some(runtime) = self.runtimes.get(key) {
@@ -176,6 +210,7 @@ impl CheckoutRegistry {
             last_error: std::sync::Mutex::new(None),
             h_in_flight: AtomicBool::new(true),
             pre_h_hook: std::sync::Mutex::new(None),
+            release_permit_fault: AtomicBool::new(false),
         });
         self.runtimes.insert(key.to_owned(), runtime.clone());
         runtime.start(options, permit);
@@ -209,7 +244,7 @@ impl CheckoutRegistry {
             return Ok(false);
         }
         runtime.epoch.fetch_add(1, Ordering::AcqRel);
-        let permit = runtime.release_permit(&phase, &resources)?;
+        let permit = runtime.release_permit(&phase, &resources).ok().flatten();
         runtime.active.store(false, Ordering::Release);
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
@@ -277,6 +312,9 @@ impl CheckoutRegistry {
                 sessions: HashSet::new(),
                 released: true,
                 pending_work: false,
+                external_work: false,
+                browser_until: None,
+                release_at: None,
             },
         );
         Ok(())
@@ -292,7 +330,7 @@ impl CheckoutRegistry {
         launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
-        self.attach(session, launch)
+        self.attach(Some(session), launch)
     }
 
     pub fn select(
@@ -342,7 +380,7 @@ impl CheckoutRegistry {
             selected_common,
         };
         witness.before_answer()?;
-        let selected = self.attach(session, &identity)?;
+        let selected = self.attach(Some(session), &identity)?;
         Ok(SelectedCheckout {
             identity: selected,
             ..witness
@@ -356,6 +394,7 @@ impl CheckoutRegistry {
             .entries
             .get_mut(key)
             .ok_or(SelectionError::Unavailable)?;
+        entry.external_work = pending;
         entry.pending_work = pending;
         Ok(())
     }
@@ -363,18 +402,29 @@ impl CheckoutRegistry {
     /// Probe only already-active checkouts. A failed queue probe remains busy;
     /// never activate an inert registered checkout to refresh pending work.
     pub fn refresh_pending_work(&mut self, key: &str) -> Result<bool, SelectionError> {
-        let pending = match self.runtimes.get(key) {
-            Some(runtime) => {
-                runtime.catching_up() || runtime.active_reads.load(Ordering::Acquire) != 0
-            }
-            None => {
-                return Ok(self
-                    .entries
-                    .get(key)
-                    .ok_or(SelectionError::Unavailable)?
-                    .pending_work);
-            }
-        };
+        let external = self
+            .entries
+            .get(key)
+            .ok_or(SelectionError::Unavailable)?
+            .external_work;
+        let pending = external
+            || match self.runtimes.get(key) {
+                Some(runtime) => {
+                    let resources = runtime
+                        .resources()
+                        .map_err(|_| SelectionError::Unavailable)?;
+                    runtime.catching_up()
+                        || runtime.active_reads.load(Ordering::Acquire) != 0
+                        || CheckoutRuntime::queue_pending(&resources)
+                }
+                None => {
+                    return Ok(self
+                        .entries
+                        .get(key)
+                        .ok_or(SelectionError::Unavailable)?
+                        .pending_work);
+                }
+            };
         self.entries
             .get_mut(key)
             .ok_or(SelectionError::Unavailable)?
@@ -387,7 +437,7 @@ impl CheckoutRegistry {
     pub fn release(&mut self, key: &str) -> Result<bool, SelectionError> {
         self.refresh_pending_work(key)?;
         let entry = self.entries.get(key).ok_or(SelectionError::Unavailable)?;
-        if !entry.sessions.is_empty() || entry.pending_work {
+        if !entry.sessions.is_empty() || entry.browser_until.is_some() || entry.pending_work {
             return Ok(false);
         }
         if !self
@@ -402,7 +452,7 @@ impl CheckoutRegistry {
 
     fn attach(
         &mut self,
-        session: u64,
+        session: Option<u64>,
         identity: &WorkspaceIdentity,
     ) -> Result<Arc<WorkspaceIdentity>, SelectionError> {
         let at_capacity = self.active_count() >= MAX_ACTIVE_CHECKOUTS;
@@ -418,8 +468,12 @@ impl CheckoutRegistry {
                     .verified_clone()
                     .map_err(|_| SelectionError::IdentityChanged)?,
             );
-            entry.sessions.insert(session);
+            if let Some(session) = session {
+                entry.sessions.insert(session);
+            }
+            entry.release_at = None;
             entry.released = false;
+            self.idle_exit_at = None;
             return Ok(checked);
         }
         if at_capacity {
@@ -435,18 +489,142 @@ impl CheckoutRegistry {
             Entry {
                 identity: CheckoutMetadata::from_identity(&identity),
                 registration: None,
-                sessions: HashSet::from([session]),
+                sessions: session.into_iter().collect(),
                 released: false,
                 pending_work: false,
+                external_work: false,
+                browser_until: None,
+                release_at: None,
             },
         );
+        self.idle_exit_at = None;
         Ok(identity)
     }
 
     /// Called at MCP EOF/disconnect; an explicit worktree remains attached until then.
     pub fn disconnect(&mut self, session: u64) {
+        self.disconnect_at(session, Instant::now());
+    }
+
+    pub fn disconnect_at(&mut self, session: u64, now: Instant) {
+        let expired_at = self.expire_browsers(now);
+        if let Some(expired_at) = expired_at {
+            self.update_exit_deadline(expired_at);
+        }
+        let mut disconnected = false;
         for entry in self.entries.values_mut() {
-            entry.sessions.remove(&session);
+            if entry.sessions.remove(&session) {
+                disconnected = true;
+                if entry.sessions.is_empty() && entry.browser_until.is_none() {
+                    entry.release_at = Some(now + CHECKOUT_RELEASE_DELAY);
+                }
+            }
+        }
+        if !disconnected {
+            return;
+        }
+        if self
+            .entries
+            .values()
+            .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none())
+        {
+            self.idle_exit_at = Some(now + DAEMON_IDLE_DELAY);
+        } else {
+            self.update_exit_deadline(now);
+        }
+    }
+
+    /// Browser activity is a virtual client, not an MCP/CLI session. A later
+    /// selected request renews its expiry without shortening the release grace.
+    pub fn browser_request_at(
+        &mut self,
+        identity: &WorkspaceIdentity,
+        now: Instant,
+    ) -> Result<Arc<WorkspaceIdentity>, SelectionError> {
+        let attached = self.attach(None, identity)?;
+        let entry = self.entries.get_mut(&identity.root_key).unwrap();
+        entry.browser_until = Some(now + BROWSER_IDLE_DELAY);
+        entry.release_at = None;
+        self.idle_exit_at = None;
+        Ok(attached)
+    }
+
+    /// Advance deterministic lifecycle clocks. Busy resources keep their original
+    /// deadlines: once work drains, no extra grace interval is added.
+    pub fn advance(&mut self, now: Instant) -> Result<LifecycleTick, SelectionError> {
+        // Expired clients disconnect at their deadline, not at this tick.
+        let expired_at = self.expire_browsers(now);
+        self.update_exit_deadline(expired_at.unwrap_or(now));
+        let due: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.release_at.is_some_and(|at| now >= at))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut released = Vec::new();
+        for key in due {
+            if self.release(&key)? {
+                self.entries.get_mut(&key).unwrap().release_at = None;
+                released.push(key);
+            }
+        }
+        let mut busy = false;
+        for key in self.entries.keys().cloned().collect::<Vec<_>>() {
+            busy |= self.refresh_pending_work(&key)?;
+        }
+        let exit = self.idle_exit_at.is_some_and(|at| now >= at)
+            && !busy
+            && !self.orphan_queue_pending()
+            && self
+                .entries
+                .values()
+                .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none());
+        Ok(LifecycleTick { released, exit })
+    }
+
+    fn expire_browsers(&mut self, now: Instant) -> Option<Instant> {
+        let mut last = None;
+        for entry in self.entries.values_mut() {
+            if entry.browser_until.is_some_and(|until| now >= until) {
+                let until = entry.browser_until.take().unwrap();
+                if entry.sessions.is_empty() {
+                    entry.release_at = Some(until + CHECKOUT_RELEASE_DELAY);
+                    last = Some(last.map_or(until, |previous: Instant| previous.max(until)));
+                }
+            }
+        }
+        last
+    }
+
+    /// Check durable queues even for roots that have not attached since daemon
+    /// startup. An unreadable queue is busy, not permission to abandon work.
+    fn orphan_queue_pending(&self) -> bool {
+        let roots = match self
+            .roots
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(TopologyRoots::production)
+        {
+            Ok(roots) => roots,
+            Err(_) => return true,
+        };
+        let active: HashSet<String> = self.runtimes.keys().cloned().collect();
+        Store::orphan_queues_pending(&roots, &active)
+    }
+
+    pub fn idle_exit_deadline(&self) -> Option<Instant> {
+        self.idle_exit_at
+    }
+
+    fn update_exit_deadline(&mut self, now: Instant) {
+        if self
+            .entries
+            .values()
+            .any(|entry| !entry.sessions.is_empty() || entry.browser_until.is_some())
+        {
+            self.idle_exit_at = None;
+        } else if self.idle_exit_at.is_none() {
+            self.idle_exit_at = Some(now + DAEMON_IDLE_DELAY);
         }
     }
 }
@@ -544,6 +722,7 @@ pub struct CheckoutRuntime {
     last_error: std::sync::Mutex<Option<String>>,
     h_in_flight: AtomicBool,
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    release_permit_fault: AtomicBool,
 }
 
 enum RuntimePhase {
@@ -685,6 +864,11 @@ impl CheckoutRuntime {
         Ok((response, catching_up))
     }
 
+    #[doc(hidden)]
+    pub fn fail_next_release_permit_for_tests(&self) {
+        self.release_permit_fault.store(true, Ordering::Release);
+    }
+
     fn release_permit(
         &self,
         phase: &RuntimePhase,
@@ -693,6 +877,9 @@ impl CheckoutRuntime {
         let RuntimePhase::Ready(session) = phase else {
             return Ok(None);
         };
+        if self.release_permit_fault.swap(false, Ordering::AcqRel) {
+            anyhow::bail!("index_not_ready: no admissible prior head");
+        }
         if !session.is_leader() {
             return Ok(None);
         }
@@ -825,6 +1012,9 @@ impl CheckoutRuntime {
                     *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
                 }
             }
+        }
+        if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
+            hook();
         }
         establish_serving_session(store, Some(options), &cancel)
     }
