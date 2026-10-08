@@ -3638,7 +3638,20 @@ fn selected_producer_hash(db: &Connection, selected: &ReadRevision) -> Result<St
     Ok(executable)
 }
 
-fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PairedManifestScope {
+    // A new Store admits the entire retained history once; staged replacement does too.
+    Full,
+    // Authored revisions were checked when published. Recheck the head, its newly
+    // superseded predecessor, and in-flight maintenance rather than every manifest.
+    Changing,
+}
+
+fn validate_paired_metadata(
+    db: &Connection,
+    root_id: &str,
+    scope: PairedManifestScope,
+) -> Result<()> {
     fn one_row(db: &Connection, sql: &str) -> Result<Option<(String, String)>> {
         let mut rows = db
             .prepare(sql)?
@@ -3720,16 +3733,22 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
             "incompatible_index: retained manifest/release mismatch"
         );
     } else {
-        // Validate all states on broad admission/status, never on a private no-op.
         // Pending retains original inputs while its manifest may be partly drained.
+        // A changed predecessor has just gained its supersession row; any pending
+        // debt is also mutable. Only Store admission/replacement sweeps all history.
         let malformed: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM native_revisions r
              CROSS JOIN index_metadata h
              LEFT JOIN native_revision_supersessions s ON s.revision_id=r.id
              LEFT JOIN native_revision_release_debt debt ON debt.revision_id=r.id
-             WHERE
+             WHERE (?1=1 OR r.id='pin:v1:'||h.index_generation||':'||h.index_revision
+                    OR r.published_index_revision=h.index_revision-1
+                    OR s.state='pending' OR debt.revision_id IS NOT NULL)
+               AND (
                (r.id='pin:v1:'||h.index_generation||':'||h.index_revision
-                    AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL))
+                    AND (s.revision_id IS NOT NULL OR debt.revision_id IS NOT NULL
+                         OR (SELECT count(*) FROM revision_documents d WHERE d.revision_id=r.id)
+                              != json_array_length(r.source_inventory)))
                OR (r.id!='pin:v1:'||h.index_generation||':'||h.index_revision
                     AND s.revision_id IS NULL)
                OR (debt.revision_id IS NOT NULL AND (s.state!='pending' OR debt.phase!='pending'))
@@ -3755,8 +3774,8 @@ fn validate_paired_metadata(db: &Connection, root_id: &str) -> Result<()> {
                     AND ((i.input_key='__pending_release:v1' AND (i.payload!='pending_release:v1'
                           OR s.state!='pending'))
                          OR (i.input_key='__released:v1' AND (i.payload!='released:v1'
-                          OR s.state!='released')))))",
-            [],
+                          OR s.state!='released'))))))",
+            [scope == PairedManifestScope::Full],
             |row| row.get(0),
         )?;
         control_ensure!(
@@ -3930,12 +3949,16 @@ pub(crate) fn compare_capture_observations(
     comparison
 }
 
+// Keep the selected manifest indexed even when many older revisions are retained.
+// The revision join still verifies that this is the exact metadata-selected head.
+const SELECTED_CAPTURE_SNAPSHOT_SQL: &str = "SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) ORDER BY d.path";
+
 fn compare_capture_snapshot(
     db: &Connection,
     capture: &crate::capture::Capture,
 ) -> Result<ScanComparison> {
     let mut previous_sources = BTreeMap::new();
-    let mut statement = db.prepare("SELECT d.path,v.content_hash,d.capture_stat FROM revision_documents d JOIN document_versions v ON v.id=d.document_version_id JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY d.path")?;
+    let mut statement = db.prepare(SELECTED_CAPTURE_SNAPSHOT_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -4012,6 +4035,9 @@ fn validate_capture_stat(stat: &crate::capture::CaptureStat, expected_kind: &str
     Ok(())
 }
 
+// The same selected-pin anchor keeps reconciliation independent of retained manifests.
+const SELECTED_RECONCILE_FILES_SQL: &str = "SELECT d.path,d.capture_stat FROM revision_documents d JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision WHERE d.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) ORDER BY d.path";
+
 fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     let (incarnation, options): (Option<String>, Option<String>) = db.query_row(
         "SELECT reconciled_incarnation,reconcile_options FROM index_metadata WHERE singleton=1",
@@ -4039,7 +4065,7 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     );
 
     let mut source_paths = BTreeSet::new();
-    let mut file_statement = db.prepare("SELECT d.path,d.capture_stat FROM revision_documents d JOIN native_revisions r ON r.id=d.revision_id JOIN index_metadata m ON m.index_revision=r.published_index_revision AND r.id='pin:v1:'||m.index_generation||':'||m.index_revision ORDER BY d.path")?;
+    let mut file_statement = db.prepare(SELECTED_RECONCILE_FILES_SQL)?;
     let mut files = file_statement.query([])?;
     while let Some(row) = files.next()? {
         let path: String = row.get(0)?;
@@ -4215,7 +4241,11 @@ fn validate_reconcile_inventory(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
+fn validate_bounded_control(
+    db: &Connection,
+    root_id: &str,
+    scope: PairedManifestScope,
+) -> Result<()> {
     validate_supersessions(db)?;
     bounded_graph_pair(
         db,
@@ -4230,7 +4260,7 @@ fn validate_bounded_control(db: &Connection, root_id: &str) -> Result<()> {
     )?;
     let _: IndexStats = serde_json::from_str(&stats)?;
     let _: Vec<Diagnostic> = serde_json::from_str(&diagnostics)?;
-    validate_paired_metadata(db, root_id)?;
+    validate_paired_metadata(db, root_id, scope)?;
     validate_reconcile_inventory(db)?;
     let warnings_bytes: Option<i64> = db
         .query_row(
@@ -4790,7 +4820,7 @@ impl Store {
         let admission = (|| -> Result<()> {
             let mut db = store.cache()?;
             let tx = storage_result(db.transaction())?;
-            let _ = store.recovery_baseline(&tx)?;
+            let _ = store.recovery_baseline_full(&tx)?;
             Ok(())
         })();
         match admission {
@@ -4960,7 +4990,7 @@ impl Store {
         witness.verify()?;
         let mut db = reopened.cache()?;
         let tx = storage_result(db.transaction())?;
-        let pin = reopened.recovery_baseline(&tx)?.pin();
+        let pin = reopened.recovery_baseline_full(&tx)?.pin();
         drop(tx);
         drop(db);
         witness.verify()?;
@@ -5231,7 +5261,7 @@ impl Store {
             marker == leader.incarnation.to_string(),
             "index_not_ready: staged leader marker changed"
         );
-        validate_bounded_control(&db, &self.identity.record_id)?;
+        validate_bounded_control(&db, &self.identity.record_id, PairedManifestScope::Full)?;
         validate_paired_rows(&db)?;
         let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
         ensure!(
@@ -5319,7 +5349,7 @@ impl Store {
                 recovery_class(&error)
             }
             Ok(db) => {
-                let result = self.recovery_baseline(&db);
+                let result = self.recovery_baseline_full(&db);
                 drop(db);
                 match result {
                     Err(error) => recovery_class(&error),
@@ -5331,7 +5361,7 @@ impl Store {
             // A new inode at the same canonical spelling is a root transition, not
             // corruption. Recheck the old derived index under EX before replacing it.
             let db = open_index(&path, false)?;
-            match self.recovery_baseline(&db) {
+            match self.recovery_baseline_full(&db) {
                 Err(error) if error.to_string() == "root_changed: index root identity mismatch" => {
                 }
                 _ => anyhow::bail!("root_changed: replacement authority changed"),
@@ -5841,6 +5871,18 @@ impl Store {
     }
 
     fn recovery_baseline(&self, db: &Connection) -> Result<RecoveryBaseline> {
+        self.recovery_baseline_scoped(db, PairedManifestScope::Changing)
+    }
+
+    fn recovery_baseline_full(&self, db: &Connection) -> Result<RecoveryBaseline> {
+        self.recovery_baseline_scoped(db, PairedManifestScope::Full)
+    }
+
+    fn recovery_baseline_scoped(
+        &self,
+        db: &Connection,
+        scope: PairedManifestScope,
+    ) -> Result<RecoveryBaseline> {
         let schema: u32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         self.verify_metadata_root(db)?;
         let witness = self.metadata_witness(db, schema)?;
@@ -5946,7 +5988,7 @@ impl Store {
                     Ok(())
                 })
             } else {
-                validate_bounded_control(db, &self.identity.record_id)
+                validate_bounded_control(db, &self.identity.record_id, scope)
             };
             match validation {
                 Ok(()) => true,
@@ -6001,7 +6043,11 @@ impl Store {
             if pin.index_revision == 0 {
                 validate_v8_bootstrap(db)?;
             } else {
-                validate_paired_metadata(db, &self.identity.record_id)?;
+                validate_paired_metadata(
+                    db,
+                    &self.identity.record_id,
+                    PairedManifestScope::Changing,
+                )?;
             }
         }
         Ok(IndexStatus {
@@ -7086,7 +7132,7 @@ impl Store {
                 && baseline.witness == expected.witness,
             "revision conflict: final inventory baseline changed"
         );
-        validate_paired_metadata(&db, &self.identity.record_id)?;
+        validate_paired_metadata(&db, &self.identity.record_id, PairedManifestScope::Changing)?;
         validate_reconcile_inventory(&db)?;
         if !has_revision_producer_bindings(&db)? {
             return Ok(false);
@@ -7197,7 +7243,7 @@ impl Store {
             selected_baseline.compatible && selected_baseline.pin == Some(selected.pin),
             "incompatible_index: selected Serve head is not validated"
         );
-        validate_paired_metadata(&db, &self.identity.record_id)?;
+        validate_paired_metadata(&db, &self.identity.record_id, PairedManifestScope::Changing)?;
         validate_reconcile_inventory(&db)?;
         let class_warning_bytes: Option<i64> = db
             .query_row(
@@ -7368,7 +7414,7 @@ impl Store {
             )? == 1,
             "incompatible_index: missing metadata head"
         );
-        validate_paired_metadata(&tx, &self.identity.record_id)?;
+        validate_paired_metadata(&tx, &self.identity.record_id, PairedManifestScope::Changing)?;
         check_cancel(cancel)?;
         capture.verify(cancel)?;
         leader.verify()?;
@@ -8539,7 +8585,7 @@ impl Store {
         if rebaseline {
             tx.pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)?;
         }
-        validate_paired_metadata(&tx, &self.identity.record_id)?;
+        validate_paired_metadata(&tx, &self.identity.record_id, PairedManifestScope::Changing)?;
         let count: i64 = tx.query_row(
             "SELECT count(*) FROM revision_documents WHERE revision_id=?1",
             [format!(
@@ -11191,6 +11237,111 @@ impl Store {
 }
 
 #[cfg(test)]
+mod selected_manifest_query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn selected_capture_and_reconcile_use_the_revision_index() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(CACHE_SCHEMA_V8).unwrap();
+        for (label, sql) in [
+            ("capture", SELECTED_CAPTURE_SNAPSHOT_SQL),
+            ("reconcile", SELECTED_RECONCILE_FILES_SQL),
+        ] {
+            let plan: Vec<String> = db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH d USING INDEX ")
+                        && step.contains("(revision_id=?)")),
+                "{label} must use the selected manifest index: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|step| step.starts_with("SCALAR SUBQUERY")),
+                "{label} must be anchored to singleton-selected metadata: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN d")),
+                "{label} scanned historical manifests: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hot_pair_check_skips_stable_history_but_admission_checks_it() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("A.java");
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        fs::write(&source, "class A { int run() { return 1; } }\n").unwrap();
+        let first_job = IndexJobCoordinator::prepare(&store, None).unwrap();
+        let session = first_job.session();
+        let first = first_job.run(&options, &cancel, |_| {}).unwrap();
+        fs::write(&source, "class A { int run() { return 2; } }\n").unwrap();
+        let second =
+            IndexJobCoordinator::prepare_with_session(&store, Some(first), session.clone())
+                .unwrap()
+                .run(&options, &cancel, |_| {})
+                .unwrap();
+        fs::write(&source, "class A { int run() { return 3; } }\n").unwrap();
+        let third = IndexJobCoordinator::prepare_with_session(&store, Some(second), session)
+            .unwrap()
+            .run(&options, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(third.index_revision, first.index_revision + 2);
+        let first_key = format!("pin:v1:{}:{}", first.index_generation, first.index_revision);
+        let third_key = format!("pin:v1:{}:{}", third.index_generation, third.index_revision);
+        let db = store.cache_write().unwrap();
+        let original: String = db
+            .query_row(
+                "SELECT source_inventory FROM native_revisions WHERE id=?1",
+                [&first_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.execute(
+            "UPDATE native_revisions SET source_inventory='[]' WHERE id=?1",
+            [&first_key],
+        )
+        .unwrap();
+        validate_paired_metadata(&db, store.root_id(), PairedManifestScope::Changing).unwrap();
+        assert!(
+            validate_paired_metadata(&db, store.root_id(), PairedManifestScope::Full)
+                .unwrap_err()
+                .to_string()
+                .contains("retained manifest/release mismatch")
+        );
+        db.execute(
+            "UPDATE native_revisions SET source_inventory=?1 WHERE id=?2",
+            rusqlite::params![original, first_key],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE native_revisions SET source_inventory='[]' WHERE id=?1",
+            [&third_key],
+        )
+        .unwrap();
+        assert!(
+            validate_paired_metadata(&db, store.root_id(), PairedManifestScope::Changing)
+                .unwrap_err()
+                .to_string()
+                .contains("retained manifest/release mismatch")
+        );
+    }
+}
+
+#[cfg(test)]
 mod rebaseline_fault_tests {
     use super::*;
     use crate::indexer::{IndexOptions, index_workspace_bundle};
@@ -12014,7 +12165,7 @@ mod rebaseline_fault_tests {
             )
             .unwrap();
         assert_eq!(marker, leader.incarnation.to_string());
-        validate_paired_metadata(&db, recovering.root_id()).unwrap();
+        validate_paired_metadata(&db, recovering.root_id(), PairedManifestScope::Full).unwrap();
         validate_paired_rows(&db).unwrap();
         validate_reconcile_inventory(&db).unwrap();
         let integrity: String = db
@@ -12534,7 +12685,7 @@ mod rebaseline_fault_tests {
                         |row| row.get(0),
                     )?;
                     ensure!(raw == changed.as_bytes(), "new native source not staged");
-                    validate_paired_metadata(tx, worker_store.root_id())?;
+                    validate_paired_metadata(tx, worker_store.root_id(), PairedManifestScope::Full)?;
                     validate_paired_rows(tx)?;
                     entered_tx
                         .send(())
@@ -12792,7 +12943,7 @@ mod rebaseline_fault_tests {
                         "SELECT v.source_bytes FROM document_versions v JOIN revision_documents m ON m.document_version_id=v.id WHERE m.revision_id=?1 AND m.path='a.js' AND v.path='a.js'",[&staged_pin],|r|r.get(0))?;
                     ensure!(source_bytes==large_source.as_bytes(),
                         "new captured native source bytes not staged");
-                    validate_paired_metadata(tx,worker_store.root_id())?;
+                    validate_paired_metadata(tx,worker_store.root_id(),PairedManifestScope::Full)?;
                     validate_paired_rows(tx)?;
                     entered_tx.send(()).context("cannot signal staged BeforeCommit")?;
                     release_rx.recv_timeout(Duration::from_secs(30))
