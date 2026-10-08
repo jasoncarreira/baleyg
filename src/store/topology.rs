@@ -674,6 +674,88 @@ impl WorkspaceIdentity {
         }
         Ok(())
     }
+    /// Resolve the common Git directory without creating any managed storage.
+    /// Both the held root and its pathname must still designate this checkout.
+    pub fn git_common_dir(&self) -> Result<PathBuf> {
+        self.git_common_dir_with_executable(Path::new("git"))
+    }
+    /// Alternate executable permits a deterministic stalled-child fixture.
+    #[doc(hidden)]
+    pub fn git_common_dir_with_executable(&self, executable: &Path) -> Result<PathBuf> {
+        self.verify_readonly()?;
+        ensure!(
+            self.git_dir.is_some(),
+            "not_checkout: missing Git directory"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_millis(750);
+        let mut child = std::process::Command::new(executable)
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("unavailable: start Git common-directory lookup")?;
+        let stdout = child.stdout.take().context("missing Git output")?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let result = stdout.take(4097).read_to_end(&mut output);
+            let _ = sender.send(result.map(|_| output));
+        });
+        let output = match receiver
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // A shell wrapper's descendant can still hold the inherited pipe.
+                // Drop the join handle: its bounded reader exits when that pipe closes.
+                drop(reader);
+                bail!("unavailable: Git common-directory lookup timed out");
+            }
+        };
+        if output.as_ref().is_ok_and(|bytes| bytes.len() > 4096) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            bail!("unavailable: Git common directory exceeds path limit");
+        }
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("unavailable: Git output reader failed"))?;
+        let output = output.context("unavailable: read Git common directory")?;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("unavailable: Git common-directory lookup timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        ensure!(
+            status.success(),
+            "not_checkout: Git common directory unavailable"
+        );
+        let text = std::str::from_utf8(&output)?.trim_end_matches('\n');
+        ensure!(
+            !text.contains(['\r', '\n', '\0']),
+            "invalid Git common directory"
+        );
+        let path = PathBuf::from(text);
+        ensure!(path.is_absolute(), "invalid Git common directory");
+        let path = fs::canonicalize(path)?;
+        ensure!(metadata(&path)?.is_dir(), "invalid Git common directory");
+        self.verify_readonly()?;
+        Ok(path)
+    }
     pub fn git_dir(&self) -> Option<&Path> {
         self.git_dir.as_deref()
     }

@@ -1,6 +1,7 @@
 //! Per-user daemon election and private Unix socket ownership.
 pub mod client;
 pub mod protocol;
+pub mod registry;
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
