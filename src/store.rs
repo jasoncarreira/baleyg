@@ -568,6 +568,9 @@ impl ReadFence {
         match self {
             Self::Current(follower, marker) => follower.verify(*marker),
             Self::PreH { session, permit } => {
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
                 if permit.epoch.load(Ordering::Acquire) != permit.captured_epoch {
                     return Err(topology::IndexNotReady::new("checkout epoch changed").into());
                 }
@@ -580,12 +583,26 @@ impl ReadFence {
                         topology::IndexNotReady::new("pre-H root or leader mismatch").into(),
                     );
                 }
-                session.leader_guard()?.verify()?;
+                session.leader_guard()?.verify().map_err(|error| {
+                    anyhow::anyhow!("store_unavailable: pre-H leader lock unavailable: {error:#}")
+                })?;
                 session.verify()?;
                 if let Some(db) = db {
-                    store.verify_pre_h_snapshot(db, permit)?;
+                    store.verify_pre_h_snapshot(db, permit).map_err(|error| {
+                        if store.disposition() != RecoveryDisposition::Ready {
+                            anyhow::anyhow!(
+                                "store_unavailable: pre-H index recovery pending: {error:#}"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
                 }
-                store.identity.verify()
+                store.identity.verify()?;
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
+                Ok(())
             }
         }
     }
@@ -640,10 +657,15 @@ impl EvidenceResponse {
         )
     }
     /// Ordinary reads release the snapshot before slow response assembly.
-    /// A transitional fence retains its predecessor snapshot through finish.
+    /// A transitional exact-pin fence retains its predecessor snapshot; T03
+    /// releases it after materialization so H may commit before finish.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
         let Self { store, db, fence } = self;
-        let snapshot = if matches!(fence, ReadFence::PreH { .. }) {
+        let pre_h_snapshot_valid =
+            !matches!(fence, ReadFence::PreH { .. }) || fence.verify(&store, Some(&db)).is_ok();
+        let snapshot = if matches!(fence, ReadFence::PreH { .. })
+            && matches!(policy, EvidenceFencePolicy::ExactPin(_))
+        {
             Some(db)
         } else {
             drop(db);
@@ -653,6 +675,7 @@ impl EvidenceResponse {
             store,
             fence,
             snapshot,
+            pre_h_snapshot_valid,
             policy,
         }
     }
@@ -667,11 +690,18 @@ pub struct EvidenceFence {
     store: Store,
     fence: ReadFence,
     snapshot: Option<IndexConnection>,
+    pre_h_snapshot_valid: bool,
     policy: EvidenceFencePolicy,
 }
 impl EvidenceFence {
     pub fn finish<T>(&self, value: T) -> Result<T> {
         self.fence.verify(&self.store, self.snapshot.as_deref())?;
+        if !self.pre_h_snapshot_valid {
+            return Err(topology::IndexNotReady::new(
+                "pre-H snapshot changed during materialization",
+            )
+            .into());
+        }
         if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
             if let Some(db) = &self.snapshot {
                 self.store.read_revision_for(db, Some(pin), true)?;
@@ -6623,8 +6653,10 @@ impl Store {
     pub fn pre_h_read_permit(
         &self,
         response: &EvidenceResponse,
+        session: &topology::LeaderSession,
         epoch: Arc<AtomicU64>,
     ) -> Result<PreHReadPermit> {
+        self.verify_reconciled_leader_claim(session)?;
         let ReadFence::Current(_, predecessor) = &response.fence else {
             return Err(topology::IndexNotReady::new("cannot mint from transitional read").into());
         };
@@ -6633,6 +6665,9 @@ impl Store {
             || response.store.identity.inode != self.identity.inode
         {
             return Err(topology::IndexNotReady::new("different checkout").into());
+        }
+        if *predecessor != session.incarnation() {
+            return Err(topology::IndexNotReady::new("not the reconciled checkout leader").into());
         }
         let captured_epoch = epoch.load(Ordering::Acquire);
         let status = response.status()?;
@@ -6654,7 +6689,14 @@ impl Store {
 
     fn verify_pre_h_snapshot(&self, db: &Connection, permit: &PreHReadPermit) -> Result<()> {
         self.verify_metadata_root(db)
-            .map_err(|error| self.report_live_read_failure(error))?;
+            .map_err(|error| self.report_live_read_failure(error))
+            .map_err(|error| {
+                if self.disposition() != RecoveryDisposition::Ready {
+                    anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+                } else {
+                    error
+                }
+            })?;
         let schema: u32 =
             storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
         if schema != DATABASE_SCHEMA_VERSION {
@@ -6696,9 +6738,14 @@ impl Store {
             permit: permit.clone(),
         };
         fence.verify(self, None)?;
-        let db = self
-            .cache()
-            .map_err(|error| self.report_live_read_failure(error))?;
+        let db = self.cache().map_err(|error| {
+            let error = self.report_live_read_failure(error);
+            if self.disposition() != RecoveryDisposition::Ready {
+                anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+            } else {
+                error
+            }
+        })?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
         fence.verify(self, Some(&db))?;
         if self.disposition() != RecoveryDisposition::Ready {
