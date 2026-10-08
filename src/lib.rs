@@ -10,6 +10,7 @@ mod behavior_rust;
 pub mod capture;
 pub mod class_diagram;
 pub mod classes;
+pub mod daemon;
 pub mod dependencies;
 pub mod dependency_links;
 mod dependency_rust;
