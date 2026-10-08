@@ -164,7 +164,7 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     assert_eq!(source["file"]["text"], text);
     // A new publication needs a live root again; the previous reads used cached source.
     std::fs::write(workspace.join("lib.rs"), text).unwrap();
-    let (refreshed_graph, refreshed_native, refreshed_capture) = index_workspace_bundle(
+    let (refreshed_graph, _refreshed_native, _refreshed_capture) = index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
         &cancel,
@@ -173,16 +173,36 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
     .unwrap();
     assert_eq!(refreshed_graph.files, graph.files);
     assert_eq!(refreshed_graph.calls, graph.calls);
-    store
-        .publish_native(
-            &refreshed_graph,
-            &refreshed_capture,
-            &refreshed_native,
-            session.leader_guard().unwrap(),
-            pin,
-            &cancel,
-        )
-        .unwrap();
+    // The live daemon owns publication after retention. Queue the next
+    // revision through it rather than opening a second writer while its tick
+    // may have an active SQLite transaction.
+    let (code, job) = request(&app, "POST", "/api/index", json!({})).await;
+    assert_eq!(code, 202, "{job}");
+    let id = job["id"].as_str().unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let (code, result) =
+                request(&app, "GET", &format!("/api/jobs/{id}"), Value::Null).await;
+            assert_eq!(code, 200, "{result}");
+            if !result["finishedAt"].is_null() {
+                break result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed["state"], "done", "{completed}");
+    assert_eq!(
+        completed["revision"]["indexGeneration"],
+        pin.index_generation.to_string()
+    );
+    assert!(
+        completed["revision"]["indexRevision"]
+            .as_u64()
+            .is_some_and(|revision| revision > pin.index_revision),
+        "queue did not publish a successor: {completed}"
+    );
     std::fs::remove_file(workspace.join("lib.rs")).unwrap();
     let (code, retained) = request(
         &app,
