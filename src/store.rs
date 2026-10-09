@@ -187,6 +187,14 @@ pub enum MaintenanceOutcome {
     Progress,
 }
 
+#[derive(Clone, Debug)]
+struct ExceptionalPublishedCandidate {
+    owner_incarnation: uuid::Uuid,
+    pin: IndexPin,
+    inode: (u64, u64),
+    classified_marker: Option<IndexFormatMarker>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
@@ -198,6 +206,10 @@ pub struct Store {
     orphan_root_loss_owner: Arc<Mutex<Option<Arc<topology::LeaderSession>>>>,
     recovery_disposition: Arc<AtomicU8>,
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
+    // Exact, fully validated replacement that reached durable rename before
+    // a later SH restoration/attestation fault. Never infer this from a merely
+    // readable head or an unrelated owner's marker.
+    exceptional_published: Arc<Mutex<Option<ExceptionalPublishedCandidate>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
     request_file_witness: Arc<Mutex<Option<(u64, u64)>>>,
     aborted_staged_index: Arc<Mutex<Option<StagedIndex>>>,
@@ -5344,6 +5356,7 @@ impl Store {
             orphan_root_loss_owner: Arc::new(Mutex::new(None)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
+            exceptional_published: Arc::new(Mutex::new(None)),
             pending_request_completion: Arc::new(Mutex::new(None)),
             request_file_witness: Arc::new(Mutex::new(None)),
             aborted_staged_index: Arc::new(Mutex::new(None)),
@@ -6084,6 +6097,16 @@ impl Store {
                 std::fs::File::open(&dir)?.sync_all()?;
             }
             self.validate_replacement_index(&path, &stage, leader, pin)?;
+            {
+                use std::os::unix::fs::MetadataExt;
+                let held = stage.file.metadata()?;
+                *self.exceptional_published.lock().unwrap() = Some(ExceptionalPublishedCandidate {
+                    owner_incarnation: leader.incarnation,
+                    pin,
+                    inode: (held.dev(), held.ino()),
+                    classified_marker: initial_marker.clone(),
+                });
+            }
             leader.downgrade_use_to_shared()?;
             leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
             self.identity.verify()?;
@@ -6940,6 +6963,68 @@ impl Store {
         }
         Ok(())
     }
+    fn recover_exact_published_exceptional_candidate(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+    ) -> Result<Option<IndexPin>> {
+        use std::os::unix::fs::MetadataExt;
+        let Some(candidate) = self.exceptional_published.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        ensure!(
+            self.is_recreate_pending()
+                && candidate.owner_incarnation == owner.incarnation()
+                && candidate.classified_marker == *self.obsolete_format_marker.lock().unwrap(),
+            "recovery_required: exceptional replacement proof belongs to another attempt"
+        );
+        self.verify_leader_session(owner)?;
+        let guard = owner.leader_guard()?;
+        guard.verify_shared_use(&self.roots.index_use_lock(&self.identity))?;
+        ensure!(
+            !guard.uncertain_use_transition(),
+            "recovery_required: exceptional transition still uncertain"
+        );
+        let path = self.roots.index_db(&self.identity);
+        let named = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            named.is_file()
+                && !named.file_type().is_symlink()
+                && (named.dev(), named.ino()) == candidate.inode,
+            "root_changed: exceptional replacement inode changed"
+        );
+        let db = open_index(&path, false)?;
+        let baseline = self.recovery_baseline_full(&db)?;
+        ensure!(
+            baseline.compatible && baseline.pin() == Some(candidate.pin),
+            "recovery_required: replacement pair no longer matches exact published pin"
+        );
+        let marker: String = db.query_row(
+            "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            marker == owner.incarnation().to_string(),
+            "index_not_ready: exceptional replacement H belongs to another owner"
+        );
+        validate_paired_rows(&db)?;
+        drop(db);
+        self.identity.verify()?;
+        guard.verify_shared_use(&self.roots.index_use_lock(&self.identity))?;
+        ensure!(
+            std::fs::symlink_metadata(&path)
+                .is_ok_and(|current| (current.dev(), current.ino()) == candidate.inode),
+            "root_changed: exceptional replacement changed after validation"
+        );
+        // Same fully validated candidate, exact owner, matching H/pin. Only
+        // now may public readiness open; claim authority is attested below.
+        self.recovery_disposition
+            .store(RecoveryDisposition::Ready as u8, Ordering::Release);
+        self.recovery_required.store(false, Ordering::Release);
+        self.attest_post_acquisition_reconciliation(owner, candidate.pin)?;
+        self.exceptional_published.lock().unwrap().take();
+        Ok(Some(candidate.pin))
+    }
     /// Recreate under the SAME H-owned leader EX; never relinquish and re-elect
     /// between an empty queue probe and this exceptional publication.
     pub(crate) fn recreate_pending_with_owner(
@@ -6954,8 +7039,13 @@ impl Store {
             "recovery_required: exceptional recreation not classified"
         );
         self.verify_leader_session(owner)?;
+        self.complete_uncertain_use_transition(owner)?;
         let guard = owner.leader_guard()?;
         guard.reacquire_sidecar_mutation_gate(&self.roots.sidecar_mutation_lock(&self.identity))?;
+        if let Some(pin) = self.recover_exact_published_exceptional_candidate(owner)? {
+            lease.disarm();
+            return Ok((pin, owner.clone()));
+        }
         if let Err(error) =
             guard.try_upgrade_use_to_exclusive(&self.roots.index_use_lock(&self.identity))
         {
@@ -6975,6 +7065,7 @@ impl Store {
             "index_not_ready: exceptional recovery pair not admitted"
         );
         self.attest_post_acquisition_reconciliation(owner, pin)?;
+        self.exceptional_published.lock().unwrap().take();
         lease.disarm();
         Ok((pin, owner.clone()))
     }
@@ -6987,6 +7078,14 @@ impl Store {
             self.is_recreate_pending(),
             "recovery_required: exceptional recreation not classified"
         );
+        if let Some(orphan) = self.orphan_root_loss_owner() {
+            // No-owner retry must adopt the exact saved EX, never re-elect.
+            let result = self.recreate_pending_with_owner(&orphan, options, cancel);
+            if result.is_ok() {
+                self.clear_orphan_root_loss_owner_if_same(&orphan);
+            }
+            return result;
+        }
         if self.disposition() == RecoveryDisposition::RootReplaced {
             // Retain the old EX until every accepted old-root row is terminal.
             let leader = Arc::new(topology::LeaderSession::leader(
@@ -7035,6 +7134,7 @@ impl Store {
             "index_not_ready: exceptional recovery pair not admitted"
         );
         self.attest_post_acquisition_reconciliation(&owner, pin)?;
+        self.exceptional_published.lock().unwrap().take();
         lease.disarm();
         Ok((pin, owner))
     }
@@ -7248,6 +7348,33 @@ impl Store {
 
     pub fn clear_orphan_root_loss_owner(&self) {
         self.orphan_root_loss_owner.lock().unwrap().take();
+    }
+    pub(crate) fn clear_orphan_root_loss_owner_if_same(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+    ) {
+        let mut slot = self.orphan_root_loss_owner.lock().unwrap();
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, owner)) {
+            slot.take();
+        }
+    }
+    pub(crate) fn use_transition_uncertain(&self, owner: &Arc<topology::LeaderSession>) -> bool {
+        owner.leader_guard().map_or(true, |guard| {
+            guard.held_exclusive_use_mode()
+                || guard.uncertain_use_transition()
+                || guard
+                    .verify_shared_use(&self.roots.index_use_lock(&self.identity))
+                    .is_err()
+        })
+    }
+    pub(crate) fn complete_uncertain_use_transition(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+    ) -> Result<()> {
+        // This proof deliberately does not inspect the root pathname: an old
+        // root may already be gone, but the exact leader/use lock files remain.
+        let guard = owner.leader_guard()?;
+        guard.complete_use_downgrade(&self.roots.index_use_lock(&self.identity))
     }
 
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
@@ -13385,6 +13512,8 @@ mod rebaseline_fault_tests {
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
         let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let q1 = store.enqueue_request(&options, None).unwrap();
         let index = store.roots.index_db(&store.identity);
         drop(store);
         fs::write(&index, b"short").unwrap();
@@ -13395,11 +13524,7 @@ mod rebaseline_fault_tests {
         ));
         owner.leader_guard().unwrap().test_fail_after_shared_flock();
         let error = recovering
-            .recreate_pending_with_owner(
-                &owner,
-                &IndexOptions::new(work.path().to_owned()),
-                &Arc::new(AtomicBool::new(false)),
-            )
+            .recreate_pending_with_owner(&owner, &options, &Arc::new(AtomicBool::new(false)))
             .unwrap_err();
         assert!(error.to_string().contains("uncertain post-SH"), "{error:#}");
         drop(owner);
@@ -13421,10 +13546,74 @@ mod rebaseline_fault_tests {
             recovering.roots.leader(&recovering.identity).is_err(),
             "original leader EX remains held until explicit verified resolution"
         );
-        guard
-            .complete_use_downgrade(&recovering.roots.index_use_lock(&recovering.identity))
+        assert!(
+            recovering.claim_request(&orphan).is_err(),
+            "Q1 cannot be claimed before exact H attests"
+        );
+        let (pin, adopted) = recovering
+            .recreate_pending_leader_session(&options, &Arc::new(AtomicBool::new(false)))
             .unwrap();
-        assert!(!guard.uncertain_use_transition());
+        assert!(Arc::ptr_eq(&adopted, &orphan), "retry adopted same old EX");
+        assert!(!adopted.leader_guard().unwrap().uncertain_use_transition());
+        assert!(recovering.orphan_root_loss_owner().is_none());
+        assert_eq!(recovering.status().unwrap().revision, pin);
+        let claimed = recovering.claim_request(&adopted).unwrap().unwrap();
+        assert_eq!(claimed.id, q1.id);
+        recovering
+            .finish_request(&adopted, &claimed, Ok(pin))
+            .unwrap();
+        assert_eq!(
+            recovering.request_by_id(&q1.id).unwrap().unwrap().state,
+            "done"
+        );
+    }
+
+    #[test]
+    fn orphaned_post_sh_fault_resolves_transition_before_old_root_fifo_settlement() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let q1 = store.enqueue_request(&options, None).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        drop(store);
+        fs::write(&index, b"short").unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        owner.leader_guard().unwrap().test_fail_after_shared_flock();
+        assert!(
+            recovering
+                .recreate_pending_with_owner(&owner, &options, &Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        drop(owner);
+        let orphan = recovering.orphan_root_loss_owner().unwrap();
+        assert!(recovering.use_transition_uncertain(&orphan));
+        let moved = state.path().join("old-root-with-q1");
+        fs::rename(work.path(), &moved).unwrap();
+        fs::create_dir(work.path()).unwrap();
+        // verify_after_root_loss must check/release the transition before
+        // fail_changed_root_requests takes its independent index-use SH.
+        assert_eq!(recovering.fail_changed_root_requests(&orphan).unwrap(), 1);
+        assert!(!recovering.use_transition_uncertain(&orphan));
+        let queue = recovering.roots.requests_db(&recovering.identity);
+        let durable_state: String = Connection::open(&queue)
+            .unwrap()
+            .query_row("SELECT state FROM requests WHERE id=?1", [&q1.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(durable_state, "failed");
+        fs::remove_dir(work.path()).unwrap();
+        fs::rename(&moved, work.path()).unwrap();
+        assert!(
+            recovering.roots.leader(&recovering.identity).is_err(),
+            "exact EX lives until serialized old-root terminal authority is released"
+        );
         drop(orphan);
         recovering.clear_orphan_root_loss_owner();
         assert!(recovering.roots.leader(&recovering.identity).is_ok());

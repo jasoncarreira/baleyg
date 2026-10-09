@@ -1575,6 +1575,12 @@ impl LeaderSession {
             identity.verify().is_err(),
             "root_changed: old-root transition requires root loss"
         );
+        // An exceptional SH restoration may have faulted after flock but
+        // before pathname proof. Resolve that gate BEFORE queue code takes a
+        // second SH or an old-root EX can be retired.
+        if guard.uncertain_use_transition() || guard.held_exclusive_use_mode() {
+            guard.complete_use_downgrade(use_path)?;
+        }
         guard.belongs_to_after_root_loss(leader_path, use_path)
     }
     pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {
