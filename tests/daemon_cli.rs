@@ -1031,3 +1031,163 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
         "daemon socket changed"
     );
 }
+
+/// One real daemon/serve cold H per private HOME; no prior daemon session can
+/// supply a warm head or make an omitted CLI option look explicit.
+#[tokio::test]
+async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() {
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::net::UnixStream;
+
+    for explicit_default in [false, true] {
+        let temp = short_temp();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let root = checkout(temp.path(), "serve-cold-options");
+        let source_path = root.join("sample.js");
+        let source_hash = hex::encode(Sha256::digest(fs::read(&source_path).unwrap()));
+        let scip_path = temp.path().join("prior.scip");
+        let manifest_path = temp.path().join("prior-manifest.json");
+        let mut scip = scip::types::Index::new();
+        let mut document = scip::types::Document::new();
+        document.relative_path = "sample.js".into();
+        let mut occurrence = scip::types::Occurrence::new();
+        occurrence.range = vec![0, 9, 10];
+        occurrence.symbol_roles = 1;
+        occurrence.symbol = "scip npm fixture 1 sample.js/prior().".into();
+        document.occurrences.push(occurrence);
+        scip.documents.push(document);
+        fs::write(&scip_path, scip.write_to_bytes().unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({"sample.js":source_hash})).unwrap(),
+        )
+        .unwrap();
+        let indexed = cli(&home)
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--max-file-bytes")
+            .arg("8192")
+            .arg("--scip")
+            .arg(&scip_path)
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .output()
+            .unwrap();
+        assert!(
+            indexed.status.success(),
+            "prior index failed: {}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        let indexes = home.join(if cfg!(target_os = "macos") {
+            "Library/Caches/dev.odin.baleyg/indexes"
+        } else {
+            ".cache/baleyg/indexes"
+        });
+        let index_db = fs::read_dir(indexes)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap()
+            .join("index.db");
+        let recorded =
+            || -> (Value, i64) {
+                let db = rusqlite::Connection::open(&index_db).unwrap();
+                let (options, revision): (String, i64) = db.query_row(
+                "SELECT reconcile_options,index_revision FROM index_metadata WHERE singleton=1",
+                [], |row| Ok((row.get(0)?, row.get(1)?))
+            ).unwrap();
+                (serde_json::from_str(&options).unwrap(), revision)
+            };
+        let (before, prior_revision) = recorded();
+        assert_eq!(before["maxFileBytes"], 8192);
+        assert_eq!(before["scipPath"], scip_path.to_str().unwrap());
+        assert_eq!(before["manifestPath"], manifest_path.to_str().unwrap());
+        fs::write(&source_path, "function newColdHead() { return 2; }\n").unwrap();
+
+        // Spawn the daemon explicitly, rather than allowing serve to auto-start
+        // an untracked process. Both Owned guards reap children on every exit.
+        let mut daemon_command = cli(&home);
+        daemon_command.arg("daemon");
+        let mut daemon = detached(daemon_command);
+        let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+        let socket_deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(&socket).is_err() {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "private daemon exited before serve"
+            );
+            assert!(
+                Instant::now() < socket_deadline,
+                "private daemon socket did not bind"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let address = free_address();
+        let token = temp.path().join("token");
+        let mut command = serve(&home, &root, address, &token);
+        if explicit_default {
+            command.arg("--max-file-bytes").arg("2097152");
+        }
+        let mut served = detached(command);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        ready(&client, address, &mut served.0).await;
+        let h_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = cli(&home)
+                .arg("status")
+                .arg("--workspace")
+                .arg(&root)
+                .output()
+                .unwrap();
+            if status.status.success() {
+                let reply: Value = serde_json::from_slice(&status.stdout).unwrap();
+                if reply["revision"]["indexRevision"]
+                    .as_i64()
+                    .is_some_and(|rev| rev > prior_revision)
+                {
+                    break;
+                }
+            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited during H"
+            );
+            assert!(
+                served.0.try_wait().unwrap().is_none(),
+                "serve exited during H"
+            );
+            assert!(
+                Instant::now() < h_deadline,
+                "cold H did not publish revision after {prior_revision}: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let (after, revision) = recorded();
+        assert!(
+            revision > prior_revision,
+            "banner/status alone cannot satisfy H proof"
+        );
+        if explicit_default {
+            assert_eq!(after["maxFileBytes"], 2_097_152);
+            assert!(
+                after["scipPath"].is_null(),
+                "explicit default must clear prior SCIP: {after}"
+            );
+            assert!(
+                after["manifestPath"].is_null(),
+                "explicit default must clear prior manifest: {after}"
+            );
+        } else {
+            assert_eq!(after["maxFileBytes"], 8192);
+            assert_eq!(after["scipPath"], scip_path.to_str().unwrap());
+            assert_eq!(after["manifestPath"], manifest_path.to_str().unwrap());
+        }
+    }
+}
