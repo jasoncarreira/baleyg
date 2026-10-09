@@ -732,8 +732,12 @@ impl CheckoutRegistry {
             })
     }
 
+    /// The provisioning caller holds the registry guard across this preflight
+    /// and its later token commit. Retire a replaced old runtime *before* token
+    /// creation: a read-only snapshot could pass during H retry backoff, then
+    /// lose to a worker re-arm and fail registration after minting a token.
     pub fn can_register(
-        &self,
+        &mut self,
         identity: &WorkspaceIdentity,
         options: &CheckoutOptions,
     ) -> Result<(), SelectionError> {
@@ -741,19 +745,13 @@ impl CheckoutRegistry {
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
         Self::validate_browser_options(identity, options)?;
-        if let Some(entry) = self.entries.get(&identity.root_key) {
-            if !entry.identity.matches(identity) && !self.can_retire_replaced(identity) {
-                return Err(SelectionError::IdentityChanged);
-            }
-            if !entry.identity.matches(identity) {
-                return Ok(());
-            }
-            if entry.registration.as_ref() != Some(options)
-                && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
-                && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
-            {
-                return Err(SelectionError::RegistrationConflict);
-            }
+        self.retire_replaced(identity)?;
+        if let Some(entry) = self.entries.get(&identity.root_key)
+            && entry.registration.as_ref() != Some(options)
+            && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
+            && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
+        {
+            return Err(SelectionError::RegistrationConflict);
         }
         Ok(())
     }
