@@ -618,11 +618,10 @@ fn legacy_title_recovery_max_id_and_root_selection() {
     assert!(outcome.stdout.is_empty());
     assert!(!overlap.join(".git/baleyg/workspace-id").exists());
     assert!(root.join(".git/baleyg/workspace-id").is_file());
-    // A separate explicit non-Git workspace is legal, but cannot create a Git marker.
+    // A separate explicit non-Git workspace cannot attach to the daemon.
     let no_git = tmp.path().join("not-checkout");
     fs::create_dir(&no_git).unwrap();
-    let peer = Peer::start(Some(&no_git));
-    assert!(peer.finish().0.success());
+    silent_failure(Peer::start(Some(&no_git)));
     assert!(!no_git.join(".git").exists());
 }
 #[test]
@@ -1150,21 +1149,10 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let nearer_marker = fs::read(nearer.join(".git/baleyg/workspace-id")).unwrap();
     assert_ne!(first_marker, nearer_marker);
     assert!(implicit.finish().0.success());
-    // A non-Git cwd falls back to its canonical directory.
+    // A non-Git cwd cannot acquire a daemon checkout attachment or marker.
     let plain = tmp.path().join("plain");
     fs::create_dir(&plain).unwrap();
-    let mut fallback = Peer::start_in(None, Some(&plain));
-    exact_tool(
-        &fallback.ask(modern(
-            json!(4),
-            "tools/call",
-            json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}),
-        )),
-        None,
-        true,
-        "plain",
-    );
-    assert!(fallback.finish().0.success());
+    silent_failure(Peer::start_in(None, Some(&plain)));
     assert!(!plain.join(".git").exists());
     // A nearer malformed .git is not silently skipped for ancestor fallback.
     let bad = ancestor.join("bad-nearer");

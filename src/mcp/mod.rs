@@ -84,15 +84,31 @@ mod tests {
 /// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
 /// Input already waiting in the bounded channel is applied before any queued outcome commits.
 pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
+    run_transport(workspace, std::io::stdin(), std::io::stdout())
+}
+
+/// Run the same protocol coordinator on a daemon-owned session socket.
+pub fn run_socket(
+    workspace: OpenedWorkspace,
+    stream: std::os::unix::net::UnixStream,
+) -> std::io::Result<()> {
+    let reader = stream.try_clone()?;
+    run_transport(workspace, reader, stream)
+}
+
+fn run_transport(
+    workspace: OpenedWorkspace,
+    input: impl std::io::Read + Send + 'static,
+    output: impl std::io::Write,
+) -> std::io::Result<()> {
     use std::collections::VecDeque;
-    use std::io::{self, BufReader};
+    use std::io::BufReader;
     use std::sync::mpsc::{self, TryRecvError};
     let (sender, receiver) = mpsc::sync_channel::<wire::Frame>(16);
     std::thread::Builder::new()
         .name("mcp-stdin".into())
         .spawn(move || {
-            let stdin = io::stdin();
-            let mut reader = BufReader::new(stdin.lock());
+            let mut reader = BufReader::new(input);
             loop {
                 match wire::read_frame(&mut reader) {
                     Ok(wire::Frame::Eof) => {
@@ -114,8 +130,7 @@ pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
         })?;
     let mut session = session::Session::new();
     let mut outcomes = VecDeque::new();
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
+    let mut writer = output;
     loop {
         // A blocked coordinator waits for one input event. Once there is pending work,
         // observe all input currently waiting before committing even the first result.
