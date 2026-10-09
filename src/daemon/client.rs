@@ -123,3 +123,93 @@ fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
         }
     }
 }
+
+/// A thin client copies bounded chunks to the private socket. The daemon alone
+/// owns protocol state, checkout attachment and the stdout response writer.
+pub fn relay_stdio(
+    mut stream: UnixStream,
+    workspace: &crate::store::topology::WorkspaceIdentity,
+) -> io::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let request = Request {
+        id: 1,
+        operation: "mcp".into(),
+        payload: serde_json::json!({
+            "workspace": workspace.root,
+            "device": workspace.device,
+            "inode": workspace.inode,
+        }),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    protocol::write_frame(&mut stream, &request)?;
+    let reply: Reply = protocol::read_frame(&mut stream)?;
+    if reply.id != request.id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon reply ID mismatch",
+        ));
+    }
+    if let Some(error) = reply.payload.get("error").and_then(|v| v.as_str()) {
+        return Err(io::Error::other(error.to_owned()));
+    }
+    if reply.payload.get("result") != Some(&serde_json::Value::Bool(true)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MCP attach reply",
+        ));
+    }
+    stream.set_read_timeout(None)?;
+    let mut outgoing = stream.try_clone()?;
+    let stdin_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sender_done = stdin_done.clone();
+    let _sender = thread::Builder::new()
+        .name("mcp-stdin-relay".into())
+        .spawn(move || {
+            let result = io::copy(&mut io::stdin().lock(), &mut outgoing);
+            sender_done.store(true, std::sync::atomic::Ordering::Release);
+            let _ = outgoing.shutdown(std::net::Shutdown::Write);
+            result
+        })?;
+    let mut reader = BufReader::new(stream);
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    loop {
+        let mut line = Vec::new();
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return if stdin_done.load(std::sync::atomic::Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "daemon_unavailable: MCP session interrupted",
+                        ))
+                    };
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "partial MCP response",
+                ));
+            }
+            let end = available.iter().position(|byte| *byte == b'\n');
+            let take = end.map_or(available.len(), |offset| offset + 1);
+            if line.len() + take > crate::mcp::wire::RESPONSE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MCP response too large",
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if end.is_some() {
+                break;
+            }
+        }
+        serde_json::from_slice::<serde_json::Value>(&line)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        writer.write_all(&line)?;
+        writer.flush()?;
+    }
+}

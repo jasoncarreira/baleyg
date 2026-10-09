@@ -427,8 +427,10 @@ async fn main() -> Result<()> {
     match command {
         Command::Daemon | Command::Serve(_) => unreachable!(),
         Command::Mcp(args) => {
-            let (_, identity) = args.resolve()?;
-            mcp::run_stdio(mcp::OpenedWorkspace::new(identity))?;
+            let (_, identity) = args.resolve_unattached()?;
+            let socket = socket_path()?;
+            let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?;
+            client::relay_stdio(stream, &identity)?;
         }
         Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
         Command::Forget(args) => {
@@ -1218,6 +1220,68 @@ fn dispatch_connection(
     let runtime = tokio::runtime::Handle::current();
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     let request: protocol::Request = protocol::read_frame(&mut stream)?;
+    if request.operation == "mcp" {
+        let result = (|| -> Result<mcp::OpenedWorkspace> {
+            let root: PathBuf = serde_json::from_value(
+                request
+                    .payload
+                    .get("workspace")
+                    .cloned()
+                    .context("missing workspace")?,
+            )?;
+            let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
+            let device: u64 = serde_json::from_value(
+                request
+                    .payload
+                    .get("device")
+                    .cloned()
+                    .context("missing root device")?,
+            )?;
+            let inode: u64 = serde_json::from_value(
+                request
+                    .payload
+                    .get("inode")
+                    .cloned()
+                    .context("missing root inode")?,
+            )?;
+            ensure!(
+                (identity.device, identity.inode) == (device, inode),
+                "root_changed: launch checkout identity changed"
+            );
+            TopologyRoots::production()?.reject_root_overlap(&identity)?;
+            ensure!(identity.root.join(".git").exists(), "not a Git checkout");
+            let identity = identity.attach_marker()?;
+            runtime.block_on(async {
+                registry
+                    .lock()
+                    .await
+                    .attach_launch(session, &identity)
+                    .map_err(|error| anyhow::anyhow!("{}", error.reason()))
+            })?;
+            Ok(mcp::OpenedWorkspace::new(identity))
+        })();
+        let reply = protocol::Reply {
+            id: request.id,
+            payload: match &result {
+                Ok(_) => serde_json::json!({"result": true}),
+                Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+            },
+        };
+        let delivered = protocol::write_frame(&mut stream, &reply);
+        let served = match (result, delivered) {
+            (Ok(workspace), Ok(())) => {
+                // The CLI request deadline must not end an idle MCP attachment.
+                stream
+                    .set_read_timeout(None)
+                    .and_then(|()| mcp::run_socket(workspace, stream))
+                    .map_err(anyhow::Error::from)
+            }
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error.into()),
+        };
+        runtime.block_on(async { registry.lock().await.disconnect(session) });
+        return served;
+    }
     let serve = request.operation == "serve";
     let result = (|| -> Result<serde_json::Value> {
         let root: PathBuf = serde_json::from_value(
