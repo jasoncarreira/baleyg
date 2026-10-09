@@ -183,7 +183,84 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .await
         .unwrap();
     assert_eq!(status.status(), reqwest::StatusCode::OK);
-    assert!(status.json::<Value>().await.unwrap()["activeCheckouts"].is_number());
+    assert_eq!(status.json::<Value>().await.unwrap()["activeCheckouts"], 0);
+    let first_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&first), &first)
+        .unwrap()
+        .root_key;
+    for (method, path) in [
+        (reqwest::Method::GET, "/api/status"),
+        (reqwest::Method::GET, "/api/jev/status"),
+        (reqwest::Method::POST, "/api/index"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("http://{address}{path}"))
+            .bearer_auth(token.trim())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{method} {path}"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(!response.headers().contains_key("X-Baleyg-Catching-Up"));
+        let state = client
+            .get(format!("http://{address}/api/daemon/status"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(
+            state["activeCheckouts"], 0,
+            "{method} {path} activated the checkout"
+        );
+    }
+    let selected = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = client
+                .get(format!("http://{address}/api/checkouts/{first_key}/status"))
+                .bearer_auth(token.trim())
+                .send()
+                .await
+                .unwrap();
+            if response.status() == reqwest::StatusCode::OK {
+                break response;
+            }
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        selected.headers()["X-Baleyg-Workspace"],
+        fs::canonicalize(&first).unwrap().to_str().unwrap()
+    );
+    assert!(selected.headers().contains_key("X-Baleyg-Catching-Up"));
+    let selected: Value = selected.json().await.unwrap();
+    assert_eq!(
+        selected["workspaceRoot"],
+        fs::canonicalize(&first).unwrap().to_str().unwrap()
+    );
+    let jobs = client
+        .get(format!(
+            "http://{address}/api/checkouts/{first_key}/jobs/current"
+        ))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(jobs.status(), reqwest::StatusCode::OK);
+    assert!(
+        jobs.json::<Value>().await.unwrap().is_null(),
+        "old POST accepted a job"
+    );
     let wrong_origin = authenticated()
         .header("Origin", "http://not-local.example")
         .send()

@@ -2519,3 +2519,252 @@ async fn provider_routes_use_only_the_selected_checkout() {
         assert!(!headers.contains_key("X-Baleyg-Workspace"));
     }
 }
+
+#[tokio::test]
+async fn production_browser_rejects_every_selector_free_checkout_route_without_attachment() {
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // The same inventory must hold with exactly one registered checkout: no
+    // implicit default is allowed merely because selection is unambiguous.
+    let old_routes = [
+        ("GET", "/api/status"),
+        ("GET", "/api/tree"),
+        ("GET", "/api/files"),
+        ("GET", "/api/methods"),
+        ("GET", "/api/classes"),
+        ("GET", "/api/symbols"),
+        ("GET", "/api/symbol"),
+        ("GET", "/api/source"),
+        ("GET", "/api/jev/status"),
+        ("GET", "/api/acp/status"),
+        ("GET", "/api/dependencies"),
+        ("GET", "/api/dependencies/symbols"),
+        ("GET", "/api/dependencies/source"),
+        ("GET", "/api/rust-sources"),
+        ("GET", "/api/rust-sources/tree"),
+        ("GET", "/api/rust-sources/file"),
+        ("GET", "/api/views"),
+        ("GET", "/api/views/saved"),
+        ("GET", "/api/annotations"),
+        ("GET", "/api/questions/packet/jev-request"),
+        ("GET", "/api/jobs/current"),
+        ("GET", "/api/jobs/job"),
+        ("POST", "/api/index"),
+        ("POST", "/api/jobs/job/cancel"),
+        ("POST", "/api/dependencies/refresh"),
+        ("POST", "/api/sequence"),
+        ("POST", "/api/class-diagram"),
+        ("POST", "/api/navigation"),
+        ("POST", "/api/query"),
+        ("POST", "/api/questions/preview"),
+        ("POST", "/api/questions/packet/jev-response"),
+        ("POST", "/api/questions/packet/selection"),
+        ("POST", "/api/questions/packet/acp-answer"),
+        ("POST", "/api/questions/packet/jev-run"),
+        ("PUT", "/api/views/saved"),
+        ("DELETE", "/api/views/saved"),
+        ("PUT", "/api/annotations/note"),
+        ("DELETE", "/api/annotations/note"),
+        ("GET", "/api/not-a-route"),
+        ("POST", "/api/not-a-route"),
+    ];
+    for count in [1, 2] {
+        let temp = TempDir::new().unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        let mut identities = Vec::new();
+        for name in ["first", "second"].into_iter().take(count) {
+            let root = temp.path().join(name);
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("core.js"), "function selected() { return 1; }\n").unwrap();
+            let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+            registry
+                .register(&identity, CheckoutOptions(serde_json::json!({})))
+                .unwrap();
+            identities.push(identity);
+        }
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let app = ProvisionedBrowser::new(
+            registry.clone(),
+            TOKEN.into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap()
+        .router();
+        let original = registry.lock().await.browser_checkouts();
+        for (method, path) in old_routes {
+            let (code, headers, body) =
+                selected_json(app.clone(), method, path, serde_json::json!({})).await;
+            assert_eq!(
+                code,
+                axum::http::StatusCode::NOT_FOUND,
+                "{count} roots: {method} {path}: {body}"
+            );
+            assert_eq!(headers["cache-control"], "no-store", "{method} {path}");
+            assert!(
+                !headers.contains_key("X-Baleyg-Workspace"),
+                "{method} {path}"
+            );
+            assert!(
+                !headers.contains_key("X-Baleyg-Catching-Up"),
+                "{method} {path}"
+            );
+            let state = registry.lock().await;
+            assert_eq!(state.active_count(), 0, "{method} {path} attached a client");
+            assert_eq!(
+                state.browser_checkouts(),
+                original,
+                "{method} {path} changed browser state"
+            );
+            for identity in &identities {
+                assert!(
+                    state.runtime(&identity.root_key).is_none(),
+                    "{method} {path} activated a runtime"
+                );
+            }
+        }
+        for path in ["/healthz", "/api/checkouts", "/api/daemon/status"] {
+            let (code, headers, _) = selected_json(app.clone(), "GET", path, Value::Null).await;
+            assert_eq!(code, axum::http::StatusCode::OK, "{path}");
+            assert_eq!(headers["cache-control"], "no-store");
+            assert!(!headers.contains_key("X-Baleyg-Workspace"));
+            assert_eq!(
+                registry.lock().await.active_count(),
+                0,
+                "{path} attached a client"
+            );
+        }
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        for path in ["/", "/app.js"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("host", "127.0.0.1:7331")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
+            assert_eq!(registry.lock().await.active_count(), 0);
+        }
+        for (host, auth, origin, expected) in [
+            (
+                "127.0.0.1:7331",
+                None,
+                None,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "127.0.0.1:7331",
+                Some("Bearer wrong"),
+                None,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "example.invalid",
+                Some("Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                None,
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+            (
+                "127.0.0.1:7331",
+                Some("Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                Some("https://example.invalid"),
+                axum::http::StatusCode::FORBIDDEN,
+            ),
+        ] {
+            for path in ["/api/status", "/api/index"] {
+                let mut request = Request::builder()
+                    .method(if path == "/api/index" { "POST" } else { "GET" })
+                    .uri(path)
+                    .header("host", host);
+                if let Some(auth) = auth {
+                    request = request.header("authorization", auth);
+                }
+                if let Some(origin) = origin {
+                    request = request.header("origin", origin);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected, "{path} {host}");
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
+                assert!(!response.headers().contains_key("X-Baleyg-Catching-Up"));
+            }
+        }
+        assert_eq!(registry.lock().await.browser_checkouts(), original);
+        let first = &identities[0];
+        let prefix = format!("/api/checkouts/{}", first.root_key);
+        let (code, headers, status) = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let result =
+                    selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null)
+                        .await;
+                if result.0 == axum::http::StatusCode::OK {
+                    break result;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
+        assert_eq!(
+            headers["X-Baleyg-Catching-Up"],
+            status["catchingUp"].as_bool().unwrap().to_string()
+        );
+        assert_eq!(status["workspaceRoot"], first.root.to_str().unwrap());
+        let (code, headers, files) =
+            selected_json(app.clone(), "GET", &format!("{prefix}/files"), Value::Null).await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{files}");
+        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        assert!(
+            files["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|file| file["path"] == "core.js"),
+            "{files}"
+        );
+        let (code, headers, provider) = selected_json(
+            app.clone(),
+            "GET",
+            &format!("{prefix}/jev/status"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{provider}");
+        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        let (code, headers, mutation) = selected_json(
+            app,
+            "POST",
+            &format!("{prefix}/index"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{mutation}");
+        assert!(mutation["id"].is_string(), "{mutation}");
+        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        assert_eq!(registry.lock().await.active_count(), 1);
+    }
+}
