@@ -1111,8 +1111,17 @@ impl UseGuard {
         let transition_shared = if exclusive {
             Self::index_transition_path(path)
                 .map(|transition| {
-                    Self::acquire_mode(&transition, false, true, create, readonly, || Ok(()))
-                        .map(Box::new)
+                    // Erase the closure type here: recursively instantiating
+                    // acquire_mode with a fresh closure exceeds rustc's limit.
+                    Self::acquire_mode(
+                        &transition,
+                        false,
+                        true,
+                        create,
+                        readonly,
+                        (|| Ok(())) as fn() -> Result<()>,
+                    )
+                    .map(Box::new)
                 })
                 .transpose()?
         } else {
