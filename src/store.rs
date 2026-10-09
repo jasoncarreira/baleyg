@@ -672,11 +672,18 @@ impl EvidenceResponse {
             .validate_selected_view_in(&self.db, view, sources)
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
+        self.query_view_at(query, None)
+    }
+    pub fn query_view_at(
+        &self,
+        query: &ViewQuery,
+        expected: Option<&IndexPin>,
+    ) -> Result<Option<ViewResult>> {
         query.validate()?;
         self.store.query_view_in_for(
             &self.db,
             query,
-            None,
+            expected,
             matches!(self.fence, ReadFence::PreH { .. }),
         )
     }

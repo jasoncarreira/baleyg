@@ -7862,10 +7862,7 @@ async fn provisioned_core_answer(
             let runtime = runtime.clone();
             let (view, catching_up) = tokio::task::spawn_blocking(move || {
                 let (response, catching_up) = runtime.evidence_response()?;
-                if let Some(pin) = expected {
-                    response.validate_pin(pin)?;
-                }
-                let view = response.query_view(&q)?;
+                let view = response.query_view_at(&q, expected.as_ref())?;
                 Ok::<_, anyhow::Error>((response.finish(view)?, catching_up))
             })
             .await
