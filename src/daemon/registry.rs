@@ -68,6 +68,45 @@ impl SelectionError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckoutOptions(pub serde_json::Value);
 
+/// Values are retained as data. No browser provider or checkout descriptor is
+/// opened by registration; activation uses only its selected checkout's values.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct BrowserOptions {
+    pub browse_root: Option<PathBuf>,
+    pub scip: Option<PathBuf>,
+    pub manifest: Option<PathBuf>,
+    pub max_file_bytes: u64,
+    pub rust_source_roots: Vec<(String, PathBuf)>,
+    pub rust_library: Option<PathBuf>,
+    pub trusted_rustc: Option<PathBuf>,
+    pub cargo_home: Option<PathBuf>,
+    pub jev_budget_dir: Option<PathBuf>,
+    pub jev_budget_cents: Option<u64>,
+    pub acp_runner: Option<PathBuf>,
+    pub acp_state_dir: Option<PathBuf>,
+    pub acp_max_attempts: Option<u64>,
+}
+impl Default for BrowserOptions {
+    fn default() -> Self {
+        Self {
+            browse_root: None,
+            scip: None,
+            manifest: None,
+            max_file_bytes: 2_097_152,
+            rust_source_roots: Vec::new(),
+            rust_library: None,
+            trusted_rustc: None,
+            cargo_home: None,
+            jev_budget_dir: None,
+            jev_budget_cents: None,
+            acp_runner: None,
+            acp_state_dir: None,
+            acp_max_attempts: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CheckoutMetadata {
     root: PathBuf,
@@ -182,11 +221,46 @@ impl CheckoutRegistry {
             None => TopologyRoots::production()?,
         };
         let store = Store::open(roots, identity)?;
-        let options = IndexOptions::new(entry.identity.root.clone());
-        // The HTTP state is a per-checkout native stream scheduler. The random
-        // internal token and placeholder address are never bound or exposed;
-        // browser provisioning owns the real listener and its configured token.
-        let scheduler = http::new(
+        let config: BrowserOptions = entry
+            .registration
+            .as_ref()
+            .map(|registered| serde_json::from_value(registered.0.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        let mut options = IndexOptions::new(entry.identity.root.clone());
+        options.scip_path = config.scip;
+        options.manifest_path = config.manifest;
+        options.max_file_bytes = config.max_file_bytes;
+        let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
+            (Some(dir), Some(cap)) => {
+                let key = std::env::var("JEV_KEY")?;
+                Some(Arc::new(crate::live_jev::LiveJev::open(
+                    &dir,
+                    key,
+                    cap,
+                    &options.workspace_root,
+                )?))
+            }
+            _ => None,
+        };
+        let acp = match (
+            config.acp_runner,
+            config.acp_state_dir,
+            config.acp_max_attempts,
+        ) {
+            (Some(runner), Some(state_dir), Some(max_attempts)) => {
+                Some(Arc::new(crate::acp::Acp::open(crate::acp::AcpConfig {
+                    runner,
+                    state_dir,
+                    max_attempts,
+                    workspace: options.workspace_root.clone(),
+                })?))
+            }
+            _ => None,
+        };
+        // Browser registration remains inert until activation. The scheduler's
+        // internal token/address are not bound or exposed by browser provisioning.
+        let scheduler = http::new_with_dependency_options(
             store.clone(),
             options.clone(),
             format!(
@@ -195,6 +269,16 @@ impl CheckoutRegistry {
                 uuid::Uuid::new_v4().simple()
             ),
             "127.0.0.1:1".parse()?,
+            provider,
+            acp,
+            config
+                .browse_root
+                .unwrap_or_else(|| options.workspace_root.clone()),
+            config.rust_source_roots,
+            Some(crate::dependencies::CatalogOptions {
+                cargo_home: config.cargo_home,
+                rust_library: config.rust_library,
+            }),
         )?;
         let permit = self.idle_permits.remove(key);
         let epoch = self
@@ -281,6 +365,173 @@ impl CheckoutRegistry {
         self.entries.get(key)?.registration.as_ref()
     }
 
+    /// Validate one inert browser configuration before changing any registry entry.
+    pub fn validate_browser_options(
+        identity: &WorkspaceIdentity,
+        options: &CheckoutOptions,
+    ) -> Result<(), SelectionError> {
+        identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        let config: BrowserOptions =
+            serde_json::from_value(options.0.clone()).map_err(|_| SelectionError::Unavailable)?;
+        if config.max_file_bytes == 0
+            || config.max_file_bytes > 16_777_216
+            || config.manifest.is_some() && config.scip.is_none()
+        {
+            return Err(SelectionError::Unavailable);
+        }
+        let browse = config.browse_root.as_deref().unwrap_or(&identity.root);
+        if !browse.is_dir() || !browse.is_absolute() {
+            return Err(SelectionError::Unavailable);
+        }
+        if config.jev_budget_dir.is_some() != config.jev_budget_cents.is_some()
+            || config.acp_runner.is_some() != config.acp_state_dir.is_some()
+            || config.acp_runner.is_some() != config.acp_max_attempts.is_some()
+            || config
+                .jev_budget_cents
+                .is_some_and(|cap| !(10..=500).contains(&cap))
+            || config
+                .acp_max_attempts
+                .is_some_and(|cap| !(1..=20).contains(&cap))
+        {
+            return Err(SelectionError::Unavailable);
+        }
+        if config.rust_source_roots.len() > 8 {
+            return Err(SelectionError::Unavailable);
+        }
+        let mut labels = HashSet::new();
+        for (label, root) in &config.rust_source_roots {
+            if label.is_empty()
+                || label.len() > 48
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !labels.insert(label)
+                || !root.is_absolute()
+                || !root.is_dir()
+            {
+                return Err(SelectionError::Unavailable);
+            }
+        }
+        if let Some(dir) = &config.jev_budget_dir {
+            let key = std::env::var("JEV_KEY").map_err(|_| SelectionError::Unavailable)?;
+            if key.trim().is_empty()
+                || reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            match fs::symlink_metadata(dir) {
+                Ok(m) => {
+                    if !m.is_dir()
+                        || m.file_type().is_symlink()
+                        || m.uid() != unsafe { libc::geteuid() }
+                        || m.mode() & 0o777 != 0o700
+                    {
+                        return Err(SelectionError::Unavailable);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SelectionError::Unavailable),
+            }
+        }
+        if let (Some(runner), Some(state)) = (&config.acp_runner, &config.acp_state_dir) {
+            let workspace = identity
+                .root
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?;
+            let runner = runner
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?;
+            if !runner.is_file()
+                || runner.starts_with(&workspace)
+                || state
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            let mut ancestor = state.as_path();
+            while !ancestor
+                .try_exists()
+                .map_err(|_| SelectionError::Unavailable)?
+            {
+                ancestor = ancestor.parent().ok_or(SelectionError::Unavailable)?;
+            }
+            if ancestor
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?
+                .starts_with(&workspace)
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            match fs::symlink_metadata(state) {
+                Ok(m) => {
+                    if !m.is_dir()
+                        || m.file_type().is_symlink()
+                        || m.uid() != unsafe { libc::geteuid() }
+                        || m.mode() & 0o777 != 0o700
+                    {
+                        return Err(SelectionError::Unavailable);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SelectionError::Unavailable),
+            }
+        }
+        if let Some(compiler) = &config.trusted_rustc
+            && (!compiler.is_absolute()
+                || !compiler.is_file()
+                || compiler
+                    .canonicalize()
+                    .map_err(|_| SelectionError::Unavailable)?
+                    .starts_with(&identity.root))
+        {
+            return Err(SelectionError::Unavailable);
+        }
+        for path in [
+            config.scip,
+            config.manifest,
+            config.rust_library,
+            config.trusted_rustc,
+            config.cargo_home,
+            config.jev_budget_dir,
+            config.acp_runner,
+            config.acp_state_dir,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_absolute() {
+                return Err(SelectionError::Unavailable);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn can_register(
+        &self,
+        identity: &WorkspaceIdentity,
+        options: &CheckoutOptions,
+    ) -> Result<(), SelectionError> {
+        identity
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        Self::validate_browser_options(identity, options)?;
+        if let Some(entry) = self.entries.get(&identity.root_key) {
+            if !entry.identity.matches(identity) {
+                return Err(SelectionError::IdentityChanged);
+            }
+            if entry.registration.as_ref() != Some(options)
+                && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
+                && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
+            {
+                return Err(SelectionError::RegistrationConflict);
+            }
+        }
+        Ok(())
+    }
+
     /// A repeat is idempotent. Replacement is possible only after release.
     pub fn register(
         &mut self,
@@ -298,7 +549,9 @@ impl CheckoutRegistry {
             if entry.registration.as_ref() == Some(&options) {
                 return Ok(());
             }
-            if !entry.released || entry.pending_work || !entry.sessions.is_empty() {
+            if (entry.registration.is_some() || self.runtimes.contains_key(key))
+                && (!entry.released || entry.pending_work || !entry.sessions.is_empty())
+            {
                 return Err(SelectionError::RegistrationConflict);
             }
             entry.registration = Some(options);

@@ -4,7 +4,7 @@ pub mod protocol;
 pub mod registry;
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
@@ -168,5 +168,216 @@ pub async fn run_idle_lifecycle(
         {
             return Ok(());
         }
+    }
+}
+
+/// Observe token data and identity through the same checked descriptor.
+fn checked_token(path: &Path) -> anyhow::Result<(String, (u64, u64))> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.mode() & 0o777 == 0o600
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1,
+        "insecure token file"
+    );
+    let mut token = String::new();
+    file.by_ref().take(65).read_to_string(&mut token)?;
+    anyhow::ensure!(crate::auth::valid_token(&token), "invalid token file");
+    Ok((token, (metadata.dev(), metadata.ino())))
+}
+
+fn check_token_path(path: &Path, inode: (u64, u64)) -> anyhow::Result<()> {
+    let named = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        named.is_file() && !named.file_type().is_symlink() && (named.dev(), named.ino()) == inode,
+        "serve token file identity changed"
+    );
+    Ok(())
+}
+
+/// Browser HTTP is absent until explicit serve registration succeeds. The
+/// provisioner belongs to the elected daemon, not a checkout attachment.
+pub struct BrowserProvisioner {
+    listener: Option<tokio::net::TcpListener>,
+    browser: Option<crate::http::ProvisionedBrowser>,
+    requested_bind: Option<std::net::SocketAddr>,
+    token_path: Option<PathBuf>,
+    token_inode: Option<(u64, u64)>,
+    token: Option<String>,
+    effective_address: Option<std::net::SocketAddr>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for BrowserProvisioner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserProvisioner {
+    pub fn new() -> Self {
+        Self {
+            listener: None,
+            browser: None,
+            requested_bind: None,
+            token_path: None,
+            token_inode: None,
+            token: None,
+            effective_address: None,
+            closed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn address(&self) -> Option<std::net::SocketAddr> {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            self.effective_address
+        }
+    }
+
+    pub fn router(&self) -> Option<axum::Router> {
+        self.browser
+            .clone()
+            .map(crate::http::ProvisionedBrowser::router)
+    }
+
+    /// Call under the daemon's provisioning mutex. All conflicts are checked
+    /// before touching registration, listener or another checkout's settings.
+    pub async fn register_serve(
+        &mut self,
+        registry: &std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        identity: &crate::store::topology::WorkspaceIdentity,
+        options: registry::CheckoutOptions,
+        bind: std::net::SocketAddr,
+        token_file: &Path,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        self.register_serve_with_hook(registry, identity, options, bind, token_file, None)
+            .await
+    }
+
+    /// Hook for deterministic boundary tests; invoked while registration holds its guard.
+    #[doc(hidden)]
+    pub async fn register_serve_with_hook(
+        &mut self,
+        registry: &std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        identity: &crate::store::topology::WorkspaceIdentity,
+        options: registry::CheckoutOptions,
+        bind: std::net::SocketAddr,
+        token_file: &Path,
+        mut hook: Option<&mut dyn FnMut(&'static str)>,
+    ) -> anyhow::Result<std::net::SocketAddr> {
+        anyhow::ensure!(
+            bind.ip().is_loopback(),
+            "only loopback bind addresses are supported"
+        );
+        let parent = token_file
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file = token_file
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
+        let token_path = parent.canonicalize()?.join(file);
+        // The held guard covers validation, binding, token creation and commit.
+        let mut checked = registry.lock().await;
+        checked
+            .can_register(identity, &options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        if let Some(hook) = hook.as_mut() {
+            hook("validated");
+        }
+        if let Some(original) = self.requested_bind {
+            anyhow::ensure!(self.address().is_some(), "browser listener closed");
+            anyhow::ensure!(
+                bind == original,
+                "serve bind conflicts with running listener"
+            );
+            anyhow::ensure!(
+                self.token_path.as_ref() == Some(&token_path),
+                "serve token file conflicts with running listener"
+            );
+            let (token, inode) = checked_token(&token_path)?;
+            if let Some(hook) = hook.as_mut() {
+                hook("token_observed");
+            }
+            check_token_path(&token_path, inode)?;
+            anyhow::ensure!(
+                self.token_inode == Some(inode),
+                "serve token file identity changed"
+            );
+            anyhow::ensure!(
+                self.token.as_ref() == Some(&token),
+                "serve token contents changed"
+            );
+            checked
+                .register(identity, options)
+                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+            return self
+                .address()
+                .ok_or_else(|| anyhow::anyhow!("browser listener closed"));
+        }
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        let address = listener.local_addr()?;
+        crate::auth::load_or_create_token(&token_path)?;
+        let (token, inode) = checked_token(&token_path)?;
+        if let Some(hook) = hook.as_mut() {
+            hook("token_observed");
+        }
+        check_token_path(&token_path, inode)?;
+        let browser =
+            crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
+        checked
+            .register(identity, options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        self.listener = Some(listener);
+        self.effective_address = Some(address);
+        self.browser = Some(browser);
+        self.requested_bind = Some(bind);
+        self.token_path = Some(token_path);
+        self.token_inode = Some(inode);
+        self.token = Some(token);
+        Ok(address)
+    }
+
+    /// Start serving without consuming the provisioner. New explicit serve
+    /// registrations can still compare against its retained bind and token.
+    /// The caller monitors the task and closes serve control on idle exit.
+    pub fn spawn_until_idle(
+        &mut self,
+        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let browser = self
+            .browser
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let closed = self.closed.clone();
+        Ok(tokio::spawn(async move {
+            let server = axum::serve(listener, browser.router());
+            let result = tokio::select! {
+                outcome = server => outcome.map_err(anyhow::Error::from),
+                outcome = run_idle_lifecycle(registry) => outcome.map_err(|error| anyhow::anyhow!("{}", error.reason())),
+            };
+            closed.store(true, std::sync::atomic::Ordering::Release);
+            result
+        }))
+    }
+
+    /// Convenience for a single serve control owner; socket dispatch should
+    /// instead keep this provisioner and monitor the spawned task.
+    pub async fn serve_until_idle(
+        mut self,
+        registry: std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    ) -> anyhow::Result<()> {
+        self.spawn_until_idle(registry)?.await?
     }
 }

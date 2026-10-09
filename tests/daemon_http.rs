@@ -1,0 +1,797 @@
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use baleyg::{
+    daemon::{
+        BrowserProvisioner,
+        registry::{BrowserOptions, CheckoutOptions, CheckoutRegistry},
+    },
+    store::topology::WorkspaceIdentity,
+};
+use std::{
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::sync::Mutex;
+use tower::ServiceExt;
+
+fn checkout(root: &Path) -> WorkspaceIdentity {
+    fs::create_dir_all(root.join(".git")).unwrap();
+    WorkspaceIdentity::discover(Some(root), root)
+        .unwrap()
+        .attach_marker()
+        .unwrap()
+}
+fn options() -> CheckoutOptions {
+    CheckoutOptions(serde_json::to_value(BrowserOptions::default()).unwrap())
+}
+async fn response(
+    router: axum::Router,
+    address: std::net::SocketAddr,
+    route: &str,
+    token: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .uri(route)
+        .header("host", address.to_string());
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn socket_first_then_serve_and_serve_first_then_mcp_are_inert() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let a = checkout(&root.join("a"));
+    let b = checkout(&root.join("b"));
+    for socket_first in [true, false] {
+        let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+        let mut browser = BrowserProvisioner::new();
+        assert!(browser.address().is_none());
+        let token_file = root.join(format!("token-{socket_first}"));
+        assert!(!token_file.exists());
+        if socket_first {
+            registry.lock().await.attach_launch(1, &a).unwrap();
+        }
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &a,
+                    options(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .is_ok()
+        );
+        let address = browser.address().unwrap();
+        assert_ne!(address.port(), 0);
+        if !socket_first {
+            registry.lock().await.attach_launch(1, &a).unwrap();
+        }
+        let registered = registry.lock().await;
+        assert_eq!(registered.active_count(), 1);
+        assert!(registered.runtime(&a.root_key).is_none());
+        drop(registered);
+        let token = fs::read_to_string(&token_file).unwrap();
+        let router = browser.router().unwrap();
+        assert_eq!(
+            response(router.clone(), address, "/api/checkouts", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            response(router.clone(), address, "/api/checkouts", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response(router.clone(), address, "/api/daemon/status", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response(router.clone(), address, "/api/status", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            response(router.clone(), address, "/api/status", Some(&token))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            response(router.clone(), address, "/healthz", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response(router.clone(), address, "/", None).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            response(router.clone(), address, "/app.js", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(registry.lock().await.active_count(), 1);
+        // Exact repeat is idempotent, including requested port zero.
+        assert_eq!(
+            browser
+                .register_serve(
+                    &registry,
+                    &a,
+                    options(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .unwrap(),
+            address
+        );
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &b,
+                    options(),
+                    "0.0.0.0:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &b,
+                    options(),
+                    "127.0.0.1:1".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .is_err()
+        );
+        assert!(registry.lock().await.registration(&b.root_key).is_none());
+        let alternate = root.join(format!("alternate-{socket_first}"));
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &b,
+                    options(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &alternate
+                )
+                .await
+                .is_err()
+        );
+        assert!(!alternate.exists());
+        fs::write(&token_file, "0".repeat(64)).unwrap();
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &b,
+                    options(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .is_err()
+        );
+        assert!(registry.lock().await.registration(&b.root_key).is_none());
+        fs::write(&token_file, &token).unwrap();
+        assert_eq!(
+            browser
+                .register_serve(
+                    &registry,
+                    &b,
+                    options(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .unwrap(),
+            address
+        );
+        assert_eq!(registry.lock().await.active_count(), 1);
+        registry.lock().await.disconnect(1);
+        assert_eq!(registry.lock().await.active_count(), 1); // release has its own timer
+    }
+}
+
+#[tokio::test]
+async fn listener_and_control_do_not_postpone_idle_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let checkout = checkout(&root.join("checkout"));
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::starting_at(
+        Instant::now() - Duration::from_secs(31 * 60),
+    )));
+    let mut browser = BrowserProvisioner::new();
+    let address = browser
+        .register_serve(
+            &registry,
+            &checkout,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &root.join("token"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(registry.lock().await.active_count(), 0);
+    let (_control, _daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
+    browser.serve_until_idle(registry).await.unwrap();
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn conflicting_checkout_settings_and_token_inode_leave_other_entries_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let first = checkout(&root.join("first"));
+    let second = checkout(&root.join("second"));
+    let token_file = root.join("token");
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    let original = options();
+    browser
+        .register_serve(
+            &registry,
+            &first,
+            original.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+        )
+        .await
+        .unwrap();
+    let address = browser.address();
+    let different = CheckoutOptions(
+        serde_json::to_value(BrowserOptions {
+            max_file_bytes: 4096,
+            ..BrowserOptions::default()
+        })
+        .unwrap(),
+    );
+    registry.lock().await.attach_launch(7, &first).unwrap();
+    assert!(
+        browser
+            .register_serve(
+                &registry,
+                &first,
+                different.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                &token_file
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        registry.lock().await.registration(&first.root_key),
+        Some(&original)
+    );
+    assert!(
+        registry
+            .lock()
+            .await
+            .registration(&second.root_key)
+            .is_none()
+    );
+    assert_eq!(browser.address(), address);
+    registry.lock().await.disconnect(7);
+    assert!(registry.lock().await.release(&first.root_key).unwrap());
+    assert!(
+        browser
+            .register_serve(
+                &registry,
+                &first,
+                different.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                &token_file
+            )
+            .await
+            .is_ok()
+    );
+    browser
+        .register_serve(
+            &registry,
+            &second,
+            original,
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+        )
+        .await
+        .unwrap();
+    let saved = registry
+        .lock()
+        .await
+        .registration(&second.root_key)
+        .cloned();
+    fs::rename(&token_file, root.join("old-token")).unwrap();
+    fs::write(&token_file, fs::read(root.join("old-token")).unwrap()).unwrap();
+    assert!(
+        browser
+            .register_serve(
+                &registry,
+                &second,
+                different,
+                "127.0.0.1:0".parse().unwrap(),
+                &token_file
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        registry
+            .lock()
+            .await
+            .registration(&second.root_key)
+            .cloned(),
+        saved
+    );
+    assert_eq!(browser.address(), address);
+}
+
+#[tokio::test]
+async fn later_serve_compares_configuration_while_http_is_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let first = checkout(&root.join("first"));
+    let second = checkout(&root.join("second"));
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    registry.lock().await.attach_launch(1, &first).unwrap();
+    let mut browser = BrowserProvisioner::new();
+    let token_file = root.join("token");
+    let address = browser
+        .register_serve(
+            &registry,
+            &first,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+        )
+        .await
+        .unwrap();
+    let serving = browser.spawn_until_idle(registry.clone()).unwrap();
+    assert_eq!(browser.address(), Some(address));
+    assert_eq!(
+        browser
+            .register_serve(
+                &registry,
+                &second,
+                options(),
+                "127.0.0.1:0".parse().unwrap(),
+                &token_file
+            )
+            .await
+            .unwrap(),
+        address
+    );
+    assert!(
+        browser
+            .register_serve(
+                &registry,
+                &second,
+                options(),
+                "127.0.0.1:1".parse().unwrap(),
+                &token_file
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(registry.lock().await.active_count(), 1);
+    serving.abort();
+    let _ = serving.await;
+}
+
+static JEV_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct JevKeyRestore(Option<std::ffi::OsString>);
+impl JevKeyRestore {
+    fn set(key: &str) -> Self {
+        let old = std::env::var_os("JEV_KEY");
+        // Only these tests mutate JEV_KEY, under JEV_ENV_LOCK.
+        unsafe { std::env::set_var("JEV_KEY", key) };
+        Self(old)
+    }
+}
+impl Drop for JevKeyRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.0 {
+            unsafe { std::env::set_var("JEV_KEY", value) };
+        } else {
+            unsafe { std::env::remove_var("JEV_KEY") };
+        }
+    }
+}
+
+async fn assert_rejected_before_provision(config: BrowserOptions, root: &Path) {
+    let identity = checkout(&root.join("checkout"));
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    let token = root.join("token");
+    assert!(
+        browser
+            .register_serve(
+                &registry,
+                &identity,
+                CheckoutOptions(serde_json::to_value(config).unwrap()),
+                "127.0.0.1:0".parse().unwrap(),
+                &token,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        browser.address().is_none(),
+        "invalid registration published listener"
+    );
+    assert!(!token.exists(), "invalid registration created token");
+    assert!(
+        registry
+            .lock()
+            .await
+            .registration(&identity.root_key)
+            .is_none(),
+        "invalid registration retained checkout"
+    );
+}
+
+#[tokio::test]
+async fn whitespace_and_invalid_header_jev_key_fail_before_provision() {
+    let _lock = JEV_ENV_LOCK.lock().await;
+    for (name, key) in [("whitespace", "  \t  "), ("invalid-header", "key\nvalue")] {
+        let temp = tempfile::tempdir().unwrap();
+        let _key = JevKeyRestore::set(key);
+        assert_rejected_before_provision(
+            BrowserOptions {
+                jev_budget_dir: Some(temp.path().join("budget")),
+                jev_budget_cents: Some(10),
+                ..BrowserOptions::default()
+            },
+            &temp.path().join(name),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn non_private_existing_jev_budget_dir_fails_before_provision() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = JEV_ENV_LOCK.lock().await;
+    let _key = JevKeyRestore::set("valid-key");
+    let temp = tempfile::tempdir().unwrap();
+    let budget = temp.path().join("budget");
+    fs::create_dir(&budget).unwrap();
+    fs::set_permissions(&budget, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_rejected_before_provision(
+        BrowserOptions {
+            jev_budget_dir: Some(budget),
+            jev_budget_cents: Some(10),
+            ..BrowserOptions::default()
+        },
+        temp.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dangling_symlink_acp_state_fails_before_provision() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let runner = temp.path().join("runner");
+    fs::write(&runner, "runner").unwrap();
+    let state = temp.path().join("state");
+    symlink(temp.path().join("missing"), &state).unwrap();
+    assert_rejected_before_provision(
+        BrowserOptions {
+            acp_runner: Some(runner),
+            acp_state_dir: Some(state),
+            acp_max_attempts: Some(1),
+            ..BrowserOptions::default()
+        },
+        temp.path(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn invalid_options_fail_before_listener_or_token_and_valid_options_are_retained() {
+    let _jev_env_lock = JEV_ENV_LOCK.lock().await;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let identity = checkout(&root.join("checkout"));
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let runner = outside.join("runner");
+    fs::write(&runner, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o700)).unwrap();
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    let token_file = root.join("token");
+    let mut variants = Vec::new();
+    variants.push(BrowserOptions {
+        rust_source_roots: (0..9)
+            .map(|i| (format!("root{i}"), outside.clone()))
+            .collect(),
+        ..BrowserOptions::default()
+    });
+    for labels in [["bad label", "good"], ["same", "same"]] {
+        variants.push(BrowserOptions {
+            rust_source_roots: labels
+                .into_iter()
+                .map(|label| (label.into(), outside.clone()))
+                .collect(),
+            ..BrowserOptions::default()
+        });
+    }
+    // A missing key is distinct from a configured valid provider.
+    if std::env::var("JEV_KEY").is_err() {
+        variants.push(BrowserOptions {
+            jev_budget_dir: Some(outside.join("budget")),
+            jev_budget_cents: Some(10),
+            ..BrowserOptions::default()
+        });
+    }
+    variants.push(BrowserOptions {
+        acp_runner: Some(outside.join("missing")),
+        acp_state_dir: Some(outside.join("private")),
+        acp_max_attempts: Some(1),
+        ..BrowserOptions::default()
+    });
+    let inside = identity.root.join("runner");
+    fs::write(&inside, "runner").unwrap();
+    variants.push(BrowserOptions {
+        acp_runner: Some(inside),
+        acp_state_dir: Some(outside.join("private")),
+        acp_max_attempts: Some(1),
+        ..BrowserOptions::default()
+    });
+    variants.push(BrowserOptions {
+        acp_runner: Some(runner.clone()),
+        acp_state_dir: Some(identity.root.join("private")),
+        acp_max_attempts: Some(1),
+        ..BrowserOptions::default()
+    });
+    for config in variants {
+        assert!(
+            browser
+                .register_serve(
+                    &registry,
+                    &identity,
+                    CheckoutOptions(serde_json::to_value(config).unwrap()),
+                    "127.0.0.1:0".parse().unwrap(),
+                    &token_file
+                )
+                .await
+                .is_err()
+        );
+        assert!(browser.address().is_none());
+        assert!(!token_file.exists());
+    }
+    let config = BrowserOptions {
+        trusted_rustc: Some(runner.clone()),
+        acp_runner: Some(runner),
+        acp_state_dir: Some(outside.join("private")),
+        acp_max_attempts: Some(2),
+        rust_source_roots: vec![("source_1".into(), outside)],
+        ..BrowserOptions::default()
+    };
+    let saved = CheckoutOptions(serde_json::to_value(config).unwrap());
+    browser
+        .register_serve(
+            &registry,
+            &identity,
+            saved.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        registry.lock().await.registration(&identity.root_key),
+        Some(&saved)
+    );
+}
+
+#[tokio::test]
+async fn provisioned_page_serves_all_referenced_assets() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let identity = checkout(&root.join("checkout"));
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    let address = browser
+        .register_serve(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &root.join("token"),
+        )
+        .await
+        .unwrap();
+    let html = include_str!("../web/index.html");
+    for asset in [
+        "style.css",
+        "classes.css",
+        "navigation.css",
+        "sequence.js",
+        "shell.js",
+        "classes.js",
+        "navigation.js",
+        "app.js",
+    ] {
+        assert!(html.contains(&format!("/{asset}")));
+        let reply = response(
+            browser.router().unwrap(),
+            address,
+            &format!("/{asset}"),
+            None,
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::OK, "{asset}");
+        assert_eq!(
+            reply.headers()["content-type"],
+            if asset.ends_with(".css") {
+                "text/css; charset=utf-8"
+            } else {
+                "text/javascript; charset=utf-8"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn bare_relative_token_file_is_anchored_to_working_directory() {
+    let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let identity = checkout(&temp.path().join("checkout"));
+    let token = temp.path().join("token");
+    let relative = token
+        .strip_prefix(std::env::current_dir().unwrap())
+        .unwrap();
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    browser
+        .register_serve(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            relative,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&token).unwrap().len(), 64);
+    // A bare filename resolves against the current working directory too.
+    let bare = format!("baleyg-token-{}", uuid::Uuid::new_v4());
+    let mut second = BrowserProvisioner::new();
+    second
+        .register_serve(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            Path::new(&bare),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&bare).unwrap().len(), 64);
+    fs::remove_file(bare).unwrap();
+}
+
+#[tokio::test]
+async fn registry_lock_covers_validation_through_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = checkout(&temp.path().join("checkout"));
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::with_roots(
+        baleyg::store::topology::TopologyRoots::isolated_for_tests(
+            temp.path().join("cache"),
+            temp.path().join("data"),
+        ),
+    )));
+    let mut browser = BrowserProvisioner::new();
+    let mut attempted = false;
+    let candidate = registry.clone();
+    let checkout_root = identity.root.clone();
+    let mut attach = None;
+    let mut hook = |stage| {
+        if stage == "validated" {
+            attempted = true;
+            assert!(
+                candidate.try_lock().is_err(),
+                "activation cannot interleave commit"
+            );
+            let candidate = candidate.clone();
+            let checkout_root = checkout_root.clone();
+            attach = Some(tokio::spawn(async move {
+                let selected = WorkspaceIdentity::discover(Some(&checkout_root), &checkout_root)
+                    .unwrap()
+                    .attach_existing_marker_readonly()
+                    .unwrap();
+                let mut guard = candidate.lock().await;
+                guard.attach_launch(7, &selected).unwrap();
+                // The activation attempt occurs only after registration commits.
+                guard.activate(&selected.root_key).unwrap();
+            }));
+        }
+    };
+    browser
+        .register_serve_with_hook(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &temp.path().join("token"),
+            Some(&mut hook),
+        )
+        .await
+        .unwrap();
+    assert!(attempted);
+    attach.take().unwrap().await.unwrap();
+    assert!(
+        registry
+            .lock()
+            .await
+            .registration(&identity.root_key)
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn replacing_token_after_descriptor_read_rejects_same_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = checkout(&temp.path().join("checkout"));
+    let token_file = temp.path().join("token");
+    let registry = Arc::new(Mutex::new(CheckoutRegistry::new()));
+    let mut browser = BrowserProvisioner::new();
+    browser
+        .register_serve(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+        )
+        .await
+        .unwrap();
+    let original = fs::read(&token_file).unwrap();
+    let mut hook = |stage| {
+        if stage == "token_observed" {
+            fs::rename(&token_file, temp.path().join("old")).unwrap();
+            fs::write(&token_file, &original).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    };
+    let result = browser
+        .register_serve_with_hook(
+            &registry,
+            &identity,
+            options(),
+            "127.0.0.1:0".parse().unwrap(),
+            &token_file,
+            Some(&mut hook),
+        )
+        .await;
+    assert!(result.unwrap_err().to_string().contains("identity changed"));
+}
