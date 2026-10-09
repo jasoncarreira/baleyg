@@ -1,6 +1,6 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let token = "", epoch = 0, selectedRootKey = null, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
+let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, checkoutBusy = false, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
 const pendingRequests = new Set();
 let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
@@ -211,8 +211,9 @@ async function refreshStatus(followup = false) {
   catch (error) {
     if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
       const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
+      const listedRoot = selectedWorkspaceRoot;
       resetCheckout();
-      selectedRootKey = root;
+      selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
@@ -348,7 +349,7 @@ const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key
 function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
 function resetCheckout() {
   // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
-  epoch++; selectedRootKey = null;
+  epoch++; selectedRootKey = null; selectedWorkspaceRoot = null; checkoutBusy = false;
   for (const controller of pendingRequests) controller.abort();
   clearTimeout(pollTimer); pollTimer = null; statusSerial++; savedSerial++; querySerial++; searchSerial++;
   pairRefreshPending = false; pairRefreshQueued = null;
@@ -400,8 +401,23 @@ async function loadCheckouts() {
     if (!Array.isArray(data?.checkouts)) throw new Error("Checkout list is invalid. Retry the list.");
     const keys = data.checkouts.filter(row => objectValue(row) && typeof row.rootKey === "string").map(row => row.rootKey);
     if (new Set(keys).size !== keys.length) throw new Error("Duplicate checkout root key. Retry the list.");
-    checkouts = data.checkouts.filter(row => objectValue(row) && validRootKey(row.rootKey) && typeof row.state === "string");
-    if (selectedRootKey && !checkouts.some(row => row.rootKey === selectedRootKey && selectable(row))) {
+    const next = data.checkouts.filter(row => objectValue(row) && validRootKey(row.rootKey) && typeof row.state === "string");
+    const selected = selectedRootKey && next.find(row => row.rootKey === selectedRootKey);
+    // A transient list read cannot revoke an explicit selection of the same listed root.
+    // Erase derived evidence and fence scoped requests until the list recovers.
+    const verifiedRoot = selectedWorkspaceRoot;
+    const sameRoot = selected && verifiedRoot && selected.workspaceRoot === verifiedRoot;
+    const busy = sameRoot && selected.state === "storage_busy";
+    const recovering = checkoutBusy && sameRoot && selectable(selected);
+    if (busy && !checkoutBusy) {
+      const key = selectedRootKey;
+      resetCheckout();
+      selectedRootKey = key; selectedWorkspaceRoot = verifiedRoot;
+      checkoutBusy = true;
+      $("checkout-root").textContent = verifiedRoot;
+    }
+    checkouts = next;
+    if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
       invalidateSelection("Selected checkout is no longer available. Choose again."); return;
     }
     const select = $("checkout-select"), choice = selectedRootKey || "";
@@ -412,10 +428,12 @@ async function loadCheckouts() {
     }
     select.value = choice;
     select.disabled = !checkouts.some(selectable);
-    $("checkout-state").textContent = !checkouts.length ? "No checkouts found. Register a checkout, then retry."
+    $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
+      : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
       : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
       : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
-    $("checkout-retry").hidden = checkouts.length > 0 && checkouts.every(selectable);
+    $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
+    if (recovering) await selectCheckout(choice);
     return true;
   } catch (error) {
     if (session !== epoch || error.name === "AbortError") return;
@@ -440,6 +458,7 @@ async function selectCheckout(key) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
   selectedRootKey = key;
+  selectedWorkspaceRoot = checkouts.find(row => row.rootKey === key).workspaceRoot;
   $("error").hidden = true; $("error").textContent = "";
   $("checkout-root").textContent = "Verifying selected checkout…";
   $("checkout-state").textContent = "Loading selected checkout…";

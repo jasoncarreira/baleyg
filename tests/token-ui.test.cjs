@@ -470,3 +470,85 @@ for (const otherState of ["available","unavailable"])
     await assert.rejects(h.run("api('/api/status')"),/Choose an available checkout/);
     assert.equal(h.requests.length,0);
   });
+
+test("selected checkout survives typed storage_busy without scoped traffic and recovers at Q", async () => {
+  const P={indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const Q={...P,indexRevision:2};
+  let phase="warm";
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:phase==="busy"?"storage_busy":"available",active:true}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:1});
+    if(phase==="busy")throw new Error(`Scoped request during typed storage_busy: ${url}`);
+    assert.ok(url.startsWith(`${SCOPED}/`),`Unexpected route: ${url}`);
+    const revision=phase==="warm"?P:Q;
+    if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision,stats:{},diagnostics:[`diagnostic-${phase}`]});
+    if(url.startsWith(`${SCOPED}/tree?`))return response({revision,path:"",root:"/synthetic",items:[],nextOffset:null});
+    if(url===`${SCOPED}/views`)return response([{id:`view-${phase}`,title:`view-${phase}`,query:{seed:"seed"}}]);
+    if(url===`${SCOPED}/annotations`)return response([{id:`note-${phase}`,nodeId:"seed",body:`note-${phase}`}]);
+    if(url===`${SCOPED}/jev/status`)return response({enabled:true,budget:{remainingCents:100,capCents:100,reservedCents:0,attempts:0}});
+    if(url===`${SCOPED}/acp/status`)return response({enabled:true,status:{remainingAttempts:1}});
+    if(url===`${SCOPED}/jobs/current`)return response(null);
+    if(url===`${SCOPED}/dependencies`)return response({state:"disabled",workspaceRevision:revision,catalogId:null,packages:[],warnings:[]});
+    if(url.startsWith(`${SCOPED}/source?`))return response({revision:P,file:{path:"same.rs",text:"source-P"}});
+    throw new Error(`Unexpected: ${url}`);
+  }});
+  await h.connect("synthetic",true);
+  await h.run("showSource({path:'same.rs',range:{startLine:1,endLine:1}},status.revision)");
+  assert.equal(h.run("status.revision.indexRevision"),1);
+  assert.equal(h.run("views.length"),1);
+  assert.equal(h.run("sourceCache.size"),1);
+  phase="busy";
+  const before=h.requests.length;
+  await h.run("loadCheckouts()");
+  assert.equal(h.run("selectedRootKey"),ROOT,"transient read-probe busy must retain explicit root");
+  assert.equal(h.run("token"),"synthetic");
+  assert.equal(h.get("checkout-select").value,ROOT);
+  assert.equal(h.get("checkout-root").textContent,"/synthetic");
+  assert.equal(h.get("workspace").hidden,true,"old evidence must be nonactionable");
+  assert.equal(h.run("status"),null);
+  assert.equal(h.run("views.length"),0);
+  assert.equal(h.run("annotations.length"),0);
+  assert.equal(h.run("jevStatus"),null);
+  assert.equal(h.run("acpStatus"),null);
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("checkout-retry").hidden,false);
+  assert.match(h.get("checkout-state").textContent,/busy.*retry/i);
+  await assert.rejects(h.run("api('/api/status')"),/Choose an available checkout/);
+  assert.deepEqual(h.requests.slice(before).map(request=>request.url),["/api/checkouts"]);
+  await h.get("checkout-retry").listeners.click(); await flush();
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.ok(h.requests.slice(before).every(({url})=>["/api/checkouts","/api/daemon/status"].includes(url)),"busy retry must be global-only");
+  phase="ready";
+  await h.get("checkout-retry").listeners.click(); await flush();
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.run("status.revision.indexRevision"),2);
+  assert.equal(h.get("workspace").hidden,false);
+  assert.match(h.get("diagnostics").textContent,/diagnostic-ready/);
+  assert.equal(h.run("views[0].view.id"),"view-ready");
+  assert.equal(h.run("annotations[0].annotation.id"),"note-ready");
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.doesNotMatch(h.get("source-path").textContent,/same.rs/);
+  assert.ok(h.requests.slice(before).filter(({url})=>url.startsWith(`${SCOPED}/`)).every(({url})=>phase==="ready" && !url.includes("source")));
+});
+
+for(const unavailable of ["unavailable","corrupt","missing","changed","duplicate"])
+  test(`selected checkout ${unavailable} is not treated as transient busy`,async()=>{
+    let phase="warm";
+    const h=harness({routes:url=>{
+      if(url==="/api/checkouts")return response({checkouts:phase==="warm"?[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"}]
+        : phase==="missing"?[]:phase==="changed"?[{rootKey:ROOT,workspaceRoot:"/other",state:"storage_busy"}]
+        : phase==="duplicate"?[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"storage_busy"},{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"}]
+        :[{rootKey:ROOT,workspaceRoot:"/synthetic",state:phase}]});
+      if(url==="/api/daemon/status")return response({activeCheckouts:0});
+      if(phase==="warm"&&url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
+      throw new Error(`Unexpected scoped request after ${phase}: ${url}`);
+    }});
+    await h.connect("synthetic",false);
+    assert.equal(h.run("selectedRootKey"),ROOT);
+    phase=unavailable;const at=h.requests.length;await h.run("loadCheckouts()");await flush();
+    assert.equal(h.run("selectedRootKey"),null);
+    assert.equal(h.run("status"),null);
+    assert.equal(h.get("workspace").hidden,true);
+    assert.ok(h.requests.slice(at).every(({url})=>url==="/api/checkouts"));
+  });
