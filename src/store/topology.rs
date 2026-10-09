@@ -6,6 +6,8 @@ use std::os::unix::{
     fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
     io::AsRawFd,
 };
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -388,6 +390,10 @@ impl TopologyRoots {
             use_guard,
             sidecar_gate: Mutex::new(Some(sidecar_gate)),
             transition_exclusive: Mutex::new(None),
+            #[cfg(test)]
+            test_transition_gap: super::TestOneShotHook::default(),
+            #[cfg(test)]
+            test_transition_gap_armed: std::sync::atomic::AtomicBool::new(false),
             file,
             path,
             incarnation,
@@ -1049,6 +1055,8 @@ pub struct UseGuard {
     file: File,
     path: PathBuf,
     state: Mutex<UseLockState>,
+    #[cfg(test)]
+    test_after_shared_flock_fault: std::sync::atomic::AtomicBool,
 }
 #[derive(Debug)]
 struct UseLockState {
@@ -1169,6 +1177,8 @@ impl UseGuard {
                             exclusive,
                             transition_shared,
                         }),
+                        #[cfg(test)]
+                        test_after_shared_flock_fault: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
             } else if !named
@@ -1197,6 +1207,17 @@ impl UseGuard {
     }
     pub(crate) fn verify_exclusive_path(&self, path: &Path) -> Result<()> {
         self.belongs_to(path, true)
+    }
+    #[cfg(test)]
+    fn test_unlock_shared_under_transition(&self) -> Result<()> {
+        ensure!(
+            !self.state.lock().unwrap().exclusive,
+            "test requires index-use SH"
+        );
+        self.verify()?;
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        ensure!(result == 0, "test failed to expose index-use gap");
+        Ok(())
     }
     fn try_upgrade_to_exclusive(&self, transition: &UseGuard) -> Result<()> {
         transition.verify_exclusive_path(&transition.path)?;
@@ -1237,6 +1258,13 @@ impl UseGuard {
             return Err(std::io::Error::last_os_error().into());
         }
         state.exclusive = false;
+        #[cfg(test)]
+        if self
+            .test_after_shared_flock_fault
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("injected post-SH-flock pathname verification failure");
+        }
         private_file(&self.path, &self.file)?;
         state.transition_shared.take();
         Ok(())
@@ -1263,6 +1291,10 @@ pub struct LeaderGuard {
     sidecar_gate: Mutex<Option<UseGuard>>,
     // Retained on uncertain SH restoration: no GC EX may enter that gap.
     transition_exclusive: Mutex<Option<UseGuard>>,
+    #[cfg(test)]
+    test_transition_gap: super::TestOneShotHook,
+    #[cfg(test)]
+    test_transition_gap_armed: std::sync::atomic::AtomicBool,
     file: File,
     path: PathBuf,
     pub incarnation: Uuid,
@@ -1381,6 +1413,13 @@ impl LeaderGuard {
             "storage_busy: exceptional transition already held"
         );
         *slot = Some(UseGuard::acquire_existing(&transition_path, true, true)?);
+        #[cfg(test)]
+        if self.test_transition_gap_armed.swap(false, Ordering::AcqRel) {
+            // Simulate a non-atomic SH->EX flock conversion. The transition
+            // EX alone must exclude every GC index-use EX during this gap.
+            self.use_guard.test_unlock_shared_under_transition()?;
+            self.test_transition_gap.run();
+        }
         let result = self
             .use_guard
             .try_upgrade_to_exclusive(slot.as_ref().unwrap());
@@ -1389,6 +1428,32 @@ impl LeaderGuard {
             slot.take();
         }
         result
+    }
+    #[cfg(test)]
+    pub(crate) fn test_pause_transition_gap(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_transition_gap.set(hook);
+        self.test_transition_gap_armed
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn verify_shared_use(&self, use_path: &Path) -> Result<()> {
+        self.use_guard.belongs_to(use_path, false)?;
+        self.verify()
+    }
+    /// Retry a previously uncertain post-flock verification under the retained
+    /// transition EX; never release it until the held SH pathname is verified.
+    pub(crate) fn complete_use_downgrade(&self, use_path: &Path) -> Result<()> {
+        if self.held_exclusive_use_mode() {
+            self.downgrade_use_to_shared()?;
+        }
+        self.verify_shared_use(use_path)?;
+        self.transition_exclusive.lock().unwrap().take();
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn test_fail_after_shared_flock(&self) {
+        self.use_guard
+            .test_after_shared_flock_fault
+            .store(true, Ordering::Release);
     }
     pub(crate) fn held_exclusive_use_mode(&self) -> bool {
         self.use_guard.state.lock().unwrap().exclusive

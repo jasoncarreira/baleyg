@@ -85,12 +85,23 @@ impl Drop for RootLossOwnerLease<'_> {
         }
         // Queue settlement acquires another SH; downgrade this existing fd
         // first, including when the root path or lock pathname is uncertain.
-        if let Ok(guard) = self.owner.leader_guard()
-            && guard.held_exclusive_use_mode()
-            && guard.downgrade_use_to_shared().is_err()
-        {
-            *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
-            return;
+        if let Ok(guard) = self.owner.leader_guard() {
+            if guard.uncertain_use_transition() && !guard.held_exclusive_use_mode() {
+                *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
+                return;
+            }
+            if guard.held_exclusive_use_mode() && guard.downgrade_use_to_shared().is_err() {
+                *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
+                return;
+            }
+            if guard.uncertain_use_transition()
+                || guard
+                    .verify_shared_use(&self.store.roots.index_use_lock(&self.store.identity))
+                    .is_err()
+            {
+                *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
+                return;
+            }
         }
         if !matches!(root_proof, Ok(true))
             || self.store.fail_changed_root_requests(&self.owner).is_err()
@@ -6351,6 +6362,11 @@ impl Store {
                 anyhow::anyhow!("incompatible_index: live index decode failed: {error:#}")
             }
             RecoveryClass::RecreatePending => {
+                if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
+                    // Bind the exact live obsolete marker before H takes
+                    // exceptional EX; reopen-only classification is too late.
+                    *self.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
+                }
                 self.mark_recovery(RecoveryDisposition::RecreatePending);
                 anyhow::anyhow!("recovery_required: exceptional index recovery deferred")
             }
@@ -6364,6 +6380,9 @@ impl Store {
                 anyhow::anyhow!("incompatible_index: selected evidence decode failed: {error:#}")
             }
             RecoveryClass::RecreatePending => {
+                if let Some(obsolete) = error.downcast_ref::<ObsoleteIndexFormat>() {
+                    *self.obsolete_format_marker.lock().unwrap() = Some(obsolete.0.clone());
+                }
                 self.mark_recovery(RecoveryDisposition::RecreatePending);
                 anyhow::anyhow!("incompatible_index: exceptional index recovery deferred")
             }
@@ -6895,6 +6914,32 @@ impl Store {
             RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
         ) && self.recovery_required.load(Ordering::Acquire)
     }
+    fn settle_exceptional_use_after_attempt(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+        failed: bool,
+    ) -> Result<()> {
+        let guard = owner.leader_guard()?;
+        let use_path = self.roots.index_use_lock(&self.identity);
+        // Inner recreation can fail AFTER flock successfully downgraded to SH
+        // but BEFORE pathname verification or transition-EX release. Preserve
+        // both exact locks; only an explicit checked retry may clear this state.
+        if failed && !guard.held_exclusive_use_mode() && guard.uncertain_use_transition() {
+            *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+            anyhow::bail!("recovery_required: uncertain post-SH exceptional transition");
+        }
+        if guard.held_exclusive_use_mode() {
+            if let Err(error) = guard.downgrade_use_to_shared() {
+                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+                return Err(error);
+            }
+        }
+        if guard.uncertain_use_transition() || guard.verify_shared_use(&use_path).is_err() {
+            *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+            anyhow::bail!("recovery_required: exceptional index-use SH unverified");
+        }
+        Ok(())
+    }
     /// Recreate under the SAME H-owned leader EX; never relinquish and re-elect
     /// between an empty queue probe and this exceptional publication.
     pub(crate) fn recreate_pending_with_owner(
@@ -6922,14 +6967,7 @@ impl Store {
         #[cfg(test)]
         self.test_exclusive_recovery_hook.run();
         let result = self.recreate_index_exclusive(options, guard, cancel);
-        // Even on root loss and other errors, queue settlement opens another
-        // index-use SH: restore this held fd first while retaining leader EX.
-        if guard.held_exclusive_use_mode() {
-            if let Err(error) = guard.downgrade_use_to_shared() {
-                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
-                return Err(error);
-            }
-        }
+        self.settle_exceptional_use_after_attempt(owner, result.is_err())?;
         let pin = result?;
         self.verify_leader_session(owner)?;
         ensure!(
@@ -6989,12 +7027,7 @@ impl Store {
         self.test_exclusive_recovery_hook.run();
         let guard = owner.leader_guard()?;
         let result = self.recreate_index_exclusive(options, guard, cancel);
-        if guard.held_exclusive_use_mode() {
-            if let Err(error) = guard.downgrade_use_to_shared() {
-                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
-                return Err(error);
-            }
-        }
+        self.settle_exceptional_use_after_attempt(&owner, result.is_err())?;
         let pin = result?;
         self.verify_leader_session(&owner)?;
         ensure!(
@@ -13300,6 +13333,104 @@ mod rebaseline_fault_tests {
     }
 
     #[test]
+    fn live_obsolete_head_classification_binds_marker_before_same_owner_recreate() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let owner = store.leader_session().unwrap();
+        let first = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        owner
+            .leader_guard()
+            .unwrap()
+            .release_sidecar_mutation_gate()
+            .unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+        drop(db);
+        let error = store
+            .evidence_response()
+            .err()
+            .expect("obsolete evidence refused");
+        assert!(error.to_string().contains("recovery_required"), "{error:#}");
+        assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
+        let (pin, same) = store
+            .recreate_pending_with_owner(&owner, &options, &cancel)
+            .unwrap();
+        assert!(Arc::ptr_eq(&owner, &same));
+        assert_ne!(pin.index_generation, first.index_generation);
+        assert_eq!(store.status().unwrap().revision, pin);
+    }
+
+    #[test]
+    fn post_shared_flock_verification_failure_orphans_exact_leader_and_transition_gate() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        drop(store);
+        fs::write(&index, b"short").unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        owner.leader_guard().unwrap().test_fail_after_shared_flock();
+        let error = recovering
+            .recreate_pending_with_owner(
+                &owner,
+                &IndexOptions::new(work.path().to_owned()),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("uncertain post-SH"), "{error:#}");
+        drop(owner);
+        let orphan = recovering
+            .orphan_root_loss_owner()
+            .expect("exact EX retained on ambiguous downgrade");
+        let guard = orphan.leader_guard().unwrap();
+        assert!(!guard.held_exclusive_use_mode() && guard.uncertain_use_transition());
+        assert!(
+            topology::UseGuard::acquire_existing(
+                &recovering.roots.index_use_lock(&recovering.identity),
+                true,
+                true
+            )
+            .is_err(),
+            "transition EX must exclude raw GC EX even after SH flock succeeds"
+        );
+        assert!(
+            recovering.roots.leader(&recovering.identity).is_err(),
+            "original leader EX remains held until explicit verified resolution"
+        );
+        guard
+            .complete_use_downgrade(&recovering.roots.index_use_lock(&recovering.identity))
+            .unwrap();
+        assert!(!guard.uncertain_use_transition());
+        drop(orphan);
+        recovering.clear_orphan_root_loss_owner();
+        assert!(recovering.roots.leader(&recovering.identity).is_ok());
+    }
+
+    #[test]
     fn exceptional_owner_survives_uncommitted_invisible_q1_after_failed_serialized_settlement() {
         let state = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
@@ -13515,16 +13646,19 @@ mod rebaseline_fault_tests {
         assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
         assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
         drop(reader);
-        let (at_ex_tx, at_ex_rx) = std::sync::mpsc::channel();
+        let (at_gap_tx, at_gap_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        recovering.test_exclusive_recovery_hook.set(move || {
-            at_ex_tx.send(()).unwrap();
-            resume_rx.recv().unwrap();
-        });
+        owner
+            .leader_guard()
+            .unwrap()
+            .test_pause_transition_gap(move || {
+                at_gap_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
         std::thread::scope(|scope| {
             let worker =
                 scope.spawn(|| recovering.recreate_pending_with_owner(&owner, &options, &cancel));
-            at_ex_rx.recv().unwrap();
+            at_gap_rx.recv().unwrap(); // use SH deliberately UNLOCKED; transition EX held
             let raw_gc_attempt = topology::UseGuard::acquire_existing(
                 &recovering.roots.index_use_lock(&recovering.identity),
                 true,
@@ -13532,12 +13666,31 @@ mod rebaseline_fault_tests {
             );
             assert!(
                 raw_gc_attempt.is_err(),
-                "raw canonical EX must take transition SH"
+                "raw GC EX must fail despite temporarily absent index-use SH"
             );
+            let ordinary_reader = recovering
+                .roots
+                .index_use_existing_readonly(&recovering.identity)
+                .unwrap();
             assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
             resume_tx.send(()).unwrap();
-            assert!(worker.join().unwrap().is_ok());
+            let failed = worker.join().unwrap().unwrap_err();
+            assert!(failed.to_string().contains("storage_busy"), "{failed:#}");
+            assert!(
+                owner
+                    .leader_guard()
+                    .unwrap()
+                    .verify_shared_use(&recovering.roots.index_use_lock(&recovering.identity))
+                    .is_ok(),
+                "failed non-atomic conversion must restore verified SH"
+            );
+            drop(ordinary_reader);
         });
+        let (pin, same_owner) = recovering
+            .recreate_pending_with_owner(&owner, &options, &cancel)
+            .unwrap();
+        assert!(Arc::ptr_eq(&same_owner, &owner));
+        assert_eq!(recovering.status().unwrap().revision, pin);
     }
 
     #[test]
