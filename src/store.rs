@@ -15888,7 +15888,7 @@ mod sqlite_schema_race_tests {
 
     #[test]
     fn tree_metadata_applies_only_after_verified_root_fence() {
-        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let mut entries = vec![crate::file_tree::Entry {
             name: "flow.js".into(),
             path: "flow.js".into(),
