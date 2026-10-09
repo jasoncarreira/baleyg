@@ -858,8 +858,18 @@ impl EvidenceResponse {
             })
             .collect()
     }
+    /// A predecessor permit is read-only. Mutations require a current strict
+    /// read, with the root and publication fence checked before sidecar work.
+    pub fn require_mutation_ready(&self) -> Result<()> {
+        if matches!(self.fence, ReadFence::PreH { .. }) {
+            return Err(topology::IndexNotReady::new("pre-H mutation is not ready").into());
+        }
+        self.store.ensure_public_read_ready()?;
+        self.finish(())
+    }
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
+        self.require_mutation_ready()?;
         self.saved_pin(Some(pin))?;
         ensure!(
             self.status()?.revision == pin,
@@ -891,6 +901,7 @@ impl EvidenceResponse {
         request: &AnnotationRequest,
     ) -> Result<AnnotationState> {
         request.validate()?;
+        self.require_mutation_ready()?;
         self.saved_pin(Some(pin))?;
         ensure!(
             self.status()?.revision == pin,
@@ -922,6 +933,14 @@ impl EvidenceResponse {
             Some(pin),
             matches!(self.fence, ReadFence::PreH { .. }),
         )
+    }
+    pub fn delete_view(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_view(id)
+    }
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_annotation(id)
     }
     /// Ordinary reads release the snapshot before slow response assembly.
     /// A transitional exact-pin fence retains its predecessor snapshot; T03
@@ -11001,6 +11020,19 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
+        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
+    }
+    fn classes_in(
+        &self,
+        tx: &Connection,
+        path: Option<&str>,
+        query: &str,
+        expected: Option<IndexPin>,
+        pagination: (usize, usize),
+        pre_h: bool,
+    ) -> Result<crate::class_diagram::ClassPage> {
+        use crate::class_diagram::ClassPage;
+        let (offset, limit) = pagination;
         use crate::class_diagram::InvalidRequest;
         let path = path.filter(|path| !path.is_empty());
         ensure!(
@@ -11021,19 +11053,6 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
-    }
-    fn classes_in(
-        &self,
-        tx: &Connection,
-        path: Option<&str>,
-        query: &str,
-        expected: Option<IndexPin>,
-        pagination: (usize, usize),
-        pre_h: bool,
-    ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::ClassPage;
-        let (offset, limit) = pagination;
         let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)

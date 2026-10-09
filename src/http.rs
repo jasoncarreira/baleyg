@@ -1548,6 +1548,9 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
+        if let Some(directory) = e.downcast_ref::<BrowseDirectoryError>() {
+            return browse_directory_error(&directory.0);
+        }
         if let Some(invalid) = e.downcast_ref::<crate::navigation::InvalidRequest>() {
             Self(
                 StatusCode::BAD_REQUEST,
@@ -2316,6 +2319,45 @@ struct TreeQuery {
     #[serde(default = "file_limit")]
     limit: usize,
 }
+#[derive(Debug)]
+struct BrowseDirectoryError(std::io::Error);
+impl std::fmt::Display for BrowseDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("browse directory unavailable")
+    }
+}
+impl std::error::Error for BrowseDirectoryError {}
+
+fn browse_directory_error(e: &std::io::Error) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError(
+            StatusCode::NOT_FOUND,
+            "directory_missing",
+            "Directory no longer exists; refresh its parent",
+        ),
+        std::io::ErrorKind::PermissionDenied => ApiError(
+            StatusCode::FORBIDDEN,
+            "directory_forbidden",
+            "Permission denied while listing directory",
+        ),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_directory",
+            "Path must be a real directory; symlink traversal is not allowed",
+        ),
+        _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
+            StatusCode::FORBIDDEN,
+            "symlink_forbidden",
+            "Symlink traversal is not allowed",
+        ),
+        _ => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "directory_error",
+            "Directory could not be read; check permissions and refresh",
+        ),
+    }
+}
+
 async fn tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<TreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2332,33 +2374,7 @@ async fn tree(
         let (mut items, next_offset, truncated) = s
             .browser
             .list(&q.path, q.offset, q.limit)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => ApiError(
-                    StatusCode::NOT_FOUND,
-                    "directory_missing",
-                    "Directory no longer exists; refresh its parent",
-                ),
-                std::io::ErrorKind::PermissionDenied => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "directory_forbidden",
-                    "Permission denied while listing directory",
-                ),
-                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_directory",
-                    "Path must be a real directory; symlink traversal is not allowed",
-                ),
-                _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "symlink_forbidden",
-                    "Symlink traversal is not allowed",
-                ),
-                _ => ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "directory_error",
-                    "Directory could not be read; check permissions and refresh",
-                ),
-            })?;
+            .map_err(|e| browse_directory_error(&e))?;
         let (revision, indexed_workspace) = s.store.tree_metadata(&s.browser.root, &mut items)?;
         for item in items
             .iter_mut()
@@ -6992,12 +7008,7 @@ async fn provisioned_core(
             if let Some(hook) = hook {
                 hook("after_handler");
             }
-            result.and_then(|(response, catching_up)| {
-                identity.verify_readonly().map_err(|_| {
-                    ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
-                })?;
-                Ok((response, catching_up))
-            })
+            result
         }
     };
     let (mut response, catching_up) = match answer {
@@ -7013,8 +7024,22 @@ async fn provisioned_core(
         }
     };
     if identity.verify_readonly().is_err() {
-        response = ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
-            .into_response();
+        let outcome = response
+            .headers()
+            .get("X-Baleyg-Mutation-Outcome")
+            .and_then(|value| value.to_str().ok());
+        response = match outcome {
+            Some(outcome) => selected_mutation_error(
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "root_changed",
+                    "Selected checkout changed",
+                ),
+                outcome,
+            ),
+            None => ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+                .into_response(),
+        };
     }
     if let Ok(value) = root.parse() {
         response.headers_mut().insert("X-Baleyg-Workspace", value);
@@ -7041,6 +7066,23 @@ async fn selected_evidence<T: Send + 'static>(
     hook: Option<SelectedResponseHook>,
     work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
 ) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, ApiError::from).await
+}
+
+async fn selected_question<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, question_error).await
+}
+
+async fn selected_evidence_map<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+    map_error: fn(anyhow::Error) -> ApiError,
+) -> Result<(T, bool), ApiError> {
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
@@ -7049,6 +7091,78 @@ async fn selected_evidence<T: Send + 'static>(
             hook("before_read_finish");
         }
         Ok::<_, anyhow::Error>((response.finish(result)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(map_error)
+}
+
+fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
+    let mut response = (
+        error.0,
+        Json(json!({
+            "error": {"code": error.1, "message": error.2},
+            "mutationOutcome": outcome
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+    response
+}
+
+/// Only a strict current head grants sidecar write eligibility. Once the
+/// sidecar is called, later failures carry an explicit committed/unknown
+/// outcome; they cannot claim that the write was rolled back.
+async fn selected_mutation<T: IntoResponse + Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    preflight: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<()>
+    + Send
+    + 'static,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(Response, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        preflight(&response)?;
+        response.finish(())?;
+        if let Some(hook) = &hook {
+            hook("before_mutation");
+        }
+        response.finish(())?;
+        let result = work(&response);
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        let mut answer = match result {
+            Ok(value) => match response.finish(value) {
+                Ok(value) => value.into_response(),
+                Err(error) => selected_mutation_error(ApiError::from(error), "committed"),
+            },
+            Err(_) => selected_mutation_error(
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "outcome_unknown",
+                    "Write outcome is unknown; inspect the saved record before retrying",
+                ),
+                "unknown",
+            ),
+        };
+        if !answer.headers().contains_key("X-Baleyg-Mutation-Outcome") {
+            answer
+                .headers_mut()
+                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+        }
+        Ok::<_, anyhow::Error>((answer, catching_up))
     })
     .await
     .map_err(|_| {
@@ -7105,8 +7219,10 @@ async fn provisioned_core_answer(
             }
             let state = runtime.browser_scheduler()?;
             let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
-                let (mut items, next_offset, truncated) =
-                    state.browser.list(&q.path, q.offset, q.limit)?;
+                let (mut items, next_offset, truncated) = state
+                    .browser
+                    .list(&q.path, q.offset, q.limit)
+                    .map_err(BrowseDirectoryError)?;
                 let (revision, indexed_workspace) =
                     response.tree_metadata(&state.browser.root, &mut items)?;
                 for item in items
@@ -7256,7 +7372,7 @@ async fn provisioned_core_answer(
             let request: QuestionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
             request.validate().map_err(|_| invalid())?;
             let state = runtime.browser_scheduler()?;
-            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+            let (value, catching_up) = selected_question(runtime, hook, move |r| {
                 r.validate_pin(request.expected_revision)?;
                 let packet = planning::prepare_in(r, request)?;
                 let selection = planning::preview(&packet)?;
@@ -7343,7 +7459,7 @@ async fn provisioned_core_answer(
                 return Err(missing());
             }
             validate_record_id(id).map_err(|_| invalid())?;
-            let response = match *method {
+            match *method {
                 Method::GET => {
                     let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
                     let pin = q.pin()?;
@@ -7351,10 +7467,10 @@ async fn provisioned_core_answer(
                     let (value, catching_up) =
                         selected_evidence(runtime, hook, move |r| r.saved_view_at(&id, pin))
                             .await?;
-                    return Ok((
+                    Ok((
                         Json(value.ok_or_else(missing)?).into_response(),
                         catching_up,
-                    ));
+                    ))
                 }
                 Method::PUT => {
                     let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
@@ -7365,20 +7481,33 @@ async fn provisioned_core_answer(
                         return Err(invalid());
                     }
                     value.validate().map_err(|_| invalid())?;
-                    let (saved, catching_up) =
-                        selected_evidence(runtime, hook, move |r| r.save_view_at(pin, &value))
-                            .await?;
-                    return Ok((Json(saved).into_response(), catching_up));
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_view_at(pin, &value).map(Json),
+                    )
+                    .await;
                 }
                 Method::DELETE => {
-                    let state = runtime.browser_scheduler()?;
                     let id = id.to_owned();
-                    db(state, move |store| store.delete_view(&id)).await?;
-                    StatusCode::NO_CONTENT.into_response()
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_view(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
                 }
-                _ => return Err(missing()),
-            };
-            Ok((response, runtime.catching_up()))
+                _ => Err(missing()),
+            }
         }
         _ if suffix.starts_with("annotations/") => {
             let id = suffix.strip_prefix("annotations/").unwrap();
@@ -7386,7 +7515,7 @@ async fn provisioned_core_answer(
                 return Err(missing());
             }
             validate_record_id(id).map_err(|_| invalid())?;
-            let response = match *method {
+            match *method {
                 Method::PUT => {
                     let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
                     let pin = q.pin()?.ok_or_else(invalid)?;
@@ -7396,21 +7525,33 @@ async fn provisioned_core_answer(
                         return Err(invalid());
                     }
                     value.validate().map_err(|_| invalid())?;
-                    let (saved, catching_up) = selected_evidence(runtime, hook, move |r| {
-                        r.save_annotation_at(pin, &value)
-                    })
-                    .await?;
-                    return Ok((Json(saved).into_response(), catching_up));
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_annotation_at(pin, &value).map(Json),
+                    )
+                    .await;
                 }
                 Method::DELETE => {
-                    let state = runtime.browser_scheduler()?;
                     let id = id.to_owned();
-                    db(state, move |store| store.delete_annotation(&id)).await?;
-                    StatusCode::NO_CONTENT.into_response()
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_annotation(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
                 }
-                _ => return Err(missing()),
-            };
-            Ok((response, runtime.catching_up()))
+                _ => Err(missing()),
+            }
         }
         _ if suffix.starts_with("questions/") => {
             let tail = suffix.strip_prefix("questions/").unwrap();
@@ -7432,7 +7573,7 @@ async fn provisioned_core_answer(
             let id = id.to_owned();
             let bytes = body.clone();
             let action = action.to_owned();
-            let (result, catching_up) = selected_evidence(runtime, hook, move |r| {
+            let (result, catching_up) = selected_question(runtime, hook, move |r| {
                 let revision = r.status()?.revision;
                 let packet = state
                     .packets
@@ -7442,7 +7583,7 @@ async fn provisioned_core_answer(
                     .iter()
                     .find(|(packet, _)| packet.packet_id == id)
                     .map(|(packet, _)| packet.clone())
-                    .ok_or_else(|| anyhow::anyhow!("packet_missing"))?;
+                    .ok_or_else(|| anyhow::anyhow!("question seed not found"))?;
                 anyhow::ensure!(
                     revision == packet.revision,
                     "revision conflict: cached packet changed"
