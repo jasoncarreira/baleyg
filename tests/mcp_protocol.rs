@@ -329,6 +329,7 @@ fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutat
             Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
         }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
