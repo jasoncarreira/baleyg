@@ -1035,6 +1035,11 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
 }
 
 async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
+    // Arm SIGTERM before any readiness banner: the serve control select is
+    // polled later, but callers may signal as soon as they see the banner.
+    #[cfg(unix)]
+    let mut termination = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("register serve SIGTERM handler")?;
     ensure!(
         args.bind.ip().is_loopback(),
         "only loopback bind addresses are supported"
@@ -1127,6 +1132,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         roots.cache.display(),
         token_file.display()
     );
+    // The opt-in test pause exposes the banner-to-select window. SIGTERM must
+    // already be armed; normal serve executions never pause here.
+    if std::env::var("BALEYG_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
+        std::thread::sleep(Duration::from_millis(750));
+    }
     // The registration is a control connection, not a checkout attachment. Its
     // normal EOF is the daemon's intentional idle exit; never respawn here.
     stream.set_read_timeout(None)?;
@@ -1139,9 +1149,18 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             _ => anyhow::bail!("daemon_unavailable: serve control interrupted"),
         }
     });
+    let shutdown = async {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = termination.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
     tokio::select! {
         result = &mut monitor => result??,
-        _ = shutdown_signal() => {
+        _ = shutdown => {
             signal_stream.shutdown(std::net::Shutdown::Both)?;
             let _ = monitor.await?;
         }

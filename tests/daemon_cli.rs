@@ -132,13 +132,13 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         assert!(Instant::now() < deadline, "daemon socket was not created");
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    // This port remains reserved by the fixture while the socket-only daemon starts.
-    // It cannot have silently acquired a browser listener before explicit serve.
+    // Keep the port reserved until explicit serve. A connect check after
+    // releasing it would race with other tests or processes that bind it.
     assert!(daemon.0.try_wait().unwrap().is_none());
-    drop(reserved);
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     assert!(
-        std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err(),
-        "the socket-only daemon must not bind a browser listener"
+        !token_file.exists(),
+        "socket-only startup provisioned a browser token"
     );
     let duplicate = cli(&home).arg("daemon").output().unwrap();
     assert!(duplicate.status.success(), "second daemon election failed");
@@ -146,6 +146,8 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         daemon.0.try_wait().unwrap().is_none(),
         "second daemon displaced socket owner"
     );
+    assert!(!token_file.exists());
+    drop(reserved);
 
     let mut first_serve = detached(serve(&home, &first, address, &token_file));
     ready(&client, address, &mut first_serve.0).await;
@@ -760,4 +762,79 @@ async fn daemon_served_export_survives_multi_frame_cli_reply() {
     let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
     assert!(graph.is_object(), "daemon export lost its JSON payload");
     assert!(daemon.0.try_wait().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_arms_sigterm_before_banner_to_control_wait() {
+    use std::os::unix::net::UnixStream;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "signal-window");
+    let token = temp.path().join("token");
+    let address = free_address();
+    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let mut daemon_command = cli(&home);
+    daemon_command.arg("daemon");
+    let mut daemon = detached(daemon_command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        assert!(Instant::now() < deadline, "daemon socket not ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let original_pid = daemon.0.id();
+    let log = temp.path().join("serve.log");
+    let mut command = serve(&home, &root, address, &token);
+    command
+        .env("BALEYG_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()));
+    let mut served = Owned(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fs::read_to_string(&log)
+            .unwrap()
+            .contains(&format!("Baleyg: http://{address}/"))
+        {
+            break;
+        }
+        assert!(
+            served.0.try_wait().unwrap().is_none(),
+            "serve exited before banner: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        assert!(Instant::now() < deadline, "serve banner not printed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The opt-in pause keeps the serve select unpolled. Without pre-arming
+    // SIGTERM, this signal terminates the process instead of closing control.
+    assert_eq!(
+        unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = served.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "serve did not exit on SIGTERM");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        status.success(),
+        "serve did not shut down gracefully: {status}; log: {}",
+        fs::read_to_string(&log).unwrap()
+    );
+    assert_eq!(daemon.0.id(), original_pid);
+    assert!(
+        daemon.0.try_wait().unwrap().is_none(),
+        "daemon owner exited"
+    );
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "daemon socket changed"
+    );
 }
