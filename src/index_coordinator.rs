@@ -1360,11 +1360,26 @@ pub fn establish_serving_session_observed(
 ) -> Result<Arc<LeaderSession>> {
     if store.is_recreate_pending() {
         if let Some(owner) = &retained {
-            // Exceptional recovery takes its own exclusive index-use lock.
-            // Never enter it while this initial-H EX still owns old-root FIFO:
-            // a root-loss retry must finish terminal rows under this owner.
-            store.fail_changed_root_requests(owner)?;
-            anyhow::bail!("recovery_required: release initial H owner before recreation");
+            // A replaced root owes its old FIFO a terminal outcome under this
+            // exact EX. The worker's root-loss retirement handles that path.
+            if store.root_path_replaced()? {
+                anyhow::bail!("root_changed: initial H must retire old-root requests");
+            }
+            let options = explicit_options.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recovery_required: index options unavailable; run explicit baleyg index"
+                )
+            })?;
+            // The Store converts this SAME owner's protected index-use SH to
+            // EX behind the per-root transition gate, and restores SH before
+            // returning. Never re-elect or release the initial-H leader here.
+            let (_, session) = store.recreate_pending_with_owner(owner, options, cancel)?;
+            ensure!(
+                Arc::ptr_eq(owner, &session),
+                "storage_busy: exceptional H changed leader owner"
+            );
+            on_owner(session.clone());
+            return Ok(session);
         }
         let options = explicit_options.ok_or_else(|| {
             anyhow::anyhow!(
