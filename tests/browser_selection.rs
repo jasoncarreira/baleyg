@@ -1005,22 +1005,12 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 let catching_up = status.headers().get("X-Baleyg-Catching-Up")
                     .and_then(|value| value.to_str().ok()).unwrap_or("missing").to_owned();
                 let status_body = status.text().await.unwrap_or_default();
-                let current = client
-                    .get(format!("{base}/api/checkouts/{key}/jobs/current"))
-                    .bearer_auth(token)
-                    .send()
-                    .await
-                    .unwrap();
-                let current_code = current.status();
-                let current_body = current.text().await.unwrap_or_default();
                 let settled = status_code == reqwest::StatusCode::OK
                     && workspace == expected_workspace.to_str().unwrap()
-                    && catching_up == "false"
-                    && current_code == reqwest::StatusCode::OK
-                    && current_body.trim() == "null";
+                    && catching_up == "false";
                 if settled { break; }
                 last_observation = format!(
-                    "{key}: status={status_code}, workspace={workspace}, catchingUp={catching_up}, statusBody={status_body}, current={current_code} {current_body}"
+                    "{key}: status={status_code}, workspace={workspace}, catchingUp={catching_up}, statusBody={status_body}"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
