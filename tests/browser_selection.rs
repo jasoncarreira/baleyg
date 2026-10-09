@@ -702,9 +702,33 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
         .await
         .unwrap();
     let token = fs::read_to_string(temp.path().join("token")).unwrap();
-    // The single serve-control connection is retained but does not count as a checkout client.
-    let (_serve_control, _daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
-    let listener = provisioner.spawn_until_idle(registry.clone()).unwrap();
+    // Match run_daemon: its idle driver signals the provisioned listener and
+    // closes the dispatch-owned serve control connection on daemon exit.
+    let (mut serve_control, daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
+    serve_control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let serve_exit = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Read;
+        let mut one = [0u8; 1];
+        if serve_control.read(&mut one)? == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "serve control received data instead of EOF",
+            ))
+        }
+    });
+    let (shutdown, signal) = tokio::sync::watch::channel(false);
+    let listener = provisioner.spawn_with_shutdown(signal).unwrap();
+    let idle_registry = registry.clone();
+    let daemon_exit = tokio::spawn(async move {
+        baleyg::daemon::run_idle_lifecycle(idle_registry)
+            .await
+            .unwrap();
+        shutdown.send(true).unwrap();
+        drop(daemon_control);
+    });
     let client = reqwest::Client::new();
     let base = format!("http://{address}");
     let before_request = std::time::Instant::now();
@@ -770,14 +794,27 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     .unwrap();
     assert_eq!(open_descriptors(&index_lock), 0);
     assert!(!listener.is_finished());
+    assert!(!serve_exit.is_finished());
+    assert!(!daemon_exit.is_finished());
     registry.lock().await.set_clock_override_for_tests(
         before_request + Duration::from_secs(45 * 60) - Duration::from_nanos(1),
     );
     assert!(!listener.is_finished());
+    assert!(!serve_exit.is_finished());
     registry
         .lock()
         .await
         .set_clock_override_for_tests(after_request + Duration::from_secs(45 * 60));
+    tokio::time::timeout(Duration::from_secs(3), daemon_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    let observed_eof = tokio::time::timeout(Duration::from_secs(3), serve_exit).await;
+    assert!(
+        observed_eof.is_ok(),
+        "serve control did not reach EOF after daemon exit"
+    );
+    observed_eof.unwrap().unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(3), listener)
         .await
         .unwrap()
