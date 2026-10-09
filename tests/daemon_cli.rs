@@ -105,6 +105,48 @@ async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child)
     }
 }
 
+#[test]
+fn daemon_keeps_private_socket_after_transient_accept_errors() {
+    use std::os::unix::{fs::MetadataExt, net::UnixStream};
+    for fault in ["emfile", "econnaborted"] {
+        let temp = short_temp();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let root = checkout(temp.path(), "work");
+        let mut command = cli(&home);
+        command
+            .arg("daemon")
+            .env("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
+        let mut owner = detached(command);
+        let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                owner.0.try_wait().unwrap().is_none(),
+                "daemon exited after {fault}"
+            );
+            if UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not accept after {fault}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let inode = fs::metadata(&socket).unwrap().ino();
+        for _ in 0..2 {
+            let reply = run(&home, "status", &root);
+            assert!(reply.is_object(), "{reply}");
+            assert!(
+                owner.0.try_wait().unwrap().is_none(),
+                "daemon died after {fault}"
+            );
+            assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
+        }
+    }
+}
+
 #[tokio::test]
 async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two_checkouts() {
     let temp = short_temp();

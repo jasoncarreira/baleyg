@@ -141,6 +141,79 @@ fn private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr() {
     );
 }
 
+/// Test-scope guard for only the daemon elected under this disposable HOME.
+struct FixtureDaemon(std::path::PathBuf);
+impl FixtureDaemon {
+    fn new(home: &std::path::Path) -> Self {
+        Self(home.to_path_buf())
+    }
+}
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let marker = self.0.join("auto-daemon.pid");
+        let Ok(raw) = fs::read_to_string(&marker) else {
+            return;
+        };
+        let _ = fs::remove_file(&marker);
+        let Ok(pid) = raw.parse::<u32>() else {
+            return;
+        };
+        let pid = pid.to_string();
+        let mut dirs = vec![self.0.clone()];
+        let mut socket = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    socket = path
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+            if socket.is_some() {
+                break;
+            }
+        }
+        let Some(socket) = socket else {
+            return;
+        };
+        let listening = || std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        let own_executable = || {
+            Command::new("ps")
+                .args(["-p", &pid, "-o", "command="])
+                .output()
+                .ok()
+                .is_some_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim()
+                            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg"))
+                })
+        };
+        if !listening() || !own_executable() {
+            return;
+        }
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while listening() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if listening() && own_executable() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
 fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
@@ -178,6 +251,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
             listener.local_addr().unwrap()
         });
         let child = command(root, home, "serve")
+            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .arg("--bind")
             .arg(address.to_string())
             .stdout(std::process::Stdio::null())
@@ -187,6 +261,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         let mut server = Server(child);
         for _ in 0..150 {
             if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+                assert!(home.join("auto-daemon.pid").exists());
                 return server;
             }
             if let Some(status) = server.0.try_wait().unwrap() {
@@ -220,6 +295,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     fs::create_dir(&root).unwrap();
     let file = root.join("a.js");
     fs::write(&file, "function seed() { return 42; }\n").unwrap();
@@ -1035,6 +1111,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     let first_cwd = temp.path().join("ingress");
     let second_cwd = temp.path().join("takeover");
     for dir in [&root, &first_cwd, &second_cwd] {
@@ -1060,6 +1137,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let stderr_path = temp.path().join("serve-ingress-stderr.log");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let child = isolated_command(&home)
+        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
@@ -1097,6 +1175,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     })
     .await
     .expect("daemon startup timed out");
+    assert!(home.join("auto-daemon.pid").exists());
     assert!(
         !String::from_utf8_lossy(&startup).contains("Evidence unavailable at startup"),
         "unexpected startup evidence: {}",

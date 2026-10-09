@@ -16,6 +16,7 @@ struct Peer {
     stdin: Option<ChildStdin>,
     lines: Receiver<Value>,
     reaped: bool,
+    auto_daemon_pid: PathBuf,
 }
 impl Peer {
     fn start(home: &Path, root: &Path) -> Self {
@@ -27,6 +28,7 @@ impl Peer {
             .env("HOME", home)
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_DATA_HOME", home.join("data"))
+            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -51,6 +53,7 @@ impl Peer {
             child,
             lines,
             reaped: false,
+            auto_daemon_pid: home.join("auto-daemon.pid"),
         }
     }
     fn ask(&mut self, id: u64, method: &str, params: Value) -> Value {
@@ -62,8 +65,8 @@ impl Peer {
         .unwrap();
         self.lines.recv_timeout(Duration::from_secs(10)).unwrap()
     }
-    // Preserve the leader PID until its entire inherited process group is
-    // stopped. A daemon started on demand inherits one of the client groups.
+    // Preserve the leader PID until its client group has stopped.
+    // The auto-started daemon is in another session and is cleaned up in Drop.
     fn finish_unreaped(&mut self) {
         self.stdin.take();
         let pid = self.child.id() as libc::pid_t;
@@ -92,6 +95,20 @@ impl Drop for Peer {
         if !self.reaped {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+        // Only our elected daemon in this private test HOME writes this marker.
+        // A direct daemon (owned by its test) never writes it.
+        if let Ok(raw) = fs::read_to_string(&self.auto_daemon_pid) {
+            let home = self.auto_daemon_pid.parent().unwrap();
+            if let Ok(pid) = raw.parse::<u32>()
+                && socket_under(home).is_some_and(|path| UnixStream::connect(path).is_ok())
+            {
+                let _ = Command::new("/bin/kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            let _ = fs::remove_file(&self.auto_daemon_pid);
         }
     }
 }
@@ -154,6 +171,48 @@ fn checkout(home: &Path) -> PathBuf {
     let root = home.join("checkout");
     fs::create_dir_all(root.join(".git")).unwrap();
     root
+}
+
+#[test]
+fn demand_started_daemon_survives_first_client_process_group_death() {
+    use std::os::unix::fs::MetadataExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut first = Peer::start(home.path(), &root);
+    let metadata = json!({"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    }});
+    let discover = first.ask(1, "server/discover", metadata.clone());
+    assert_eq!(discover["id"], 1);
+    assert!(discover["result"].is_object(), "{discover}");
+    let socket = socket_ready(home.path());
+    let inode = fs::metadata(&socket).unwrap().ino();
+    let daemon_pid = fs::read_to_string(home.path().join("auto-daemon.pid")).unwrap();
+    let group = format!("-{}", first.child.id());
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "unable to signal isolated client group");
+    assert!(!first.child.wait().unwrap().success());
+    first.reaped = true;
+    // The old group is gone. Do not demand-start another daemon before this check.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "daemon died with first client group"
+    );
+    assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read_to_string(home.path().join("auto-daemon.pid")).unwrap(),
+        daemon_pid
+    );
+    let mut second = Peer::start(home.path(), &root);
+    assert_eq!(second.ask(2, "server/discover", metadata)["id"], 2);
+    assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
+    drop(second);
+    drop(first);
 }
 
 #[test]

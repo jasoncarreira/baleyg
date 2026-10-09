@@ -69,6 +69,79 @@ fn git(root: &std::path::Path, args: &[&str]) {
     );
 }
 
+/// Test-scope guard for only the daemon elected under this disposable HOME.
+struct FixtureDaemon(std::path::PathBuf);
+impl FixtureDaemon {
+    fn new(home: &std::path::Path) -> Self {
+        Self(home.to_path_buf())
+    }
+}
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let marker = self.0.join("auto-daemon.pid");
+        let Ok(raw) = fs::read_to_string(&marker) else {
+            return;
+        };
+        let _ = fs::remove_file(&marker);
+        let Ok(pid) = raw.parse::<u32>() else {
+            return;
+        };
+        let pid = pid.to_string();
+        let mut dirs = vec![self.0.clone()];
+        let mut socket = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    socket = path
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+            if socket.is_some() {
+                break;
+            }
+        }
+        let Some(socket) = socket else {
+            return;
+        };
+        let listening = || std::os::unix::net::UnixStream::connect(&socket).is_ok();
+        let own_executable = || {
+            Command::new("ps")
+                .args(["-p", &pid, "-o", "command="])
+                .output()
+                .ok()
+                .is_some_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim()
+                            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg"))
+                })
+        };
+        if !listening() || !own_executable() {
+            return;
+        }
+        let _ = Command::new("/bin/kill")
+            .args(["-TERM", &pid])
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while listening() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if listening() && own_executable() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
 struct Server(std::process::Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -81,6 +154,7 @@ impl Drop for Server {
 async fn production_browser_selects_two_real_worktrees_without_global_attachment() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     fs::create_dir(&home).unwrap();
     let a = temp.path().join("a");
     let b = temp.path().join("b");
@@ -161,6 +235,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     drop(listener);
     let log = temp.path().join("serve-stderr");
     let child = command(&home)
+        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&a)
@@ -197,6 +272,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     })
     .await
     .unwrap();
+    assert!(home.join("auto-daemon.pid").exists());
     let global = client
         .get(format!("{base}/api/daemon/status"))
         .send()

@@ -918,12 +918,29 @@ fn socket_path() -> Result<PathBuf> {
 }
 
 fn start_daemon() -> std::io::Result<client::StartOutcome> {
-    std::process::Command::new(std::env::current_exe()?)
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // The daemon must outlive the first CLI/MCP client's process group/session.
+    // setsid is async-signal-safe: no allocation or lock is taken in the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    // Election losers exit quickly; a still-running winner must not block the caller.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(client::StartOutcome::Started)
 }
 
@@ -1177,6 +1194,10 @@ async fn run_daemon() -> Result<()> {
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
         return Ok(());
     };
+    // Test-only ownership marker: only the elected daemon records its PID.
+    if let Some(path) = std::env::var_os("BALEYG_TEST_DAEMON_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
@@ -1186,11 +1207,34 @@ async fn run_daemon() -> Result<()> {
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
+    // A single injected accept fault tests that the elected socket survives it.
+    let mut injected_accept_errno =
+        match std::env::var("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
+            Ok("emfile") => Some(libc::EMFILE),
+            Ok("econnaborted") => Some(libc::ECONNABORTED),
+            _ => None,
+        };
     loop {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+            accepted = async {
+                if let Some(errno) = injected_accept_errno {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                } else {
+                    listener.accept().await
+                }
+            } => {
+                injected_accept_errno = None;
+                let (stream, _) = match accepted {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr().lock(), "daemon socket accept failed: {error}");
+                        // Even a persistent EMFILE must not hot-spin or drop the elected socket.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 let stream = stream.into_std()?;
                 stream.set_nonblocking(false)?;
                 let registry = registry.clone();

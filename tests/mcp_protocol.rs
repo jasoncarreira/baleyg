@@ -86,6 +86,45 @@ fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         }
     }
 }
+/// Stop only the daemon elected for this fixture's unique private HOME.
+/// A child-side reaper waits while the MCP process is still alive; after panic,
+/// the OS reaps an already-orphaned daemon when it exits.
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("auto-daemon.pid");
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return;
+    };
+    let _ = fs::remove_file(&marker);
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    let pid = pid.to_string();
+    let sent = Command::new("/bin/kill")
+        .args(["-TERM", &pid])
+        .stderr(Stdio::null())
+        .status();
+    if !sent.is_ok_and(|status| status.success()) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if !Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Still alive after graceful termination: do not leave a 30-minute fixture.
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &pid])
+        .stderr(Stdio::null())
+        .status();
+}
+
 struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -115,6 +154,10 @@ impl Peer {
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .env(
+                "BALEYG_TEST_DAEMON_PID_FILE",
+                home.path().join("auto-daemon.pid"),
+            )
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -192,6 +235,7 @@ impl Peer {
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
+        stop_fixture_daemon(self._home.path());
         let (status, expired) = bounded_group_wait(&mut self.child);
         self.reaped = true;
         assert!(!expired, "MCP subprocess exceeded 10-second deadline");
@@ -201,6 +245,9 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        // Also covers assertion failure before finish(): only this unique HOME's
+        // elected daemon can have written its opt-in marker.
+        stop_fixture_daemon(self._home.path());
         if !self.reaped {
             // No previous wait/reap occurred: this PID/PGID cannot be recycled.
             unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
