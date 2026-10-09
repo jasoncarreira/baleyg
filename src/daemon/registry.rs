@@ -162,6 +162,21 @@ pub struct CheckoutRegistry {
     idle_exit_at: Option<Instant>,
 }
 
+fn indexed_spelling(index: &Path) -> rusqlite::Result<String> {
+    let db =
+        rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let spelling: String = db.query_row(
+        "SELECT root_spelling FROM index_metadata WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(spelling)
+}
+
 impl Default for CheckoutRegistry {
     fn default() -> Self {
         Self::new()
@@ -352,6 +367,132 @@ impl CheckoutRegistry {
             .collect();
         roots.sort();
         roots
+    }
+
+    /// Browser selection is by the exact registered or discovered root key.
+    /// No launch checkout, prior browser request, or serve registration is a default.
+    pub fn browser_identity(&mut self, key: &str) -> Result<WorkspaceIdentity, SelectionError> {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(SelectionError::NotCheckout);
+        }
+        if !self.entries.contains_key(key) {
+            let roots = self
+                .roots
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(TopologyRoots::production)
+                .map_err(|_| SelectionError::Unavailable)?;
+            let index = roots.cache.join("indexes").join(key).join("index.db");
+            if !index.is_file() {
+                return Err(SelectionError::NotCheckout);
+            }
+            let spelling = indexed_spelling(&index).map_err(|_| SelectionError::Unavailable)?;
+            let identity = WorkspaceIdentity::discover_unattached(
+                Some(Path::new(&spelling)),
+                Path::new(&spelling),
+            )
+            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+            .map_err(|_| SelectionError::IdentityChanged)?;
+            if identity.root_key != key {
+                return Err(SelectionError::IdentityChanged);
+            }
+            self.register_discovered(&identity);
+        }
+        self.entries
+            .get(key)
+            .ok_or(SelectionError::NotCheckout)?
+            .identity
+            .rediscover()
+            .map_err(|_| SelectionError::IdentityChanged)
+    }
+
+    fn register_discovered(&mut self, identity: &WorkspaceIdentity) {
+        self.entries.insert(
+            identity.root_key.clone(),
+            Entry {
+                identity: CheckoutMetadata::from_identity(identity),
+                registration: None,
+                sessions: HashSet::new(),
+                released: true,
+                pending_work: false,
+                external_work: false,
+                browser_until: None,
+                release_at: None,
+            },
+        );
+    }
+
+    /// Inspect existing indexes without activating a checkout or changing clocks.
+    pub fn browser_checkouts(&self) -> Vec<serde_json::Value> {
+        let mut rows = std::collections::BTreeMap::new();
+        let roots = self
+            .roots
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(TopologyRoots::production);
+        for (key, entry) in &self.entries {
+            let index = roots
+                .as_ref()
+                .ok()
+                .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
+            let state = if entry.identity.rediscover().is_err() {
+                "unavailable"
+            } else if index
+                .as_ref()
+                .is_some_and(|index| index.is_file() && indexed_spelling(index).is_err())
+            {
+                "corrupt"
+            } else {
+                "available"
+            };
+            rows.insert(
+                key.clone(),
+                serde_json::json!({
+                    "rootKey": key, "workspaceRoot": entry.identity.root,
+                    "state": state,
+                    "active": self.runtimes.contains_key(key)
+                }),
+            );
+        }
+        if let Ok(roots) = roots
+            && let Ok(indexes) = fs::read_dir(roots.cache.join("indexes"))
+        {
+            for candidate in indexes.flatten() {
+                let key = candidate.file_name().to_string_lossy().to_string();
+                if rows.contains_key(&key)
+                    || key.len() != 64
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                let row = match indexed_spelling(&candidate.path().join("index.db")) {
+                    Ok(spelling)
+                        if WorkspaceIdentity::discover_unattached(
+                            Some(Path::new(&spelling)),
+                            Path::new(&spelling),
+                        )
+                        .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                        .is_ok_and(|identity| identity.root_key == key) =>
+                    {
+                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"available", "active":false})
+                    }
+                    Ok(spelling) => {
+                        serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"unavailable", "active":false})
+                    }
+                    Err(_) => {
+                        serde_json::json!({"rootKey": key, "state":"corrupt", "active":false})
+                    }
+                };
+                rows.insert(key, row);
+            }
+        }
+        rows.into_values().collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -1033,6 +1174,10 @@ impl CheckoutRuntime {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout released"))
+    }
+
+    pub fn browser_scheduler(&self) -> anyhow::Result<Arc<http::DaemonState>> {
+        Ok(self.resources()?.scheduler.clone())
     }
 
     /// CLI calls share the activated checkout's Store and scheduler; they never

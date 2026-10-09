@@ -6323,6 +6323,7 @@ impl Store {
         }
         Ok(IndexStatus {
             workspace_root: self.workspace_root.clone(),
+            catching_up: false,
             revision: pin,
             indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
             stats: serde_json::from_str(&row.8)?,
