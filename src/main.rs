@@ -1273,7 +1273,7 @@ fn dispatch_connection(
                 // The CLI request deadline must not end an idle MCP attachment.
                 stream
                     .set_read_timeout(None)
-                    .and_then(|()| mcp::run_socket(workspace, stream))
+                    .and_then(|()| mcp::run_socket(workspace, stream, registry.clone(), session))
                     .map_err(anyhow::Error::from)
             }
             (Err(error), _) => Err(error),

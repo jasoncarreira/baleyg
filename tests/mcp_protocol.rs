@@ -99,6 +99,13 @@ impl Peer {
         Self::start_in(workspace, None)
     }
     fn start_in(workspace: Option<&Path>, cwd: Option<&Path>) -> Self {
+        Self::start_with_phase(workspace, cwd, None)
+    }
+    fn start_with_phase(
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
@@ -114,6 +121,10 @@ impl Peer {
             .stderr(Stdio::from(stderr));
         if let Some(path) = workspace {
             cmd.arg("--workspace").arg(path);
+        }
+        if let Some((stage, socket)) = phase {
+            cmd.env("BALEYG_TEST_MCP_PHASE", stage)
+                .env("BALEYG_TEST_MCP_PHASE_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -218,7 +229,7 @@ fn error(v: &Value, code: i64, id: Value) {
 fn tool(v: &Value, code: Option<&str>, modern: bool) {
     assert_eq!(v["jsonrpc"], "2.0");
     assert_eq!(v["result"]["resultType"].as_str().is_some(), modern);
-    assert_eq!(v["result"]["isError"], code.is_some());
+    assert_eq!(v["result"]["isError"], code.is_some(), "{v}");
     let envelope = &v["result"]["structuredContent"];
     assert_eq!(
         serde_json::from_str::<Value>(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap(),
@@ -229,22 +240,30 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
         assert_eq!(envelope["error"]["code"], code);
     }
 }
-fn expected_envelope(id: &Value, code: Option<&str>, label: &str) -> Value {
+fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
     let fixture = fixture();
     if let Some(code) = code {
         let spec = &fixture["expected"]["failures"][code];
         assert!(spec.is_array(), "missing golden error {code}");
-        json!({"schemaVersion":1,"requestId":id,"error":{"code":code,
-            "message":spec[0],"retryable":spec[1],"currentBasis":null,"currentContentHash":null}})
+        let mut envelope = json!({"schemaVersion":1,"requestId":id,"error":{"code":code,
+            "message":spec[0],"retryable":spec[1],"currentBasis":null,"currentContentHash":null}});
+        if code != "invalid_request" && code != "range_too_large" {
+            envelope["workspace"] = root.clone();
+            envelope["catchingUp"] = json!(true);
+        }
+        envelope
     } else {
         let mut envelope = fixture["expected"]["describe"].clone();
         envelope["requestId"] = id.clone();
         envelope["data"]["workspaceLabel"] = json!(label);
+        envelope["workspace"] = root.clone();
+        envelope["catchingUp"] = json!(true);
         envelope
     }
 }
 fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
-    let envelope = expected_envelope(&v["id"], code, label);
+    let root = &v["result"]["structuredContent"]["workspace"];
+    let envelope = expected_envelope(&v["id"], code, label, root);
     let text = serde_json::to_string(&envelope).unwrap();
     let mut result = json!({"isError":code.is_some(),"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
@@ -252,6 +271,17 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
         result["resultType"] = json!("complete");
     }
     assert_eq!(*v, json!({"jsonrpc":"2.0","id":v["id"],"result":result}));
+}
+fn exact_selection_failure(v: &Value, id: i64, reason: &str, attempted: &Path) {
+    let envelope = json!({"schemaVersion":1,"requestId":id,"error":{
+        "code":"workspace_selection_failed","message":"Workspace selection failed",
+        "retryable":reason == "unavailable","reason":reason,
+        "attemptedWorkspace":{"kind":"path","value":attempted,"utf8Bytes":attempted.to_str().unwrap().len(),"truncated":false},
+        "currentBasis":null,"currentContentHash":null}});
+    let result = json!({"resultType":"complete","isError":true,
+        "structuredContent":envelope,
+        "content":[{"type":"text","text":serde_json::to_string(&envelope).unwrap()}]});
+    assert_eq!(*v, json!({"jsonrpc":"2.0","id":id,"result":result}));
 }
 fn exact_tool_for_id(
     v: &Value,
@@ -284,6 +314,34 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
         modern(id, "tools/call", fields)
     }
 }
+fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now()
+            }
+            Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, format!("{stage}\n"));
+    mutate();
+    stream.write_all(b"x").unwrap();
+}
+
 fn no_db_under(root: &Path) {
     no_db_under_except(root, &[]);
 }
@@ -1168,27 +1226,27 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let mut marker_lost = Peer::start(Some(&ancestor));
     assert!(marker_lost.ask(modern(json!(40), "server/discover", json!({})))["result"].is_object());
     fs::remove_file(&ancestor_marker).unwrap();
-    exact_tool(
+    exact_selection_failure(
         &marker_lost.ask(call(
             false,
             json!(5),
             "baleyg_workspace_describe",
             json!({"schemaVersion":1}),
         )),
-        Some("store_unavailable"),
-        true,
-        "ancestor",
+        5,
+        "identity_changed",
+        &ancestor.canonicalize().unwrap(),
     );
-    exact_tool(
+    exact_selection_failure(
         &marker_lost.ask(call(
             false,
             json!(6),
             "baleyg_workspace_describe",
             json!({"schemaVersion":1,"workspace":"escape"}),
         )),
-        Some("invalid_request"),
-        true,
-        "ancestor",
+        6,
+        "identity_changed",
+        Path::new("escape"),
     );
     no_db_under(marker_lost._home.path());
     assert!(marker_lost.finish().0.success());
@@ -1199,16 +1257,16 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let moved = ancestor.join("moved-nearer");
     fs::rename(&nearer, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &nearer).unwrap();
-    exact_tool(
+    exact_selection_failure(
         &root_changed.ask(call(
             false,
             json!(7),
             "baleyg_find_symbols",
             json!({"schemaVersion":1,"query":"a"}),
         )),
-        Some("root_changed"),
-        true,
-        "nearer",
+        7,
+        "identity_changed",
+        &ancestor.canonicalize().unwrap().join("nearer"),
     );
     assert!(root_changed.finish().0.success());
 }
@@ -1574,4 +1632,481 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
         ids[0], ids[1],
         "two real linked worktrees must not share a workspace UUID marker"
     );
+}
+
+#[test]
+fn per_call_linked_worktree_selection_and_closed_failures() {
+    assert_eq!(
+        fixture()["workspaceSelection"],
+        json!({
+        "inputField":"workspace","maxUtf8Bytes":4096,"attemptedValueBytes":256,
+        "resolvedFields":["workspace","catchingUp"],
+        "reasons":["not_absolute","not_checkout","different_repository","identity_changed","unavailable"]})
+    );
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git(temp.path(), &["init", "--quiet", main.to_str().unwrap()]);
+    git(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let foreign = temp.path().join("foreign");
+    git(temp.path(), &["init", "--quiet", foreign.to_str().unwrap()]);
+    let main = main.canonicalize().unwrap();
+    let linked = linked.canonicalize().unwrap();
+    let foreign = foreign.canonicalize().unwrap();
+    let foreign_marker = foreign.join(".git/baleyg/workspace-id");
+    let git_pointer = fs::read_to_string(linked.join(".git")).unwrap();
+    let linked_git =
+        fs::canonicalize(linked.join(git_pointer.trim().strip_prefix("gitdir: ").unwrap()))
+            .unwrap();
+    let linked_marker = linked_git.join("baleyg/workspace-id");
+    for legacy in [false, true] {
+        let mut peer = Peer::start(Some(&main));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        let describe = |peer: &mut Peer, id: i64, args: Value| {
+            peer.ask(call(legacy, json!(id), "baleyg_workspace_describe", args))
+        };
+        let selected = describe(&mut peer, 10, json!({"schemaVersion":1,"workspace":linked}));
+        tool(&selected, None, !legacy);
+        assert_eq!(
+            selected["result"]["structuredContent"]["workspace"],
+            json!(linked)
+        );
+        assert_eq!(selected["result"]["structuredContent"]["catchingUp"], true);
+        assert_eq!(
+            selected["result"]["structuredContent"]["data"]["workspaceLabel"],
+            "linked"
+        );
+        assert!(linked_marker.exists());
+        for (offset, name) in fixture()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let mut arguments = fixture()["validArguments"][offset].clone();
+            arguments["workspace"] = json!(linked);
+            let answer = peer.ask(call(
+                legacy,
+                json!(30 + offset),
+                name.as_str().unwrap(),
+                arguments,
+            ));
+            tool(&answer, Some("index_not_ready"), !legacy);
+            assert_eq!(
+                answer["result"]["structuredContent"]["workspace"],
+                json!(linked)
+            );
+            assert_eq!(answer["result"]["structuredContent"]["catchingUp"], true);
+        }
+        let launch = describe(&mut peer, 11, json!({"schemaVersion":1}));
+        tool(&launch, None, !legacy);
+        assert_eq!(
+            launch["result"]["structuredContent"]["workspace"],
+            json!(main)
+        );
+        assert_eq!(
+            launch["result"]["structuredContent"]["data"]["workspaceLabel"],
+            "main"
+        );
+        for (id, value, reason) in [
+            (12, json!("relative"), "not_absolute"),
+            (13, json!(foreign), "different_repository"),
+        ] {
+            let answer = describe(&mut peer, id, json!({"schemaVersion":1,"workspace":value}));
+            tool(&answer, Some("workspace_selection_failed"), !legacy);
+            let envelope = &answer["result"]["structuredContent"];
+            assert!(envelope.get("workspace").is_none());
+            assert!(envelope.get("catchingUp").is_none());
+            assert_eq!(envelope["error"]["reason"], reason);
+            assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], value);
+            assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+        }
+        assert!(
+            !foreign_marker.exists(),
+            "foreign selection cannot create a marker"
+        );
+        let symlink = temp.path().join("link-to-linked");
+        if !symlink.exists() {
+            std::os::unix::fs::symlink(&linked, &symlink).unwrap();
+        }
+        let answer = describe(
+            &mut peer,
+            14,
+            json!({"schemaVersion":1,"workspace":symlink}),
+        );
+        tool(&answer, Some("workspace_selection_failed"), !legacy);
+        assert_eq!(
+            answer["result"]["structuredContent"]["error"]["reason"],
+            "not_checkout"
+        );
+        let invalid = describe(&mut peer, 15, json!({"schemaVersion":1,"workspace":[]}));
+        tool(&invalid, Some("invalid_request"), !legacy);
+        assert_eq!(
+            invalid["result"]["structuredContent"]["error"]["attemptedWorkspace"],
+            json!({"kind":"invalid_type","jsonType":"array"})
+        );
+        assert!(
+            invalid["result"]["structuredContent"]
+                .get("workspace")
+                .is_none()
+        );
+        let long = format!("{}😀", "é".repeat(2047));
+        let invalid = describe(&mut peer, 16, json!({"schemaVersion":1,"workspace":long}));
+        tool(&invalid, Some("invalid_request"), !legacy);
+        let attempt = &invalid["result"]["structuredContent"]["error"]["attemptedWorkspace"];
+        assert_eq!(attempt["utf8Bytes"], 4098);
+        assert_eq!(attempt["value"].as_str().unwrap().len(), 256);
+        assert_eq!(attempt["truncated"], true);
+        assert_eq!(
+            describe(&mut peer, 17, json!({"schemaVersion":1}))["result"]["structuredContent"]["workspace"],
+            json!(main)
+        );
+        no_db_under(peer._home.path());
+        assert!(peer.finish().0.success());
+    }
+}
+
+#[test]
+fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
+    let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
+    assert_eq!(catalog.as_array().unwrap().len(), 4);
+    for entry in catalog.as_array().unwrap() {
+        let defs = &entry["outputSchema"]["$defs"];
+        assert_eq!(
+            defs["Failure"]["properties"]["error"]["properties"]["code"],
+            json!({"$ref":"#/$defs/ResolvedFailureCode"})
+        );
+        assert!(
+            !defs["ResolvedFailureCode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("workspace_selection_failed"))
+        );
+        for kind in ["SelectionFailure", "InvalidWorkspaceFailure"] {
+            let error = &defs[kind]["properties"]["error"]["properties"];
+            assert_eq!(error["currentBasis"], json!({"const":null}));
+            assert_eq!(error["currentContentHash"], json!({"const":null}));
+        }
+        assert_eq!(
+            defs["InvalidWorkspaceFailure"]["properties"]["error"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["then"]["properties"]["retryable"],
+            json!({"const":true})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["else"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+    }
+}
+
+fn git_selection(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn git_linked_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+    let main = temp.join("main");
+    git_selection(temp, &["init", "--quiet", main.to_str().unwrap()]);
+    git_selection(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = temp.join("linked");
+    git_selection(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    (main.canonicalize().unwrap(), linked.canonicalize().unwrap())
+}
+fn linked_marker(linked: &Path) -> PathBuf {
+    let pointer = fs::read_to_string(linked.join(".git")).unwrap();
+    fs::canonicalize(linked.join(pointer.trim().strip_prefix("gitdir: ").unwrap()))
+        .unwrap()
+        .join("baleyg/workspace-id")
+}
+
+#[test]
+fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, linked) = git_linked_fixture(temp.path());
+        let socket = temp.path().join("phase.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut peer = Peer::start_with_phase(Some(&main), None, Some(("selected_clone", &socket)));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        peer.send_raw(
+            serde_json::to_string(&call(
+                legacy,
+                json!(8),
+                "baleyg_workspace_describe",
+                json!({"schemaVersion":1,"workspace":linked}),
+            ))
+            .unwrap()
+            .as_bytes(),
+        );
+        let marker = linked_marker(&linked);
+        phase_barrier(&listener, "selected_clone", || {
+            fs::remove_file(&marker).unwrap()
+        });
+        let reply = peer.reply();
+        tool(&reply, Some("root_changed"), !legacy);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(linked)
+        );
+        assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["currentBasis"],
+            Value::Null
+        );
+        assert!(
+            peer.finish().0.success(),
+            "daemon panic cannot interrupt thin client"
+        );
+    }
+}
+
+#[test]
+fn final_resolved_drift_is_attributed_for_four_tools_and_both_modes() {
+    for legacy in [false, true] {
+        for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
+            for explicit in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (main, linked) = git_linked_fixture(temp.path());
+                let root = if explicit { &linked } else { &main };
+                let stage = if explicit {
+                    "selected_final"
+                } else {
+                    "launch_final"
+                };
+                let socket = temp.path().join("phase.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let mut peer = Peer::start_with_phase(Some(&main), None, Some((stage, &socket)));
+                if legacy {
+                    ready_legacy(&mut peer);
+                }
+                let mut args = fixture()["validArguments"][index].clone();
+                if explicit {
+                    args["workspace"] = json!(linked);
+                }
+                peer.send_raw(
+                    serde_json::to_string(&call(
+                        legacy,
+                        json!(index),
+                        name.as_str().unwrap(),
+                        args,
+                    ))
+                    .unwrap()
+                    .as_bytes(),
+                );
+                if index % 2 == 0 {
+                    let marker = if explicit {
+                        linked_marker(root)
+                    } else {
+                        root.join(".git/baleyg/workspace-id")
+                    };
+                    let mut saved = Vec::new();
+                    phase_barrier(&listener, stage, || {
+                        saved = fs::read(&marker).unwrap();
+                        fs::remove_file(&marker).unwrap();
+                    });
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    let envelope = &reply["result"]["structuredContent"];
+                    assert_eq!(envelope["workspace"], json!(root));
+                    assert_eq!(envelope["catchingUp"], true);
+                    assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+                    assert!(envelope["error"].get("reason").is_none());
+                    fs::write(&marker, saved).unwrap();
+                } else {
+                    let moved = temp.path().join(if explicit {
+                        "moved-linked"
+                    } else {
+                        "moved-main"
+                    });
+                    phase_barrier(&listener, stage, || fs::rename(root, &moved).unwrap());
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["workspace"],
+                        json!(root)
+                    );
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["error"]["currentBasis"],
+                        Value::Null
+                    );
+                    fs::rename(moved, root).unwrap();
+                }
+                assert!(peer.finish().0.success());
+            }
+        }
+    }
+}
+
+#[test]
+fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, first) = git_linked_fixture(temp.path());
+    let mut linked = vec![first];
+    for index in 1..=63 {
+        let path = temp.path().join(format!("linked-{index}"));
+        git_selection(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        linked.push(path.canonicalize().unwrap());
+    }
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase(Some(&main), None, Some(("capacity_final", &socket)));
+    for (index, path) in linked.iter().take(63).enumerate() {
+        let reply = peer.ask(call(
+            false,
+            json!(index),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":path}),
+        ));
+        tool(&reply, None, true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(path)
+        );
+    }
+    let denied = &linked[63];
+    peer.send_raw(
+        serde_json::to_string(&call(
+            false,
+            json!(64),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":denied}),
+        ))
+        .unwrap()
+        .as_bytes(),
+    );
+    let marker = linked_marker(denied);
+    phase_barrier(&listener, "capacity_final", || {
+        fs::remove_file(&marker).unwrap()
+    });
+    let reply = peer.reply();
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(denied)
+    );
+    assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["currentBasis"],
+        Value::Null
+    );
+    assert!(peer.finish().0.success());
+}
+
+#[test]
+fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let first = peer.ask(call(
+        false,
+        json!(1),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&first, None, true);
+    assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
+    let home = peer._home.path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"));
+    let indexed = bounded_output(command);
+    assert!(
+        indexed.status.success(),
+        "index: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let second = peer.ask(call(
+        false,
+        json!(2),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&second, None, true);
+    assert_eq!(
+        second["result"]["structuredContent"]["workspace"],
+        first["result"]["structuredContent"]["workspace"]
+    );
+    assert_eq!(second["result"]["structuredContent"]["catchingUp"], false);
+    assert!(peer.finish().0.success());
 }

@@ -596,14 +596,18 @@ impl CheckoutRegistry {
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
         let root = checkout_root(selected)?;
-        let identity = WorkspaceIdentity::discover(Some(&root), &root)
-            .and_then(WorkspaceIdentity::attach_marker)
+        // Membership must be established before marker attachment, which can create
+        // a marker in a previously untouched linked worktree.
+        let unattached = WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .map_err(|_| SelectionError::Unavailable)?;
         let launch_common = common_identity(launch)?;
-        let selected_common = common_identity(&identity)?;
+        let selected_common = common_identity_unattached(&unattached)?;
         if launch_common != selected_common {
             return Err(SelectionError::DifferentRepository);
         }
+        let identity = unattached
+            .attach_marker()
+            .map_err(|_| SelectionError::Unavailable)?;
         // The worktree and its common directory can change while Git runs.
         launch
             .verify_readonly()
@@ -638,6 +642,43 @@ impl CheckoutRegistry {
             identity: selected,
             ..witness
         })
+    }
+
+    /// Capacity is a resolved-checkout failure: recheck the selected root
+    /// read-only before attributing the error, without reserving a slot.
+    pub fn capacity_witness(
+        &self,
+        launch: &WorkspaceIdentity,
+        selected: &Path,
+    ) -> Result<SelectedCheckout, SelectionError> {
+        launch
+            .verify_readonly()
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        let root = checkout_root(selected)?;
+        let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        let launch_common = common_identity(launch)?;
+        let selected_common = common_identity(&identity)?;
+        if launch_common != selected_common {
+            return Err(SelectionError::IdentityChanged);
+        }
+        let witness = SelectedCheckout {
+            launch: Arc::new(
+                launch
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            identity: Arc::new(
+                identity
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            launch_common,
+            selected_common,
+        };
+        witness.before_answer()?;
+        Ok(witness)
     }
 
     /// Mark a known checkout busy even without an attached client. The runtime
@@ -1354,6 +1395,74 @@ fn common_identity(identity: &WorkspaceIdentity) -> Result<(u64, u64), Selection
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Probe membership before writing a worktree marker. Git output is bounded and
+/// the root identity is checked on both sides of the probe.
+fn common_identity_unattached(identity: &WorkspaceIdentity) -> Result<(u64, u64), SelectionError> {
+    let root = &identity.root;
+    let before = fs::symlink_metadata(root).map_err(|_| SelectionError::Unavailable)?;
+    if !before.is_dir()
+        || before.file_type().is_symlink()
+        || (before.dev(), before.ino()) != (identity.device, identity.inode)
+    {
+        return Err(SelectionError::IdentityChanged);
+    }
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| SelectionError::Unavailable)?;
+    let stdout = child.stdout.take().ok_or(SelectionError::Unavailable)?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut output = Vec::new();
+        stdout.take(4097).read_to_end(&mut output).map(|_| output)
+    });
+    let deadline = Instant::now() + Duration::from_millis(750);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::yield_now(),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SelectionError::Unavailable);
+            }
+        }
+    };
+    let output = reader
+        .join()
+        .map_err(|_| SelectionError::Unavailable)?
+        .map_err(|_| SelectionError::Unavailable)?;
+    if !status.success() || output.len() > 4096 {
+        return Err(SelectionError::Unavailable);
+    }
+    let path = std::str::from_utf8(&output)
+        .map_err(|_| SelectionError::Unavailable)?
+        .trim_end_matches('\n');
+    if path.contains(['\r', '\n', '\0']) || !Path::new(path).is_absolute() {
+        return Err(SelectionError::Unavailable);
+    }
+    let path = fs::canonicalize(path).map_err(|_| SelectionError::Unavailable)?;
+    let after = fs::symlink_metadata(root).map_err(|_| SelectionError::IdentityChanged)?;
+    if !after.is_dir()
+        || after.file_type().is_symlink()
+        || (after.dev(), after.ino()) != (identity.device, identity.inode)
+    {
+        return Err(SelectionError::IdentityChanged);
+    }
+    let common = fs::metadata(path).map_err(|_| SelectionError::Unavailable)?;
+    if !common.is_dir() {
+        return Err(SelectionError::Unavailable);
+    }
+    Ok((common.dev(), common.ino()))
+}
+
 /// Walk the literal selected pathname. In particular, do not canonicalize a
 /// symlink (including one in an intermediate component) into a different root.
 fn checkout_root(selected: &Path) -> Result<PathBuf, SelectionError> {
@@ -1385,4 +1494,132 @@ fn checkout_root(selected: &Path) -> Result<PathBuf, SelectionError> {
         }
     }
     Err(SelectionError::NotCheckout)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn rejected_selection_never_attaches_or_creates_a_foreign_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        let foreign = temp.path().join("foreign");
+        git(temp.path(), &["init", "--quiet", launch.to_str().unwrap()]);
+        git(temp.path(), &["init", "--quiet", foreign.to_str().unwrap()]);
+        let launch = launch.canonicalize().unwrap();
+        let foreign = foreign.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&launch), &launch).unwrap();
+        let mut registry = CheckoutRegistry::new();
+        registry.attach_launch(17, &identity).unwrap();
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(
+            registry.select(17, &identity, &foreign).unwrap_err(),
+            SelectionError::DifferentRepository
+        );
+        assert!(!foreign.join(".git/baleyg/workspace-id").exists());
+        assert_eq!(
+            registry
+                .select(17, &identity, Path::new("relative"))
+                .unwrap_err(),
+            SelectionError::NotAbsolute
+        );
+        assert_eq!(registry.entries.len(), 1);
+        assert!(
+            registry
+                .entries
+                .get(&identity.root_key)
+                .unwrap()
+                .sessions
+                .contains(&17)
+        );
+        registry.disconnect(17);
+        assert!(
+            registry
+                .entries
+                .values()
+                .all(|entry| entry.sessions.is_empty())
+        );
+    }
+    #[test]
+    fn capacity_failure_retains_verified_root_without_reserving_a_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let launch = temp.path().join("launch");
+        git(temp.path(), &["init", "--quiet", launch.to_str().unwrap()]);
+        git(
+            &launch,
+            &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+        );
+        let selected = temp.path().join("linked");
+        git(
+            &launch,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                selected.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let launch = launch.canonicalize().unwrap();
+        let selected = selected.canonicalize().unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&launch), &launch).unwrap();
+        let mut registry = CheckoutRegistry::new();
+        registry.attach_launch(17, &identity).unwrap();
+        for index in 0..MAX_ACTIVE_CHECKOUTS - 1 {
+            let key = format!("fixture-{index}");
+            let mut metadata = CheckoutMetadata::from_identity(&identity);
+            metadata.root_key = key.clone();
+            registry.entries.insert(
+                key,
+                Entry {
+                    identity: metadata,
+                    registration: None,
+                    sessions: HashSet::from([18]),
+                    released: false,
+                    pending_work: false,
+                    external_work: false,
+                    browser_until: None,
+                    release_at: None,
+                },
+            );
+        }
+        assert_eq!(registry.active_count(), MAX_ACTIVE_CHECKOUTS);
+        assert_eq!(
+            registry.select(17, &identity, &selected).unwrap_err(),
+            SelectionError::CheckoutCapacity
+        );
+        assert_eq!(registry.entries.len(), MAX_ACTIVE_CHECKOUTS);
+        assert_eq!(
+            registry
+                .capacity_witness(&identity, &selected)
+                .unwrap()
+                .root,
+            selected
+        );
+        assert!(
+            registry
+                .entries
+                .values()
+                .all(|entry| entry.sessions.contains(&17)
+                    == (entry.identity.root_key == identity.root_key))
+        );
+    }
 }
