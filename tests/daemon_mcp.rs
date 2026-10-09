@@ -414,7 +414,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
 #[test]
 fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
     use std::os::unix::net::UnixListener;
-    for count in [1usize, 16usize] {
+    for count in [1usize, 16usize, 18usize, 19usize] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
         let phase_path = PathBuf::from(format!(
@@ -466,13 +466,17 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             String::new()
         };
         for n in 0..count {
-            burst.push_str(
-                &json!({"jsonrpc":"2.0","id":100+n,"method":"tools/list","params":metadata})
-                    .to_string(),
-            );
+            let call = if (16..18).contains(&n) {
+                json!({"jsonrpc":"2.0","id":100+n,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe",
+                        "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
+            } else {
+                json!({"jsonrpc":"2.0","id":100+n,"method":"tools/list","params":metadata})
+            };
+            burst.push_str(&call.to_string());
             burst.push('\n');
         }
-        if count == 16 {
+        if count >= 16 {
             burst.push_str(cancel);
         }
         peer.stdin
@@ -480,6 +484,44 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             .unwrap()
             .write_all(burst.as_bytes())
             .unwrap();
+        if count >= 18 {
+            // The daemon is held at A: overflow replies must come from the thin relay.
+            for id in [116, 117] {
+                let overflow = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(overflow["id"], id, "{overflow}");
+                assert_eq!(overflow["result"]["isError"], true, "{overflow}");
+                let envelope = &overflow["result"]["structuredContent"];
+                assert_eq!(envelope["requestId"], id, "{overflow}");
+                assert_eq!(
+                    envelope["error"]["code"], "workspace_selection_failed",
+                    "{overflow}"
+                );
+                assert_eq!(envelope["error"]["reason"], "unavailable", "{overflow}");
+                assert_eq!(envelope["error"]["retryable"], true, "{overflow}");
+                assert_eq!(
+                    envelope["error"]["attemptedWorkspace"]["value"],
+                    json!(root.canonicalize().unwrap())
+                );
+                assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+                assert_eq!(envelope["error"]["currentContentHash"], Value::Null);
+                assert!(envelope.get("workspace").is_none(), "{overflow}");
+                assert!(envelope.get("catchingUp").is_none(), "{overflow}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        overflow["result"]["content"][0]["text"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    *envelope
+                );
+            }
+            if count == 19 {
+                let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(refused["id"], 118, "{refused}");
+                assert_eq!(refused["error"]["code"], -32000, "{refused}");
+                assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
+                assert!(refused.get("result").is_none(), "{refused}");
+            }
+        }
         phase.write_all(b"x").unwrap();
         if count == 1 {
             let invalid = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -489,7 +531,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             assert_eq!(oversized["id"], Value::Null, "{oversized}");
             assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
         }
-        for n in 0..count {
+        for n in 0..count.min(16) {
             let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
             assert_eq!(reply["id"], 100 + n, "cancelled/queued response: {reply}");
             assert!(reply["result"].is_object(), "{reply}");
@@ -642,6 +684,179 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
 }
 
 #[test]
+fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let initialized = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(initialized["id"], 1);
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    assert_eq!(peer.ask(4, "tools/list", json!({}))["id"], 4);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let mut dirs = vec![home.path().to_path_buf()];
+    let mut data = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                data = path.parent().and_then(Path::parent).map(Path::to_path_buf);
+                break;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let owner =
+        baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
+            .unwrap()
+            .expect("killed daemon released singleton lock");
+    let listener = owner.listener().try_clone().unwrap();
+    let (connected_tx, connected_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let fake = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
+        assert_eq!(attach.operation, "mcp");
+        connected_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        protocol::write_frame(
+            &mut socket,
+            &protocol::Reply {
+                id: attach.id,
+                payload: json!({"result":true}),
+            },
+        )
+        .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        let mut steps = Vec::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let value: Value = serde_json::from_str(&line).unwrap();
+            let method = value["method"].as_str().unwrap();
+            steps.push(method.to_owned());
+            match method {
+                "initialize" => {
+                    assert_eq!(value["id"], 1);
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":1,"result":{
+                            "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                            "serverInfo":{"name":"baleyg","version":"fixture"}}
+                        })
+                    )
+                    .unwrap();
+                }
+                "notifications/cancelled" => assert_eq!(value["params"]["requestId"], 1),
+                "notifications/initialized" => (),
+                "tools/list" => {
+                    assert_eq!(value["id"], 5);
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":5,"result":{"tools":[]}})
+                    )
+                    .unwrap();
+                }
+                "tools/call" => {
+                    assert_eq!(value["id"], 6);
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":6,"result":{"isError":false}})
+                    )
+                    .unwrap();
+                    break;
+                }
+                other => panic!("unexpected synthetic MCP method {other}: {steps:?}"),
+            }
+        }
+        assert!(
+            steps.contains(&"notifications/cancelled".into()),
+            "{steps:?}"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|stage| stage.as_str() == "initialize")
+                .count(),
+            1
+        );
+    });
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/list","params":{}
+        })
+    )
+    .unwrap();
+    connected_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}
+        })
+    )
+    .unwrap();
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(150)).is_err(),
+        "setup replied while attach paused"
+    );
+    release_tx.send(()).unwrap();
+    let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(list["id"], 5, "{list}");
+    assert!(list["result"]["tools"].is_array(), "{list}");
+    let call = peer.ask(
+        6,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+        }),
+    );
+    assert_eq!(call["id"], 6, "{call}");
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    fake.join().unwrap();
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+}
+
+#[test]
 fn idle_mcp_connection_outlives_cli_request_deadline() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
@@ -721,7 +936,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["method"],
-            "server/discover"
+            "tools/call"
         );
         stream
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":")
@@ -744,11 +959,12 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         child.stdin.as_mut().unwrap(),
         "{}",
         json!({
-            "jsonrpc":"2.0", "id":1,"method":"server/discover",
-            "params":{"_meta":{
-                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities":{}
-            }}
+            "jsonrpc":"2.0", "id":1,"method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+                "_meta":{
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}
+                }}
         })
     )
     .unwrap();
@@ -771,7 +987,26 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         .expect("typed interrupted result while stdin open");
     let response: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(response["id"], 1);
-    assert_eq!(response["error"]["data"]["code"], "daemon_unavailable");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(response["result"]["structuredContent"]["requestId"], 1);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        "workspace_selection_failed"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["reason"],
+        "unavailable"
+    );
+    assert!(
+        response["result"]["structuredContent"]
+            .get("workspace")
+            .is_none()
+    );
+    assert!(
+        response["result"]["structuredContent"]
+            .get("catchingUp")
+            .is_none()
+    );
     let listener = owner.listener().try_clone().unwrap();
     let failed_attach = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -795,7 +1030,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"baleyg_workspace_describe",
-                "arguments":{"schemaVersion":1,"workspace":"../../foreign"},
+                "arguments":{"schemaVersion":1,"workspace":root.canonicalize().unwrap()},
                 "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities":{}}}
         })
@@ -804,16 +1039,26 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let selected: Value =
         serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
     assert_eq!(selected["id"], 2);
-    assert_eq!(selected["error"]["data"]["code"], "daemon_unavailable");
+    assert_eq!(selected["result"]["isError"], true, "{selected}");
+    let envelope = &selected["result"]["structuredContent"];
+    assert_eq!(envelope["requestId"], 2);
+    assert_eq!(envelope["error"]["code"], "workspace_selection_failed");
+    assert_eq!(envelope["error"]["reason"], "unavailable");
+    assert_eq!(envelope["error"]["retryable"], true);
     assert_eq!(
-        selected["error"]["data"]["attemptedWorkspace"]["value"],
-        "../../foreign"
+        envelope["error"]["attemptedWorkspace"]["value"],
+        json!(root.canonicalize().unwrap())
     );
     assert!(
-        selected.get("result").is_none(),
+        envelope.get("workspace").is_none(),
         "unverified checkout attributed: {selected}"
     );
-    assert!(selected.get("workspace").is_none(), "{selected}");
+    assert!(envelope.get("catchingUp").is_none(), "{selected}");
+    assert_eq!(
+        serde_json::from_str::<Value>(selected["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *envelope
+    );
     failed_attach.join().unwrap();
     child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(10);

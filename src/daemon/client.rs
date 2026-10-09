@@ -162,18 +162,67 @@ fn attach_mcp(
     Ok(stream)
 }
 
-fn mcp_failure(value: &serde_json::Value, code: &str) -> serde_json::Value {
+fn mcp_failure(
+    value: &serde_json::Value,
+    code: &str,
+    workspace: &crate::store::topology::WorkspaceIdentity,
+) -> serde_json::Value {
     use serde_json::json;
-    let mut data = json!({"code":code});
-    if let Some(selected) = value.pointer("/params/arguments/workspace") {
-        data["attemptedWorkspace"] = crate::mcp::tools::attempted(selected);
+    let id = value.get("id").cloned().unwrap_or_default();
+    if matches!(code, "daemon_unavailable" | "selection_unavailable")
+        && value.get("method").and_then(|v| v.as_str()) == Some("tools/call")
+        && value
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .is_some_and(crate::mcp::catalog::known)
+    {
+        // An interrupted attachment has not verified any answering checkout.
+        // Validate application fields before classifying an attempted selection.
+        let name = value
+            .pointer("/params/name")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let arguments = value.pointer("/params/arguments");
+        let selected = arguments
+            .and_then(serde_json::Value::as_object)
+            .and_then(|object| object.get("workspace"));
+        let envelope = if let Err(error) = crate::mcp::tools::validate(name, arguments) {
+            let mut failure = crate::mcp::tools::failure(&id, error);
+            if let Some(selected) = selected
+                && let Some(object) = arguments.and_then(serde_json::Value::as_object)
+            {
+                let mut without = object.clone();
+                without.remove("workspace");
+                if crate::mcp::tools::validate(name, Some(&serde_json::Value::Object(without)))
+                    .is_ok()
+                    && selected.as_str().is_none_or(|path| path.len() > 4096)
+                {
+                    failure["error"]["attemptedWorkspace"] = crate::mcp::tools::attempted(selected);
+                }
+            }
+            failure
+        } else {
+            let attempted = selected.cloned().unwrap_or_else(|| json!(workspace.root));
+            let reason = if selected
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| !std::path::Path::new(path).is_absolute())
+            {
+                crate::daemon::registry::SelectionError::NotAbsolute
+            } else {
+                crate::daemon::registry::SelectionError::Unavailable
+            };
+            crate::mcp::tools::selection_failure(&id, reason, &attempted)
+        };
+        let modern = value.pointer("/params/_meta").is_some();
+        return json!({"jsonrpc":"2.0","id":id,
+            "result":crate::mcp::tools::result(envelope, modern)});
     }
-    json!({"jsonrpc":"2.0","id":value.get("id").cloned().unwrap_or_default(),
-        "error":{"code":-32603,"message":"Internal error","data":data}})
+    json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-32603,"message":"Internal error","data":{"code":code}}})
 }
 
-#[derive(Default)]
-struct McpInputBuffer {
+struct McpInputBuffer<'a> {
+    workspace: &'a crate::store::topology::WorkspaceIdentity,
     queue: std::collections::VecDeque<crate::mcp::wire::Frame>,
     cancelled_queued: Vec<serde_json::Value>,
 }
@@ -213,7 +262,11 @@ pub fn relay_stdio(
                 }
             }
         })?;
-    let mut buffer = McpInputBuffer::default();
+    let mut buffer = McpInputBuffer {
+        workspace,
+        queue: std::collections::VecDeque::new(),
+        cancelled_queued: Vec::new(),
+    };
     let mut receive_bytes = Vec::new();
     let mut stdout = io::stdout().lock();
     let mut legacy_init: Option<Vec<u8>> = None;
@@ -300,13 +353,22 @@ pub fn relay_stdio(
                                 &mut buffer,
                                 &mut stdout,
                                 &mut eof,
-                                Some(&init_id),
+                                None, // synthetic setup has no cancellable external ID
                                 &mut receive_bytes,
                             )
                             .and_then(|reply| {
                                 reply.ok_or_else(|| io::Error::other("MCP setup canceled"))
                             })
-                            .map(|_| ())
+                            .and_then(|reply| {
+                                if reply.get("id") == Some(&init_id) {
+                                    Ok(())
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "MCP setup reply ID mismatch",
+                                    ))
+                                }
+                            })
                         })
                         .and_then(|()| {
                             stream.write_all(
@@ -323,7 +385,10 @@ pub fn relay_stdio(
             }
             let Some(stream) = current.as_mut() else {
                 if has_id {
-                    wire::write_response(&mut stdout, &mcp_failure(&value, "daemon_unavailable"))?;
+                    wire::write_response(
+                        &mut stdout,
+                        &mcp_failure(&value, "daemon_unavailable", workspace),
+                    )?;
                 }
                 break;
             };
@@ -378,6 +443,7 @@ pub fn relay_stdio(
                                     } else {
                                         "outcome_unknown"
                                     },
+                                    workspace,
                                 ),
                             )?;
                             break;
@@ -398,6 +464,7 @@ pub fn relay_stdio(
                             } else {
                                 "outcome_unknown"
                             },
+                            workspace,
                         ),
                     )?;
                 }
@@ -448,7 +515,7 @@ fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value>
 fn drain_mcp_input(
     stream: &mut UnixStream,
     receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
-    buffer: &mut McpInputBuffer,
+    buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
     active_id: Option<&serde_json::Value>,
@@ -483,12 +550,37 @@ fn drain_mcp_input(
                 } else if buffer.queue.len() < 16 {
                     buffer.queue.push_back(frame);
                 } else {
+                    // A finite relay cannot admit this frame for daemon selection.
+                    // Decode before refusal so known tools retain their closed DTO shape.
+                    let decoded = match &frame {
+                        Frame::Line(line) => serde_json::from_slice::<serde_json::Value>(line).ok(),
+                        _ => None,
+                    };
                     let response = match wire::decode(frame) {
                         Err(error) => Some(error.response()),
-                        Ok(Some(request)) if request.id.is_some() => Some(serde_json::json!({
-                            "jsonrpc":"2.0","id":request.id,"error":{
-                                "code":-32603,"message":"Internal error",
-                                "data":{"code":"too_many_requests"}}})),
+                        Ok(Some(request)) if request.id.is_some() => {
+                            let id = request.id.expect("checked ID");
+                            if request.method == "tools/call"
+                                && request
+                                    .params
+                                    .as_ref()
+                                    .and_then(|p| p.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(crate::mcp::catalog::known)
+                            {
+                                let mut value = decoded.expect("decoded MCP request");
+                                value["id"] = id;
+                                Some(mcp_failure(
+                                    &value,
+                                    "selection_unavailable",
+                                    buffer.workspace,
+                                ))
+                            } else {
+                                Some(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                                    "code":-32000,"message":"Relay queue is full",
+                                    "data":{"code":"too_many_requests"}}}))
+                            }
+                        }
                         _ => None,
                     };
                     if let Some(response) = response {
@@ -506,7 +598,7 @@ fn drain_mcp_input(
 fn read_mcp_line(
     stream: &mut UnixStream,
     receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
-    buffer: &mut McpInputBuffer,
+    buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
     eof: &mut bool,
     expected_id: Option<&serde_json::Value>,
@@ -604,5 +696,62 @@ fn read_mcp_line(
             }
             return Ok(Some(reply));
         }
+    }
+}
+
+#[cfg(test)]
+mod relay_failure_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn unresolved_tool_input_keeps_closed_application_and_selection_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let workspace =
+            crate::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+                .unwrap();
+        for (selection, code, reason) in [
+            (json!(42), "invalid_request", None),
+            (json!("x".repeat(4097)), "invalid_request", None),
+            (
+                json!("../relative"),
+                "workspace_selection_failed",
+                Some("not_absolute"),
+            ),
+        ] {
+            let request = json!({"jsonrpc":"2.0","id":"validation",
+                "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+                "arguments":{"schemaVersion":1,"workspace":selection},
+                "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}}}});
+            let reply = mcp_failure(&request, "daemon_unavailable", &workspace);
+            assert_eq!(reply["id"], "validation", "{reply}");
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let envelope = &reply["result"]["structuredContent"];
+            assert_eq!(envelope["error"]["code"], code, "{reply}");
+            assert_eq!(envelope["error"]["reason"].as_str(), reason, "{reply}");
+            assert_eq!(envelope["requestId"], "validation");
+            assert!(envelope["error"]["attemptedWorkspace"].is_object());
+            assert!(envelope.get("workspace").is_none());
+            assert!(envelope.get("catchingUp").is_none());
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    reply["result"]["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                *envelope
+            );
+        }
+        let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}});
+        let reply = mcp_failure(&legacy, "daemon_unavailable", &workspace);
+        assert_eq!(reply["result"]["structuredContent"]["requestId"], 2);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["reason"],
+            "unavailable"
+        );
+        assert!(reply["result"].get("resultType").is_none(), "{reply}");
     }
 }
