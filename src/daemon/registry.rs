@@ -646,11 +646,11 @@ impl CheckoutRegistry {
 
     /// Capacity is a resolved-checkout failure: recheck the selected root
     /// read-only before attributing the error, without reserving a slot.
-    pub fn capacity_identity(
+    pub fn capacity_witness(
         &self,
         launch: &WorkspaceIdentity,
         selected: &Path,
-    ) -> Result<WorkspaceIdentity, SelectionError> {
+    ) -> Result<SelectedCheckout, SelectionError> {
         launch
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
@@ -658,13 +658,27 @@ impl CheckoutRegistry {
         let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
             .map_err(|_| SelectionError::IdentityChanged)?;
-        if common_identity(launch)? != common_identity(&identity)? {
+        let launch_common = common_identity(launch)?;
+        let selected_common = common_identity(&identity)?;
+        if launch_common != selected_common {
             return Err(SelectionError::IdentityChanged);
         }
-        identity
-            .verify_readonly()
-            .map_err(|_| SelectionError::IdentityChanged)?;
-        Ok(identity)
+        let witness = SelectedCheckout {
+            launch: Arc::new(
+                launch
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            identity: Arc::new(
+                identity
+                    .verified_clone()
+                    .map_err(|_| SelectionError::IdentityChanged)?,
+            ),
+            launch_common,
+            selected_common,
+        };
+        witness.before_answer()?;
+        Ok(witness)
     }
 
     /// Mark a known checkout busy even without an attached client. The runtime
@@ -1595,7 +1609,7 @@ mod selection_tests {
         assert_eq!(registry.entries.len(), MAX_ACTIVE_CHECKOUTS);
         assert_eq!(
             registry
-                .capacity_identity(&identity, &selected)
+                .capacity_witness(&identity, &selected)
                 .unwrap()
                 .root,
             selected

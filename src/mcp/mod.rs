@@ -104,6 +104,42 @@ pub fn run_socket(
     run_transport(workspace, reader, stream, Some((registry, session_id)))
 }
 
+fn catching_up(
+    registry: &Option<(
+        std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+        u64,
+    )>,
+    key: &str,
+) -> bool {
+    registry
+        .as_ref()
+        .and_then(|(registry, _)| registry.blocking_lock().runtime(key))
+        .is_none_or(|runtime| runtime.catching_up())
+}
+
+/// An opt-in, bounded fixture barrier at an actual coordinator boundary.
+/// Normal MCP calls do not connect to or wait for a test socket.
+fn phase_hook(stage: &str) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    if std::env::var("BALEYG_TEST_MCP_PHASE").ok().as_deref() != Some(stage) {
+        return Ok(());
+    }
+    let path = std::env::var_os("BALEYG_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing MCP fixture socket",
+        )
+    })?;
+    let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    stream.write_all(stage.as_bytes())?;
+    stream.write_all(b"\n")?;
+    let mut release = [0u8; 1];
+    stream.read_exact(&mut release)?;
+    Ok(())
+}
+
 fn run_transport(
     workspace: OpenedWorkspace,
     input: impl std::io::Read + Send + 'static,
@@ -183,6 +219,7 @@ fn run_transport(
                 }
                 let modern = session.mode() == session::Mode::Modern;
                 let mut prepared_tool = None;
+                let mut capacity_witness = None;
                 let result = match &admission.action {
                     session::Action::Discover => catalog::discover(workspace.build_version()),
                     session::Action::Initialize => catalog::initialize(workspace.build_version()),
@@ -202,7 +239,7 @@ fn run_transport(
                                 &workspace,
                             );
                             let result = tool.response.clone();
-                            prepared_tool = Some((tool, None));
+                            prepared_tool = Some((tool, None, false));
                             result
                         } else {
                             let selected = if let Some((registry, session_id)) = &registry {
@@ -226,67 +263,87 @@ fn run_transport(
                             };
                             match selected {
                                 Ok(selected) => {
-                                    let selected_workspace = selected.as_ref().map(|w| {
-                                        OpenedWorkspace::new(
-                                            w.identity
-                                                .as_ref()
-                                                .verified_clone()
-                                                .expect("selected witness verified"),
-                                        )
-                                    });
-                                    let answering =
-                                        selected_workspace.as_ref().unwrap_or(&workspace);
-                                    let catching_up = registry
-                                        .as_ref()
-                                        .and_then(|(registry, _)| {
-                                            registry
-                                                .blocking_lock()
-                                                .runtime(&answering.identity.root_key)
-                                        })
-                                        .is_none_or(|runtime| runtime.catching_up());
-                                    let mut tool = tools::prepare(
-                                        name,
-                                        arguments.as_ref(),
-                                        &admission.id,
-                                        modern,
-                                        answering,
-                                    );
-                                    if tool.answered {
-                                        let mut envelope =
-                                            tool.response["structuredContent"].clone();
-                                        envelope["catchingUp"] = serde_json::json!(catching_up);
-                                        tool.response = tools::result(envelope, modern);
+                                    if selected.is_some() {
+                                        phase_hook("selected_clone")?;
                                     }
-                                    let result = tool.response.clone();
-                                    prepared_tool = Some((tool, selected));
-                                    result
+                                    let key = selected
+                                        .as_ref()
+                                        .map_or(&workspace.identity.root_key, |w| {
+                                            &w.identity.root_key
+                                        });
+                                    let catching_up = catching_up(&registry, key);
+                                    let selected_workspace = selected.as_ref().map(|w| {
+                                        w.identity.verified_clone().map(OpenedWorkspace::new)
+                                    });
+                                    match selected_workspace.transpose() {
+                                        Err(_) => {
+                                            let root = selected
+                                                .as_ref()
+                                                .map_or(workspace.root(), |witness| {
+                                                    witness.identity.root.as_path()
+                                                });
+                                            tools::resolved_root_changed(
+                                                &admission.id,
+                                                root,
+                                                catching_up,
+                                                modern,
+                                            )
+                                        }
+                                        Ok(selected_workspace) => {
+                                            let answering =
+                                                selected_workspace.as_ref().unwrap_or(&workspace);
+                                            let mut tool = tools::prepare(
+                                                name,
+                                                arguments.as_ref(),
+                                                &admission.id,
+                                                modern,
+                                                answering,
+                                            );
+                                            let mut envelope =
+                                                tool.response["structuredContent"].clone();
+                                            envelope["catchingUp"] = serde_json::json!(catching_up);
+                                            tool.response = tools::result(envelope, modern);
+                                            let result = tool.response.clone();
+                                            prepared_tool = Some((tool, selected, catching_up));
+                                            result
+                                        }
+                                    }
                                 }
                                 Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
-                                    let path = selection
-                                        .and_then(serde_json::Value::as_str)
-                                        .expect("capacity requires an explicit path");
-                                    match registry
-                                        .as_ref()
-                                        .expect("daemon registry required")
-                                        .0
-                                        .blocking_lock()
-                                        .capacity_identity(
+                                    let Some(path) = selection.and_then(serde_json::Value::as_str)
+                                    else {
+                                        unreachable!(
+                                            "validated capacity requires explicit selection"
+                                        )
+                                    };
+                                    let checked_capacity = {
+                                        let guard = registry
+                                            .as_ref()
+                                            .expect("daemon registry required")
+                                            .0
+                                            .blocking_lock();
+                                        guard.capacity_witness(
                                             workspace.identity(),
                                             std::path::Path::new(path),
-                                        ) {
-                                        Ok(identity) => {
-                                            let selected = OpenedWorkspace::new(identity);
-                                            tools::result(
-                                                tools::attributed(
+                                        )
+                                    };
+                                    match checked_capacity {
+                                        Ok(witness) => {
+                                            let catching_up =
+                                                catching_up(&registry, &witness.identity.root_key);
+                                            let response = tools::result(
+                                                tools::attributed_root(
                                                     tools::failure(
                                                         &admission.id,
                                                         "checkout_capacity",
                                                     ),
-                                                    &selected,
-                                                    true,
+                                                    &witness.identity.root,
+                                                    catching_up,
                                                 ),
                                                 modern,
-                                            )
+                                            );
+                                            capacity_witness = Some((witness, catching_up));
+                                            response
                                         }
                                         Err(error) => tools::result(
                                             tools::selection_failure(
@@ -337,27 +394,41 @@ fn run_transport(
                         }
                     }
                 }
-                if let Some((mut tool, selected)) = prepared_tool {
-                    if let Some(witness) = selected.as_ref() {
-                        if let Err(error) = witness.before_answer() {
-                            let attempted = serde_json::json!(witness.identity.root);
-                            tool.response = tools::result(
-                                tools::selection_failure(&admission.id, error, &attempted),
+                if let Some((mut tool, selected, catching_up)) = prepared_tool {
+                    if tool.valid_arguments {
+                        phase_hook(if selected.is_some() {
+                            "selected_final"
+                        } else {
+                            "launch_final"
+                        })?;
+                        let changed = selected.as_ref().map_or_else(
+                            || workspace.check().is_err(),
+                            |witness| witness.before_answer().is_err(),
+                        );
+                        if changed {
+                            let root = selected.as_ref().map_or(workspace.root(), |witness| {
+                                witness.identity.root.as_path()
+                            });
+                            tool.response = tools::resolved_root_changed(
+                                &admission.id,
+                                root,
+                                catching_up,
                                 modern,
                             );
                         }
-                    } else if tool.valid_arguments && workspace.check().is_err() {
-                        let attempted = serde_json::json!(workspace.root());
-                        tool.response = tools::result(
-                            tools::selection_failure(
-                                &admission.id,
-                                crate::daemon::registry::SelectionError::IdentityChanged,
-                                &attempted,
-                            ),
+                    }
+                    prepared.response["result"] = tool.response;
+                }
+                if let Some((witness, catching_up)) = capacity_witness {
+                    phase_hook("capacity_final")?;
+                    if witness.before_answer().is_err() {
+                        prepared.response["result"] = tools::resolved_root_changed(
+                            &admission.id,
+                            &witness.identity.root,
+                            catching_up,
                             modern,
                         );
                     }
-                    prepared.response["result"] = tool.response;
                 }
                 if let Some(value) = session.commit(prepared) {
                     wire::write_response(&mut writer, &value)?;

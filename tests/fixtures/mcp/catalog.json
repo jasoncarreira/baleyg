@@ -51,7 +51,7 @@
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/FailureCode"
+                  "$ref": "#/$defs/ResolvedFailureCode"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -346,24 +346,10 @@
                   "const": "workspace_selection_failed"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -393,7 +379,32 @@
                 "attemptedWorkspace",
                 "reason"
               ],
-              "type": "object"
+              "type": "object",
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "reason": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "retryable": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "retryable": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "requestId": {
               "oneOf": [
@@ -428,30 +439,16 @@
                   "const": "invalid_request"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
                 },
                 "retryable": {
-                  "type": "boolean"
+                  "const": false
                 },
                 "attemptedWorkspace": {
                   "$ref": "#/$defs/AttemptedWorkspace"
@@ -489,6 +486,23 @@
             "error"
           ],
           "type": "object"
+        },
+        "ResolvedFailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -859,7 +873,7 @@
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/FailureCode"
+                  "$ref": "#/$defs/ResolvedFailureCode"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -1339,24 +1353,10 @@
                   "const": "workspace_selection_failed"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -1386,7 +1386,32 @@
                 "attemptedWorkspace",
                 "reason"
               ],
-              "type": "object"
+              "type": "object",
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "reason": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "retryable": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "retryable": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "requestId": {
               "oneOf": [
@@ -1421,30 +1446,16 @@
                   "const": "invalid_request"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
                 },
                 "retryable": {
-                  "type": "boolean"
+                  "const": false
                 },
                 "attemptedWorkspace": {
                   "$ref": "#/$defs/AttemptedWorkspace"
@@ -1482,6 +1493,23 @@
             "error"
           ],
           "type": "object"
+        },
+        "ResolvedFailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2157,7 +2185,7 @@
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/FailureCode"
+                  "$ref": "#/$defs/ResolvedFailureCode"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -2943,24 +2971,10 @@
                   "const": "workspace_selection_failed"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -2990,7 +3004,32 @@
                 "attemptedWorkspace",
                 "reason"
               ],
-              "type": "object"
+              "type": "object",
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "reason": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "retryable": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "retryable": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "requestId": {
               "oneOf": [
@@ -3025,30 +3064,16 @@
                   "const": "invalid_request"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
                 },
                 "retryable": {
-                  "type": "boolean"
+                  "const": false
                 },
                 "attemptedWorkspace": {
                   "$ref": "#/$defs/AttemptedWorkspace"
@@ -3086,6 +3111,23 @@
             "error"
           ],
           "type": "object"
+        },
+        "ResolvedFailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3387,7 +3429,7 @@
               "additionalProperties": false,
               "properties": {
                 "code": {
-                  "$ref": "#/$defs/FailureCode"
+                  "$ref": "#/$defs/ResolvedFailureCode"
                 },
                 "currentBasis": {
                   "anyOf": [
@@ -3602,24 +3644,10 @@
                   "const": "workspace_selection_failed"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
@@ -3649,7 +3677,32 @@
                 "attemptedWorkspace",
                 "reason"
               ],
-              "type": "object"
+              "type": "object",
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "reason": {
+                        "const": "unavailable"
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "retryable": {
+                        "const": true
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "retryable": {
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "requestId": {
               "oneOf": [
@@ -3684,30 +3737,16 @@
                   "const": "invalid_request"
                 },
                 "currentBasis": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Basis"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "currentContentHash": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/$defs/Hash"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
+                  "const": null
                 },
                 "message": {
                   "$ref": "#/$defs/Text"
                 },
                 "retryable": {
-                  "type": "boolean"
+                  "const": false
                 },
                 "attemptedWorkspace": {
                   "$ref": "#/$defs/AttemptedWorkspace"
@@ -3745,6 +3784,23 @@
             "error"
           ],
           "type": "object"
+        },
+        "ResolvedFailureCode": {
+          "enum": [
+            "invalid_request",
+            "range_too_large",
+            "unsupported_encoding",
+            "revision_conflict",
+            "index_not_ready",
+            "not_found",
+            "too_many_requests",
+            "deadline_exceeded",
+            "root_changed",
+            "store_unavailable",
+            "checkout_capacity",
+            "daemon_unavailable",
+            "outcome_unknown"
+          ]
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -235,10 +235,24 @@ pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Va
     envelope["error"]["attemptedWorkspace"] = attempted(value);
     envelope
 }
-pub fn attributed(mut envelope: Value, workspace: &OpenedWorkspace, catching_up: bool) -> Value {
-    envelope["workspace"] = json!(workspace.root());
+pub fn attributed_root(mut envelope: Value, root: &std::path::Path, catching_up: bool) -> Value {
+    envelope["workspace"] = json!(root);
     envelope["catchingUp"] = json!(catching_up);
     envelope
+}
+pub fn attributed(envelope: Value, workspace: &OpenedWorkspace, catching_up: bool) -> Value {
+    attributed_root(envelope, workspace.root(), catching_up)
+}
+pub fn resolved_root_changed(
+    id: &Value,
+    root: &std::path::Path,
+    catching_up: bool,
+    modern: bool,
+) -> Value {
+    result(
+        attributed_root(failure(id, "root_changed"), root, catching_up),
+        modern,
+    )
 }
 pub fn result(envelope: Value, modern: bool) -> Value {
     let text = serde_json::to_string(&envelope).expect("bounded tool envelope");

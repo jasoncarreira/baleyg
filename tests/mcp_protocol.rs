@@ -99,6 +99,13 @@ impl Peer {
         Self::start_in(workspace, None)
     }
     fn start_in(workspace: Option<&Path>, cwd: Option<&Path>) -> Self {
+        Self::start_with_phase(workspace, cwd, None)
+    }
+    fn start_with_phase(
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
@@ -114,6 +121,10 @@ impl Peer {
             .stderr(Stdio::from(stderr));
         if let Some(path) = workspace {
             cmd.arg("--workspace").arg(path);
+        }
+        if let Some((stage, socket)) = phase {
+            cmd.env("BALEYG_TEST_MCP_PHASE", stage)
+                .env("BALEYG_TEST_MCP_PHASE_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -303,6 +314,33 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
         modern(id, "tools/call", fields)
     }
 }
+fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now()
+            }
+            Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, format!("{stage}\n"));
+    mutate();
+    stream.write_all(b"x").unwrap();
+}
+
 fn no_db_under(root: &Path) {
     no_db_under_except(root, &[]);
 }
@@ -1760,4 +1798,314 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
         no_db_under(peer._home.path());
         assert!(peer.finish().0.success());
     }
+}
+
+#[test]
+fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
+    let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
+    assert_eq!(catalog.as_array().unwrap().len(), 4);
+    for entry in catalog.as_array().unwrap() {
+        let defs = &entry["outputSchema"]["$defs"];
+        assert_eq!(
+            defs["Failure"]["properties"]["error"]["properties"]["code"],
+            json!({"$ref":"#/$defs/ResolvedFailureCode"})
+        );
+        assert!(
+            !defs["ResolvedFailureCode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("workspace_selection_failed"))
+        );
+        for kind in ["SelectionFailure", "InvalidWorkspaceFailure"] {
+            let error = &defs[kind]["properties"]["error"]["properties"];
+            assert_eq!(error["currentBasis"], json!({"const":null}));
+            assert_eq!(error["currentContentHash"], json!({"const":null}));
+        }
+        assert_eq!(
+            defs["InvalidWorkspaceFailure"]["properties"]["error"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["then"]["properties"]["retryable"],
+            json!({"const":true})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["else"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+    }
+}
+
+fn git_selection(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn git_linked_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+    let main = temp.join("main");
+    git_selection(temp, &["init", "--quiet", main.to_str().unwrap()]);
+    git_selection(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = temp.join("linked");
+    git_selection(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    (main.canonicalize().unwrap(), linked.canonicalize().unwrap())
+}
+fn linked_marker(linked: &Path) -> PathBuf {
+    let pointer = fs::read_to_string(linked.join(".git")).unwrap();
+    fs::canonicalize(linked.join(pointer.trim().strip_prefix("gitdir: ").unwrap()))
+        .unwrap()
+        .join("baleyg/workspace-id")
+}
+
+#[test]
+fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, linked) = git_linked_fixture(temp.path());
+        let socket = temp.path().join("phase.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut peer = Peer::start_with_phase(Some(&main), None, Some(("selected_clone", &socket)));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        peer.send_raw(
+            serde_json::to_string(&call(
+                legacy,
+                json!(8),
+                "baleyg_workspace_describe",
+                json!({"schemaVersion":1,"workspace":linked}),
+            ))
+            .unwrap()
+            .as_bytes(),
+        );
+        let marker = linked_marker(&linked);
+        phase_barrier(&listener, "selected_clone", || {
+            fs::remove_file(&marker).unwrap()
+        });
+        let reply = peer.reply();
+        tool(&reply, Some("root_changed"), !legacy);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(linked)
+        );
+        assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["currentBasis"],
+            Value::Null
+        );
+        assert!(
+            peer.finish().0.success(),
+            "daemon panic cannot interrupt thin client"
+        );
+    }
+}
+
+#[test]
+fn final_resolved_drift_is_attributed_for_four_tools_and_both_modes() {
+    for legacy in [false, true] {
+        for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
+            for explicit in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (main, linked) = git_linked_fixture(temp.path());
+                let root = if explicit { &linked } else { &main };
+                let stage = if explicit {
+                    "selected_final"
+                } else {
+                    "launch_final"
+                };
+                let socket = temp.path().join("phase.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let mut peer = Peer::start_with_phase(Some(&main), None, Some((stage, &socket)));
+                if legacy {
+                    ready_legacy(&mut peer);
+                }
+                let mut args = fixture()["validArguments"][index].clone();
+                if explicit {
+                    args["workspace"] = json!(linked);
+                }
+                peer.send_raw(
+                    serde_json::to_string(&call(
+                        legacy,
+                        json!(index),
+                        name.as_str().unwrap(),
+                        args,
+                    ))
+                    .unwrap()
+                    .as_bytes(),
+                );
+                if index % 2 == 0 {
+                    let marker = if explicit {
+                        linked_marker(root)
+                    } else {
+                        root.join(".git/baleyg/workspace-id")
+                    };
+                    let mut saved = Vec::new();
+                    phase_barrier(&listener, stage, || {
+                        saved = fs::read(&marker).unwrap();
+                        fs::remove_file(&marker).unwrap();
+                    });
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    let envelope = &reply["result"]["structuredContent"];
+                    assert_eq!(envelope["workspace"], json!(root));
+                    assert_eq!(envelope["catchingUp"], true);
+                    assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+                    assert!(envelope["error"].get("reason").is_none());
+                    fs::write(&marker, saved).unwrap();
+                } else {
+                    let moved = temp.path().join(if explicit {
+                        "moved-linked"
+                    } else {
+                        "moved-main"
+                    });
+                    phase_barrier(&listener, stage, || fs::rename(root, &moved).unwrap());
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["workspace"],
+                        json!(root)
+                    );
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["error"]["currentBasis"],
+                        Value::Null
+                    );
+                    fs::rename(moved, root).unwrap();
+                }
+                assert!(peer.finish().0.success());
+            }
+        }
+    }
+}
+
+#[test]
+fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, first) = git_linked_fixture(temp.path());
+    let mut linked = vec![first];
+    for index in 1..=63 {
+        let path = temp.path().join(format!("linked-{index}"));
+        git_selection(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        linked.push(path.canonicalize().unwrap());
+    }
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase(Some(&main), None, Some(("capacity_final", &socket)));
+    for (index, path) in linked.iter().take(63).enumerate() {
+        let reply = peer.ask(call(
+            false,
+            json!(index),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":path}),
+        ));
+        tool(&reply, None, true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(path)
+        );
+    }
+    let denied = &linked[63];
+    peer.send_raw(
+        serde_json::to_string(&call(
+            false,
+            json!(64),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":denied}),
+        ))
+        .unwrap()
+        .as_bytes(),
+    );
+    let marker = linked_marker(denied);
+    phase_barrier(&listener, "capacity_final", || {
+        fs::remove_file(&marker).unwrap()
+    });
+    let reply = peer.reply();
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(denied)
+    );
+    assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["currentBasis"],
+        Value::Null
+    );
+    assert!(peer.finish().0.success());
+}
+
+#[test]
+fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let mut peer = Peer::start(Some(&root));
+    let first = peer.ask(call(
+        false,
+        json!(1),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&first, None, true);
+    assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
+    let home = peer._home.path();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"));
+    let indexed = bounded_output(command);
+    assert!(
+        indexed.status.success(),
+        "index: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let second = peer.ask(call(
+        false,
+        json!(2),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&second, None, true);
+    assert_eq!(
+        second["result"]["structuredContent"]["workspace"],
+        first["result"]["structuredContent"]["workspace"]
+    );
+    assert_eq!(second["result"]["structuredContent"]["catchingUp"], false);
+    assert!(peer.finish().0.success());
 }
