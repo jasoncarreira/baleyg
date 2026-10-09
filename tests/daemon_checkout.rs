@@ -1074,3 +1074,111 @@ fn browser_listing_does_not_offer_ambiguous_same_inode_git_transition() {
 "
     );
 }
+
+#[tokio::test]
+async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
+    use baleyg::daemon::BrowserProvisioner;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    let moved = base.path().join("old");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function priorOwner() {}\n").unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let registry = std::sync::Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(
+        roots(base.path()),
+    )));
+    let old_options = CheckoutOptions(serde_json::json!({"maxFileBytes":8192}));
+    let old = {
+        let mut checked = registry.lock().await;
+        checked.register(&old_id, old_options.clone()).unwrap();
+        checked.attach_launch(1, &old_id).unwrap();
+        checked.activate(&key).unwrap()
+    };
+    ready(&old).await;
+    let (held_read, _) = old.evidence_response().unwrap();
+    fs::rename(&checkout, &moved).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("a.js"), "function newOwner() {}\n").unwrap();
+    let next = identity(&checkout);
+    registry.lock().await.disconnect(1);
+    let token = base.path().join("new-token");
+    let mut provisioner = BrowserProvisioner::new();
+    let options = CheckoutOptions(serde_json::json!({}));
+    assert!(!token.exists());
+    assert!(
+        provisioner
+            .register_serve(
+                &registry,
+                &next,
+                options.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                &token
+            )
+            .await
+            .is_err(),
+        "retained read must veto replacement serve"
+    );
+    assert!(
+        !token.exists(),
+        "failed first serve must not mint an unused token"
+    );
+    assert_eq!(registry.lock().await.registration(&key), Some(&old_options));
+    assert!(old.has_active_resources());
+    drop(held_read);
+    // The recorded pending bit stays conservative until an actual release
+    // refreshes it. A mere read drain does not authorize token creation.
+    assert!(
+        provisioner
+            .register_serve(
+                &registry,
+                &next,
+                options.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+                &token,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!token.exists());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !registry.lock().await.release(&key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("old root did not settle and release");
+    let mut validated = |stage| {
+        if stage == "validated" {
+            assert!(
+                !old.has_active_resources(),
+                "old owner was not retired before token"
+            );
+        }
+    };
+    provisioner
+        .register_serve_with_hook(
+            &registry,
+            &next,
+            options,
+            "127.0.0.1:0".parse().unwrap(),
+            &token,
+            Some(&mut validated),
+        )
+        .await
+        .expect("new checkout can serve after old runtime drains");
+    assert!(token.exists());
+    let current = {
+        let mut checked = registry.lock().await;
+        checked
+            .browser_request_at(&next, std::time::Instant::now())
+            .unwrap();
+        checked.activate(&key).unwrap()
+    };
+    ready(&current).await;
+    let (answer, _) = current.evidence_response().unwrap();
+    let (_, source) = answer.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("newOwner"));
+    answer.finish(()).unwrap();
+    assert!(old.evidence_response().is_err());
+}
