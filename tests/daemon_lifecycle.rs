@@ -481,6 +481,70 @@ async fn released_checkout_reads_prior_head_during_h_without_claiming_fifo() {
 }
 
 #[tokio::test]
+async fn initial_h_reclassifies_obsolete_current_head_and_recreates_without_stranding_ex() {
+    let (base, id, mut registry, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    registry.attach_launch(1, &id).unwrap();
+    let first = registry.activate(&id.root_key).unwrap();
+    ready(&first).await;
+    let (prior, _) = first.evidence_response().unwrap();
+    let generation = prior.status().unwrap().revision.index_generation;
+    prior.finish(()).unwrap();
+    drop(prior);
+    registry.disconnect_at(1, now);
+    assert!(registry.release(&id.root_key).unwrap());
+
+    registry.attach_launch(2, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successor did not elect its initial H owner");
+    let index = roots.index_db(&id);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+    )
+    .unwrap();
+    drop(db);
+    // A read on this activated runtime, not a second Store's private state,
+    // classifies the genuine obsolete on-disk index during its paused H.
+    let error = runtime
+        .evidence_response()
+        .err()
+        .expect("obsolete head refused");
+    assert!(error.to_string().contains("recovery_required"), "{error:#}");
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response() {
+                let status = response.status();
+                let finished = response.finish(());
+                if !catching_up && finished.is_ok() {
+                    let status = status.unwrap();
+                    assert_ne!(status.revision.index_generation, generation);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("genuine mid-initial-H RecreatePending stranded old EX");
+}
+
+#[tokio::test]
 async fn initial_h_root_loss_keeps_exact_ex_until_old_fifo_is_terminal() {
     let (base, id, mut registry, now) = fixture();
     let roots =
