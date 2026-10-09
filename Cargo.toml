@@ -6,6 +6,9 @@ description = "Local diagram-first code index and daemon"
 license = "BUSL-1.1"
 publish = false
 
+[features]
+test-causal-witness = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"

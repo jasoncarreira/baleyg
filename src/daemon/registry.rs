@@ -1,15 +1,10 @@
 //! In-memory checkout admission. Retained entries never own checkout resources.
 use crate::store::{
-    PreHReadPermit, Store,
+    Store,
     topology::{LeaderSession, TopologyRoots, WorkspaceIdentity},
 };
-use crate::{
-    http,
-    index_coordinator::{IndexJobCoordinator, establish_serving_session},
-    indexer::IndexOptions,
-    model::CancelFlag,
-};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::{http, indexer::IndexOptions, model::CancelFlag};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -157,8 +152,6 @@ pub struct CheckoutRegistry {
     entries: HashMap<String, Entry>,
     roots: Option<TopologyRoots>,
     runtimes: HashMap<String, Arc<CheckoutRuntime>>,
-    idle_permits: HashMap<String, PreHReadPermit>,
-    idle_epochs: HashMap<String, Arc<AtomicU64>>,
     idle_exit_at: Option<Instant>,
     orphan_scan_cache: Option<(Instant, bool)>,
     orphan_scan_count: u64,
@@ -181,8 +174,6 @@ impl CheckoutRegistry {
             entries: HashMap::new(),
             roots: None,
             runtimes: HashMap::new(),
-            idle_permits: HashMap::new(),
-            idle_epochs: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
             orphan_scan_cache: None,
             orphan_scan_count: 0,
@@ -294,20 +285,8 @@ impl CheckoutRegistry {
                 rust_library: config.rust_library,
             }),
         )?;
-        let permit = self.idle_permits.remove(key);
-        let epoch = self
-            .idle_epochs
-            .remove(key)
-            .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
-        // Epoch binding exists even for cold H: a later independently verified
-        // publication can supply a predecessor without a selected read.
-        store.bind_runtime_epoch(epoch.clone());
-        if let Ok(read) = store.evidence_response() {
-            let _ = store.remember_read_only_predecessor(&read, epoch.clone());
-        }
         let runtime = Arc::new(CheckoutRuntime {
             resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources { store, scheduler }))),
-            epoch,
             phase: std::sync::Mutex::new(RuntimePhase::Reconciling),
             active: AtomicBool::new(true),
             active_reads: Arc::new(AtomicUsize::new(0)),
@@ -315,8 +294,8 @@ impl CheckoutRegistry {
             h_in_flight: AtomicBool::new(true),
             retry_waiting: AtomicBool::new(false),
             pre_h_hook: std::sync::Mutex::new(None),
-            release_permit_fault: AtomicBool::new(false),
         });
+        #[cfg(feature = "test-causal-witness")]
         if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
             runtime
                 .resources()?
@@ -324,7 +303,7 @@ impl CheckoutRegistry {
                 .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
         }
         self.runtimes.insert(key.to_owned(), runtime.clone());
-        runtime.start(options, permit, explicit_options);
+        runtime.start(options, explicit_options);
         Ok(runtime)
     }
 
@@ -349,16 +328,13 @@ impl CheckoutRegistry {
         let mut phase = runtime.phase.lock().unwrap();
         CheckoutRuntime::refresh_phase(&mut phase, &resources);
         if runtime.h_in_flight.load(Ordering::Acquire)
-            || (matches!(*phase, RuntimePhase::Transitional(_, _))
+            || (matches!(*phase, RuntimePhase::HOwned(_))
                 && !runtime.retry_waiting.load(Ordering::Acquire))
             || runtime.active_reads.load(Ordering::Acquire) != 0
         {
             return Ok(false);
         }
-        runtime.epoch.fetch_add(1, Ordering::AcqRel);
-        let permit = runtime.release_permit(&phase, &resources).ok().flatten();
         runtime.active.store(false, Ordering::Release);
-        resources.store.notify_owner_validation_release();
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
         runtime.resources.lock().unwrap().take();
@@ -366,11 +342,6 @@ impl CheckoutRegistry {
         drop(phase);
         drop(resources);
         self.runtimes.remove(key);
-        if let Some(permit) = permit {
-            self.idle_epochs
-                .insert(key.to_owned(), runtime.epoch.clone());
-            self.idle_permits.insert(key.to_owned(), permit);
-        }
         Ok(true)
     }
 
@@ -715,8 +686,6 @@ impl CheckoutRegistry {
             return Err(SelectionError::IdentityChanged);
         }
         self.entries.remove(key);
-        self.idle_permits.remove(key);
-        self.idle_epochs.remove(key);
         Ok(())
     }
 
@@ -1276,7 +1245,6 @@ struct ActiveResources {
 /// A failed H retains no claim authority; the worker retries while attached.
 pub struct CheckoutRuntime {
     resources: std::sync::Mutex<Option<Arc<ActiveResources>>>,
-    epoch: Arc<AtomicU64>,
     phase: std::sync::Mutex<RuntimePhase>,
     active: AtomicBool,
     active_reads: Arc<AtomicUsize>,
@@ -1284,12 +1252,12 @@ pub struct CheckoutRuntime {
     h_in_flight: AtomicBool,
     retry_waiting: AtomicBool,
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    release_permit_fault: AtomicBool,
 }
 
 enum RuntimePhase {
     Reconciling,
-    Transitional(PreHReadPermit, Arc<LeaderSession>),
+    /// Owns initial-H's elected EX until failed old-root FIFO rows are durable.
+    HOwned(Arc<LeaderSession>),
     Ready(Arc<LeaderSession>),
 }
 
@@ -1310,6 +1278,7 @@ impl CheckoutRuntime {
     /// Invoked through a weak edge AFTER a queue tick releases all stream and
     /// watcher locks. This is a snapshot of the current verified H owner, not a
     /// claim that H ran again when a serving watcher gets a new epoch.
+    #[cfg(feature = "test-causal-witness")]
     pub(crate) fn report_causal_h_ready(&self, scheduler: &Arc<http::DaemonState>) {
         if !self.active.load(Ordering::Acquire) || self.h_in_flight.load(Ordering::Acquire) {
             return;
@@ -1434,7 +1403,7 @@ impl CheckoutRuntime {
     /// serving owner. A stale follower cannot describe an in-progress takeover
     /// as ready; the new leader appears only after mandatory H commits.
     fn refresh_phase(phase: &mut RuntimePhase, resources: &ActiveResources) {
-        if matches!(phase, RuntimePhase::Transitional(_, _)) {
+        if matches!(phase, RuntimePhase::HOwned(_)) {
             return;
         }
         match resources.scheduler.checkout_serving_owner() {
@@ -1514,16 +1483,9 @@ impl CheckoutRuntime {
             || Self::queue_pending(&resources)
     }
 
-    /// Snapshot freshness and the read basis are sampled under the same phase
-    /// lock. The Store's own finish fence then validates the admitted revision.
+    /// Read admission belongs to the Store's verified paired-head snapshot.
+    /// H, watcher and FIFO progress affect freshness, never read availability.
     pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
-        self.evidence_response_with_validation_wait(true)
-    }
-
-    fn evidence_response_with_validation_wait(
-        &self,
-        allow_wait: bool,
-    ) -> anyhow::Result<(CheckoutEvidence, bool)> {
         let mut phase = self.phase.lock().unwrap();
         anyhow::ensure!(
             self.active.load(Ordering::Acquire),
@@ -1535,62 +1497,7 @@ impl CheckoutRuntime {
             || !matches!(*phase, RuntimePhase::Ready(_))
             || resources.scheduler.checkout_watch_pending()
             || Self::queue_pending(&resources);
-        let admitted = match &*phase {
-            RuntimePhase::Transitional(permit, leader) => resources
-                .store
-                .evidence_response_pre_h(permit, leader.clone()),
-            RuntimePhase::Reconciling | RuntimePhase::Ready(_) => {
-                resources.store.evidence_response()
-            }
-        };
-        let response = match admitted {
-            Ok(response) => response,
-            Err(error) => {
-                if !allow_wait
-                    || error
-                        .downcast_ref::<crate::store::topology::IndexNotReady>()
-                        .is_none()
-                    || !resources
-                        .store
-                        .has_read_only_predecessor_for_epoch(&self.epoch)
-                {
-                    return Err(error);
-                }
-                resources.store.verify_root()?;
-                let epoch = self.epoch.load(Ordering::Acquire);
-                // The gate begins before a new EX may write its incarnation.
-                // Do not hold phase/registry locks while it publishes proof.
-                drop(phase);
-                if !resources.store.restricted_owner_associated()
-                    && resources.store.owner_validation_pending()
-                    && !resources
-                        .store
-                        .wait_for_restricted_owner(Duration::from_secs(5))
-                {
-                    return Err(error);
-                }
-                anyhow::ensure!(
-                    self.active.load(Ordering::Acquire)
-                        && self.epoch.load(Ordering::Acquire) == epoch,
-                    "index_not_ready: checkout epoch changed"
-                );
-                resources.store.verify_root()?;
-                if let Ok(response) = resources.store.restricted_predecessor_read() {
-                    self.active_reads.fetch_add(1, Ordering::AcqRel);
-                    return Ok((
-                        CheckoutEvidence {
-                            response,
-                            reads: self.active_reads.clone(),
-                            selection: None,
-                        },
-                        true,
-                    ));
-                }
-                // Metadata may already be rebound by the time this task runs.
-                // One fresh strict admission then decides; never infer a head.
-                return self.evidence_response_with_validation_wait(false);
-            }
-        };
+        let response = resources.store.evidence_response()?;
         self.active_reads.fetch_add(1, Ordering::AcqRel);
         Ok((
             CheckoutEvidence {
@@ -1617,48 +1524,15 @@ impl CheckoutRuntime {
         Ok((response, catching_up))
     }
 
-    #[doc(hidden)]
-    pub fn fail_next_release_permit_for_tests(&self) {
-        self.release_permit_fault.store(true, Ordering::Release);
-    }
-
-    fn release_permit(
-        &self,
-        phase: &RuntimePhase,
-        resources: &ActiveResources,
-    ) -> anyhow::Result<Option<PreHReadPermit>> {
-        let RuntimePhase::Ready(session) = phase else {
-            return Ok(None);
-        };
-        if self.release_permit_fault.swap(false, Ordering::AcqRel) {
-            anyhow::bail!("index_not_ready: no admissible prior head");
-        }
-        if !session.is_leader() {
-            return Ok(None);
-        }
-        let response = resources.store.evidence_response()?;
-        Ok(Some(resources.store.pre_h_read_permit(
-            &response,
-            session,
-            self.epoch.clone(),
-        )?))
-    }
-
-    fn start(
-        self: &Arc<Self>,
-        options: IndexOptions,
-        permit: Option<PreHReadPermit>,
-        explicit_options: bool,
-    ) {
+    fn start(self: &Arc<Self>, options: IndexOptions, explicit_options: bool) {
         let runtime = self.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             loop {
                 let worker = runtime.clone();
                 let options = options.clone();
-                let permit = permit.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
-                    worker.reconcile(&options, permit, explicit_options)
+                    worker.reconcile(&options, explicit_options)
                 })
                 .await;
                 match outcome {
@@ -1671,25 +1545,11 @@ impl CheckoutRuntime {
                             break;
                         }
                         *runtime.phase.lock().unwrap() = RuntimePhase::Ready(session);
-                        if let Ok(resources) = runtime.resources()
-                            && let Ok(read) = resources.store.evidence_response()
-                            && let Ok(status) = read.status()
-                            && let Ok(status) = read.finish(status)
-                            && status.evidence_format.is_some()
-                            && status.revision.index_revision > 0
-                        {
-                            let _ = resources
-                                .store
-                                .remember_read_only_predecessor(&read, runtime.epoch.clone());
-                        }
                         *runtime.last_error.lock().unwrap() = None;
                         runtime.h_in_flight.store(false, Ordering::Release);
                         break;
                     }
                     result => {
-                        if let Ok(resources) = runtime.resources() {
-                            resources.store.revoke_restricted_predecessor();
-                        }
                         {
                             let mut failure = runtime.last_error.lock().unwrap();
                             if failure.is_none() {
@@ -1736,7 +1596,7 @@ impl CheckoutRuntime {
         }
         let mut phase = self.phase.lock().unwrap();
         match &*phase {
-            RuntimePhase::Transitional(_, session) => {
+            RuntimePhase::HOwned(session) => {
                 if resources.store.fail_changed_root_requests(session).is_err() {
                     return false;
                 }
@@ -1753,68 +1613,37 @@ impl CheckoutRuntime {
     fn reconcile(
         &self,
         options: &IndexOptions,
-        permit: Option<PreHReadPermit>,
         explicit_options: bool,
     ) -> anyhow::Result<Arc<LeaderSession>> {
         let resources = self.resources()?;
         let store = &resources.store;
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        if let Some(permit) = permit {
-            let retained = match &*self.phase.lock().unwrap() {
-                RuntimePhase::Transitional(_, session) if session.verify().is_ok() => {
-                    Some(session.clone())
-                }
-                _ => None,
-            };
-            match retained
-                .map(Ok)
-                .unwrap_or_else(|| store.leader_for_idle_reattach(&permit))
-            {
-                Ok(session) => {
-                    *self.phase.lock().unwrap() =
-                        RuntimePhase::Transitional(permit, session.clone());
-                    if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
-                        hook();
-                    }
-                    store
-                        .fail_changed_root_requests(&session)
-                        .map_err(|e| anyhow::anyhow!("pre-H root requests: {e:#}"))?;
-                    let selected = if explicit_options {
-                        options.clone()
-                    } else {
-                        store
-                            .recorded_index_options()?
-                            .unwrap_or_else(|| options.clone())
-                    };
-                    IndexJobCoordinator::prepare_with_session(store, None, session.clone())
-                        .map_err(|e| anyhow::anyhow!("pre-H preparation: {e:#}"))?
-                        .run_serving(&selected, &cancel, |_| {})
-                        .map_err(|e| anyhow::anyhow!("pre-H publication: {e:#}"))?;
-                    session.verify()?;
-                    return Ok(session);
-                }
-                Err(error) if crate::store::transient_storage_contention(&error) => {
-                    // An external standalone owner wins. Never try the stale
-                    // permit as a follower or claim its queued requests.
-                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
-                    return store.follower_session();
-                }
-                Err(_) => {
-                    *self.phase.lock().unwrap() = RuntimePhase::Reconciling;
-                }
-            }
-        }
-        if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
-            hook();
-        }
-        // Implicit CLI/MCP activation must not overwrite a published head's
-        // recorded SCIP, manifest or size options with daemon defaults.
-        // A different root inode at the same path must recreate its own index;
-        // the former checkout's recorded options are not authority for it.
+        // Implicit CLI/MCP activation must retain a published head's recorded
+        // options. A replaced root recreates its own index instead.
         let supplied = explicit_options
             || store.is_recreate_pending()
             || store.recorded_index_options()?.is_none();
-        establish_serving_session(store, supplied.then_some(options), &cancel)
+        let retained = match &*self.phase.lock().unwrap() {
+            // Even after root loss, keep this exact old EX while its FIFO
+            // failure is retried. Re-electing here could drop it prematurely.
+            RuntimePhase::HOwned(session) => Some(session.clone()),
+            _ => None,
+        };
+        // The elected EX is held by HOwned as soon as it exists. If an initial-H
+        // error follows root loss, retire_lost_root_h must fail every old-root
+        // FIFO row before the final EX lease is dropped or this worker retries.
+        crate::index_coordinator::establish_serving_session_observed(
+            store,
+            supplied.then_some(options),
+            &cancel,
+            retained,
+            |session| {
+                *self.phase.lock().unwrap() = RuntimePhase::HOwned(session);
+                if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
+                    hook();
+                }
+            },
+        )
     }
 }
 
