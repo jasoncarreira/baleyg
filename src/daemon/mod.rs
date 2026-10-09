@@ -4,7 +4,7 @@ pub mod protocol;
 pub mod registry;
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
@@ -171,6 +171,35 @@ pub async fn run_idle_lifecycle(
     }
 }
 
+/// Observe token data and identity through the same checked descriptor.
+fn checked_token(path: &Path) -> anyhow::Result<(String, (u64, u64))> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.mode() & 0o777 == 0o600
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.nlink() == 1,
+        "insecure token file"
+    );
+    let mut token = String::new();
+    file.by_ref().take(65).read_to_string(&mut token)?;
+    anyhow::ensure!(crate::auth::valid_token(&token), "invalid token file");
+    Ok((token, (metadata.dev(), metadata.ino())))
+}
+
+fn check_token_path(path: &Path, inode: (u64, u64)) -> anyhow::Result<()> {
+    let named = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        named.is_file() && !named.file_type().is_symlink() && (named.dev(), named.ino()) == inode,
+        "serve token file identity changed"
+    );
+    Ok(())
+}
+
 /// Browser HTTP is absent until explicit serve registration succeeds. The
 /// provisioner belongs to the elected daemon, not a checkout attachment.
 pub struct BrowserProvisioner {
@@ -228,22 +257,40 @@ impl BrowserProvisioner {
         bind: std::net::SocketAddr,
         token_file: &Path,
     ) -> anyhow::Result<std::net::SocketAddr> {
+        self.register_serve_with_hook(registry, identity, options, bind, token_file, None)
+            .await
+    }
+
+    /// Hook for deterministic boundary tests; invoked while registration holds its guard.
+    #[doc(hidden)]
+    pub async fn register_serve_with_hook(
+        &mut self,
+        registry: &std::sync::Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+        identity: &crate::store::topology::WorkspaceIdentity,
+        options: registry::CheckoutOptions,
+        bind: std::net::SocketAddr,
+        token_file: &Path,
+        mut hook: Option<&mut dyn FnMut(&'static str)>,
+    ) -> anyhow::Result<std::net::SocketAddr> {
         anyhow::ensure!(
             bind.ip().is_loopback(),
             "only loopback bind addresses are supported"
         );
         let parent = token_file
             .parent()
-            .ok_or_else(|| anyhow::anyhow!("token file needs a parent"))?;
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         let file = token_file
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("token file needs a name"))?;
         let token_path = parent.canonicalize()?.join(file);
-        {
-            let checked = registry.lock().await;
-            checked
-                .can_register(identity, &options)
-                .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        // The held guard covers validation, binding, token creation and commit.
+        let mut checked = registry.lock().await;
+        checked
+            .can_register(identity, &options)
+            .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
+        if let Some(hook) = hook.as_mut() {
+            hook("validated");
         }
         if let Some(original) = self.requested_bind {
             anyhow::ensure!(self.address().is_some(), "browser listener closed");
@@ -255,19 +302,20 @@ impl BrowserProvisioner {
                 self.token_path.as_ref() == Some(&token_path),
                 "serve token file conflicts with running listener"
             );
-            let metadata = fs::metadata(&token_path)?;
+            let (token, inode) = checked_token(&token_path)?;
+            if let Some(hook) = hook.as_mut() {
+                hook("token_observed");
+            }
+            check_token_path(&token_path, inode)?;
             anyhow::ensure!(
-                self.token_inode == Some((metadata.dev(), metadata.ino())),
+                self.token_inode == Some(inode),
                 "serve token file identity changed"
             );
-            let token = crate::auth::load_or_create_token(&token_path)?;
             anyhow::ensure!(
                 self.token.as_ref() == Some(&token),
                 "serve token contents changed"
             );
-            registry
-                .lock()
-                .await
+            checked
                 .register(identity, options)
                 .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
             return self
@@ -276,13 +324,15 @@ impl BrowserProvisioner {
         }
         let listener = tokio::net::TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
-        let token = crate::auth::load_or_create_token(&token_path)?;
-        let metadata = fs::metadata(&token_path)?;
+        crate::auth::load_or_create_token(&token_path)?;
+        let (token, inode) = checked_token(&token_path)?;
+        if let Some(hook) = hook.as_mut() {
+            hook("token_observed");
+        }
+        check_token_path(&token_path, inode)?;
         let browser =
             crate::http::ProvisionedBrowser::new(registry.clone(), token.clone(), address)?;
-        registry
-            .lock()
-            .await
+        checked
             .register(identity, options)
             .map_err(|error| anyhow::anyhow!("{}", error.reason()))?;
         self.listener = Some(listener);
@@ -290,7 +340,7 @@ impl BrowserProvisioner {
         self.browser = Some(browser);
         self.requested_bind = Some(bind);
         self.token_path = Some(token_path);
-        self.token_inode = Some((metadata.dev(), metadata.ino()));
+        self.token_inode = Some(inode);
         self.token = Some(token);
         Ok(address)
     }

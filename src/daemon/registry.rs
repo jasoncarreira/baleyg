@@ -79,6 +79,7 @@ pub struct BrowserOptions {
     pub max_file_bytes: u64,
     pub rust_source_roots: Vec<(String, PathBuf)>,
     pub rust_library: Option<PathBuf>,
+    pub trusted_rustc: Option<PathBuf>,
     pub cargo_home: Option<PathBuf>,
     pub jev_budget_dir: Option<PathBuf>,
     pub jev_budget_cents: Option<u64>,
@@ -95,6 +96,7 @@ impl Default for BrowserOptions {
             max_file_bytes: 2_097_152,
             rust_source_roots: Vec::new(),
             rust_library: None,
+            trusted_rustc: None,
             cargo_home: None,
             jev_budget_dir: None,
             jev_budget_cents: None,
@@ -395,10 +397,84 @@ impl CheckoutRegistry {
         {
             return Err(SelectionError::Unavailable);
         }
+        if config.rust_source_roots.len() > 8 {
+            return Err(SelectionError::Unavailable);
+        }
+        let mut labels = HashSet::new();
+        for (label, root) in &config.rust_source_roots {
+            if label.is_empty()
+                || label.len() > 48
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !labels.insert(label)
+                || !root.is_absolute()
+                || !root.is_dir()
+            {
+                return Err(SelectionError::Unavailable);
+            }
+        }
+        if config.jev_budget_dir.is_some()
+            && std::env::var("JEV_KEY").map_or(true, |key| key.is_empty())
+        {
+            return Err(SelectionError::Unavailable);
+        }
+        if let (Some(runner), Some(state)) = (&config.acp_runner, &config.acp_state_dir) {
+            let workspace = identity
+                .root
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?;
+            let runner = runner
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?;
+            if !runner.is_file()
+                || runner.starts_with(&workspace)
+                || state
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            let mut ancestor = state.as_path();
+            while !ancestor
+                .try_exists()
+                .map_err(|_| SelectionError::Unavailable)?
+            {
+                ancestor = ancestor.parent().ok_or(SelectionError::Unavailable)?;
+            }
+            if ancestor
+                .canonicalize()
+                .map_err(|_| SelectionError::Unavailable)?
+                .starts_with(&workspace)
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            if state.exists() {
+                let m = fs::symlink_metadata(state).map_err(|_| SelectionError::Unavailable)?;
+                if !m.is_dir()
+                    || m.file_type().is_symlink()
+                    || m.uid() != unsafe { libc::geteuid() }
+                    || m.mode() & 0o777 != 0o700
+                {
+                    return Err(SelectionError::Unavailable);
+                }
+            }
+        }
+        if let Some(compiler) = &config.trusted_rustc
+            && (!compiler.is_absolute()
+                || !compiler.is_file()
+                || compiler
+                    .canonicalize()
+                    .map_err(|_| SelectionError::Unavailable)?
+                    .starts_with(&identity.root))
+        {
+            return Err(SelectionError::Unavailable);
+        }
         for path in [
             config.scip,
             config.manifest,
             config.rust_library,
+            config.trusted_rustc,
             config.cargo_home,
             config.jev_budget_dir,
             config.acp_runner,
@@ -408,11 +484,6 @@ impl CheckoutRegistry {
         .flatten()
         {
             if !path.is_absolute() {
-                return Err(SelectionError::Unavailable);
-            }
-        }
-        for (_, root) in config.rust_source_roots {
-            if !root.is_absolute() || !root.is_dir() {
                 return Err(SelectionError::Unavailable);
             }
         }
