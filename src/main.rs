@@ -430,7 +430,9 @@ async fn main() -> Result<()> {
             let (_, identity) = args.resolve_unattached()?;
             let socket = socket_path()?;
             let stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))?;
-            client::relay_stdio(stream, &identity)?;
+            client::relay_stdio(stream, &identity, || {
+                client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+            })?;
         }
         Command::Gc(_) => print_json(&TopologyRoots::production()?.gc_report()?)?,
         Command::Forget(args) => {

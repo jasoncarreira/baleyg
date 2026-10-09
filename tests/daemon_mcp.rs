@@ -15,7 +15,6 @@ struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<Value>,
-    stderr: PathBuf,
     reaped: bool,
 }
 impl Peer {
@@ -51,7 +50,6 @@ impl Peer {
             stdin: child.stdin.take(),
             child,
             lines,
-            stderr,
             reaped: false,
         }
     }
@@ -85,20 +83,6 @@ impl Peer {
                 break;
             }
             assert!(Instant::now() < deadline, "MCP client did not finish");
-            std::thread::yield_now();
-        }
-    }
-    fn interrupted(mut self) -> (bool, String) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                self.reaped = true;
-                return (status.success(), fs::read_to_string(&self.stderr).unwrap());
-            }
-            assert!(
-                Instant::now() < deadline,
-                "MCP client did not observe daemon death"
-            );
             std::thread::yield_now();
         }
     }
@@ -303,23 +287,128 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
-    let (success, stderr) = client.interrupted();
-    assert!(!success, "daemon death cannot be a clean MCP EOF");
-    assert!(stderr.contains("daemon_unavailable"), "{stderr}");
-    let mut recovered = Peer::start(home.path(), &root);
-    assert_eq!(
-        recovered.ask(
-            2,
-            "server/discover",
-            json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}})
-        )["id"],
-        2
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "original MCP client exited"
     );
-    recovered.finish_unreaped();
+    let recovered = client.ask(
+        2,
+        "server/discover",
+        json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}),
+    );
+    assert_eq!(recovered["id"], 2);
+    assert!(recovered["result"].is_object(), "{recovered}");
+    client.finish_unreaped();
     assert_elected(home.path());
-    unsafe { libc::kill(-(recovered.child.id() as libc::pid_t), libc::SIGKILL) };
-    assert!(recovered.child.wait().unwrap().success());
-    recovered.reaped = true;
+    unsafe { libc::kill(-(client.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(client.child.wait().unwrap().success());
+    client.reaped = true;
+}
+
+#[test]
+fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&root, &["init", "--quiet"]);
+    git(
+        &root,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = home.path().join("linked");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let linked = linked.canonicalize().unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _socket = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let init = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0", "method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    assert_eq!(peer.ask(2, "tools/list", json!({}))["id"], 2);
+    let selected = peer.ask(
+        20,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1,"workspace":linked}
+        }),
+    );
+    assert_eq!(
+        selected["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(peer.child.try_wait().unwrap().is_none());
+    let result = peer.ask(
+        3,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1,"workspace":linked}
+        }),
+    );
+    assert_eq!(result["id"], 3, "{result}");
+    assert_eq!(
+        result["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert_eq!(result["result"]["structuredContent"]["requestId"], 3);
+    peer.finish_unreaped();
+    assert_elected(home.path());
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
 }
 
 #[test]
@@ -433,6 +522,9 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         })
     )
     .unwrap();
+    // A truncated daemon response is never released to stdout. The thin
+    // client remains alive and emits one typed failure for the admitted call.
+    child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -440,7 +532,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
         assert!(
             Instant::now() < deadline,
-            "client did not exit after partial reply"
+            "client did not finish after stdin EOF"
         );
         std::thread::yield_now();
     };
@@ -469,11 +561,17 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
         "client reattached after an interrupted MCP response"
     );
-    assert!(!status.success());
-    assert!(
-        stdout.is_empty(),
-        "partial daemon reply leaked to MCP stdout"
+    assert!(status.success(), "{stderr}");
+    let responses: Vec<Value> = stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(
+        responses.len(),
+        1,
+        "no partial or duplicate stdout: {responses:?}"
     );
-    assert!(stderr.contains("daemon_unavailable"), "{stderr}");
-    assert!(!stderr.contains("partial MCP response"), "{stderr}");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["error"]["data"]["code"], "daemon_unavailable");
 }
