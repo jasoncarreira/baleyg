@@ -1142,11 +1142,19 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         acp_max_attempts: args.acp_max_attempts,
     };
     let mut options_json = serde_json::to_value(options)?;
+    let fields = options_json
+        .as_object_mut()
+        .expect("browser options object");
+    // Only index options actually supplied by this caller can supersede a
+    // durable option. Other BrowserOptions fields retain their normal shape.
+    if args.index.scip.is_none() {
+        fields.remove("scip");
+    }
+    if args.index.manifest.is_none() {
+        fields.remove("manifest");
+    }
     if args.index.max_file_bytes.is_none() {
-        options_json
-            .as_object_mut()
-            .expect("browser options object")
-            .remove("maxFileBytes");
+        fields.remove("maxFileBytes");
     }
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
@@ -1287,11 +1295,17 @@ mod serve_option_transport_tests {
     fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
         let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
         let mut omitted = options.clone();
-        omitted.as_object_mut().unwrap().remove("maxFileBytes");
+        for key in ["scip", "manifest", "maxFileBytes"] {
+            omitted.as_object_mut().unwrap().remove(key);
+        }
         let absent = checked_serve_options(omitted).unwrap();
         let explicit = checked_serve_options(options).unwrap();
-        assert!(absent.0.get("maxFileBytes").is_none(), "{}", absent.0);
+        for key in ["scip", "manifest", "maxFileBytes"] {
+            assert!(absent.0.get(key).is_none(), "{}", absent.0);
+        }
         assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
+        assert_eq!(explicit.0.get("scip"), Some(&serde_json::Value::Null));
+        assert_eq!(explicit.0.get("manifest"), Some(&serde_json::Value::Null));
     }
 }
 

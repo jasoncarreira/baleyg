@@ -163,7 +163,19 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
         "omission became explicit: {}",
         options[0]
     );
+    assert!(
+        options[0].get("scip").is_none(),
+        "omitted SCIP became explicit: {}",
+        options[0]
+    );
+    assert!(
+        options[0].get("manifest").is_none(),
+        "omitted manifest became explicit: {}",
+        options[0]
+    );
     assert_eq!(options[1]["maxFileBytes"], 2_097_152, "{}", options[1]);
+    assert!(options[1].get("scip").is_none(), "{}", options[1]);
+    assert!(options[1].get("manifest").is_none(), "{}", options[1]);
     drop(owner);
 }
 
