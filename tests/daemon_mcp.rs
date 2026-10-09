@@ -414,7 +414,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
 #[test]
 fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
     use std::os::unix::net::UnixListener;
-    for count in [1usize, 16usize, 18usize, 19usize] {
+    for count in [1usize, 16usize, 18usize, 24usize, 25usize, 26usize] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
         let phase_path = PathBuf::from(format!(
@@ -466,13 +466,33 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             String::new()
         };
         for n in 0..count {
-            let call = if (16..18).contains(&n) {
-                json!({"jsonrpc":"2.0","id":100+n,"method":"tools/call",
+            let id = if count >= 25 && (n == 8 || n == 24) {
+                8
+            } else {
+                100 + n
+            };
+            let call = match n {
+                16 | 17 | 24 if n != 24 || count == 26 => {
+                    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
                     "params":{"name":"baleyg_workspace_describe",
                         "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
-            } else {
-                json!({"jsonrpc":"2.0","id":100+n,"method":"tools/list","params":metadata})
+                }
+                19 => json!({"jsonrpc":"2.0","id":119,"method":"no/such/method","params":metadata}),
+                20 => json!({"jsonrpc":"2.0","id":120,"method":"tools/call",
+                    "params":{"name":"unknown_tool","arguments":{},"_meta":metadata["_meta"]}}),
+                21 => json!({"jsonrpc":"2.0","id":121,"method":"tools/list",
+                    "params":{"cursor":"unexpected","_meta":metadata["_meta"]}}),
+                22 => json!({"jsonrpc":"2.0","id":122,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}}),
+                23 => json!({"jsonrpc":"2.0","id":123,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+                        "_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01",
+                            "io.modelcontextprotocol/clientCapabilities":{}}}}),
+                _ => json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":metadata}),
             };
+            if count == 26 && n == 24 {
+                burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":8}}\n");
+            }
             burst.push_str(&call.to_string());
             burst.push('\n');
         }
@@ -514,12 +534,45 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                     *envelope
                 );
             }
-            if count == 19 {
-                let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-                assert_eq!(refused["id"], 118, "{refused}");
-                assert_eq!(refused["error"]["code"], -32000, "{refused}");
-                assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
-                assert!(refused.get("result").is_none(), "{refused}");
+            if count >= 24 {
+                for (id, code) in [
+                    (118, -32000),
+                    (119, -32601),
+                    (120, -32602),
+                    (121, -32602),
+                    (122, -32602),
+                    (123, -32022),
+                ] {
+                    let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(refused["id"], id, "{refused}");
+                    assert_eq!(refused["error"]["code"], code, "{refused}");
+                    assert!(refused.get("result").is_none(), "{refused}");
+                    if id == 118 {
+                        assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
+                    }
+                    if id == 123 {
+                        assert_eq!(refused["error"]["data"]["requested"], "2099-01-01");
+                    }
+                }
+                if count >= 25 {
+                    let duplicate = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(duplicate["id"], 8, "{duplicate}");
+                    if count == 25 {
+                        assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+                        assert!(duplicate.get("result").is_none(), "{duplicate}");
+                    } else {
+                        // The earlier queued ID8 was canceled before this new admission.
+                        assert_eq!(duplicate["result"]["isError"], true, "{duplicate}");
+                        assert_eq!(duplicate["result"]["structuredContent"]["requestId"], 8);
+                        assert_eq!(
+                            duplicate["result"]["structuredContent"]["error"]["reason"],
+                            "unavailable"
+                        );
+                        let extra = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                        assert_eq!(extra["id"], 125, "{extra}");
+                        assert_eq!(extra["error"]["code"], -32000, "{extra}");
+                    }
+                }
             }
         }
         phase.write_all(b"x").unwrap();
@@ -532,9 +585,21 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
         }
         for n in 0..count.min(16) {
+            if count == 26 && n == 8 {
+                continue;
+            }
             let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(reply["id"], 100 + n, "cancelled/queued response: {reply}");
+            assert_eq!(
+                reply["id"],
+                if count >= 25 && n == 8 { 8 } else { 100 + n },
+                "cancelled/queued response: {reply}"
+            );
             assert!(reply["result"].is_object(), "{reply}");
+        }
+        if count >= 25 {
+            let reused = peer.ask(8, "tools/list", metadata.clone());
+            assert_eq!(reused["id"], 8, "{reused}");
+            assert!(reused["result"].is_object(), "{reused}");
         }
         assert!(
             peer.lines.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -685,6 +750,15 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
 
 #[test]
 fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
+    check_legacy_synthetic_reattach_cancel(1);
+}
+
+#[test]
+fn legacy_pending_call_cancel_during_synthetic_reattach_is_silent() {
+    check_legacy_synthetic_reattach_cancel(5);
+}
+
+fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
@@ -779,7 +853,7 @@ fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
                     )
                     .unwrap();
                 }
-                "notifications/cancelled" => assert_eq!(value["params"]["requestId"], 1),
+                "notifications/cancelled" => assert_eq!(value["params"]["requestId"], cancel_id),
                 "notifications/initialized" => (),
                 "tools/list" => {
                     assert_eq!(value["id"], 5);
@@ -814,6 +888,12 @@ fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
                 .count(),
             1
         );
+        if cancel_id == 5 {
+            assert!(
+                !steps.contains(&"tools/list".to_owned()),
+                "canceled ID5 reached daemon: {steps:?}"
+            );
+        }
     });
     writeln!(
         peer.stdin.as_mut().unwrap(),
@@ -828,7 +908,7 @@ fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
         peer.stdin.as_mut().unwrap(),
         "{}",
         json!({
-            "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}
+            "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":cancel_id}
         })
     )
     .unwrap();
@@ -837,9 +917,16 @@ fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
         "setup replied while attach paused"
     );
     release_tx.send(()).unwrap();
-    let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
-    assert_eq!(list["id"], 5, "{list}");
-    assert!(list["result"]["tools"].is_array(), "{list}");
+    if cancel_id == 5 {
+        assert!(
+            peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+            "canceled pending ID5 produced stdout"
+        );
+    } else {
+        let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(list["id"], 5, "{list}");
+        assert!(list["result"]["tools"].is_array(), "{list}");
+    }
     let call = peer.ask(
         6,
         "tools/call",
@@ -850,6 +937,60 @@ fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
     assert_eq!(call["id"], 6, "{call}");
     assert_eq!(call["result"]["isError"], false, "{call}");
     fake.join().unwrap();
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+}
+
+#[test]
+fn legacy_await_initialized_refuses_tool_after_daemon_death() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let init = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let rejected = peer.ask(
+        2,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+        }),
+    );
+    assert_eq!(rejected["id"], 2, "{rejected}");
+    assert_eq!(rejected["error"]["code"], -32600, "{rejected}");
+    assert!(rejected.get("result").is_none(), "{rejected}");
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    let ready = peer.ask(3, "tools/list", json!({}));
+    assert_eq!(ready["id"], 3, "{ready}");
+    assert!(ready["result"].is_object(), "{ready}");
     peer.finish_unreaped();
     unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
     assert!(peer.child.wait().unwrap().success());
@@ -1060,6 +1201,54 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         *envelope
     );
     failed_attach.join().unwrap();
+    // Even though attach now fails, prior modern mode still defines protocol errors.
+    let metadata = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    for (id, method, params, code) in [
+        (
+            3,
+            "tools/call",
+            json!({"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1}}),
+            -32602,
+        ),
+        (
+            4,
+            "tools/call",
+            json!({"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1},"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2099-01-01",
+                "io.modelcontextprotocol/clientCapabilities":{}}}),
+            -32022,
+        ),
+        (5, "no/such/method", json!({"_meta":metadata}), -32601),
+        (
+            6,
+            "tools/call",
+            json!({"name":"unknown_tool","arguments":{},
+            "_meta":metadata}),
+            -32602,
+        ),
+    ] {
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            json!({
+                "jsonrpc":"2.0","id":id,"method":method,"params":params
+            })
+        )
+        .unwrap();
+        let rejected: Value =
+            serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert_eq!(rejected["id"], id, "{rejected}");
+        assert_eq!(rejected["error"]["code"], code, "{rejected}");
+        assert!(rejected.get("result").is_none(), "{rejected}");
+        if id == 4 {
+            assert_eq!(rejected["error"]["data"]["requested"], "2099-01-01");
+        }
+    }
     child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {

@@ -221,10 +221,66 @@ fn mcp_failure(
         "error":{"code":-32603,"message":"Internal error","data":{"code":code}}})
 }
 
+/// Apply the daemon's own pure admission reducer to protocol decisions that
+/// cannot be delegated to a disconnected or saturated daemon generation.
+fn protocol_event(
+    request: crate::mcp::wire::Request,
+    mode: crate::mcp::session::Mode,
+) -> (crate::mcp::session::Event, crate::mcp::session::Mode) {
+    use crate::mcp::{catalog, session, wire};
+    use serde_json::json;
+    let mut session = session::Session::new();
+    let bootstrap = match mode {
+        session::Mode::Unselected => None,
+        session::Mode::Modern => Some((
+            "server/discover",
+            json!({"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}
+            }}),
+        )),
+        session::Mode::LegacyAwaitInitialized | session::Mode::LegacyReady => Some((
+            "initialize",
+            json!({"protocolVersion":"2025-11-25",
+                "capabilities":{},"clientInfo":{"name":"relay","version":"1"}}),
+        )),
+    };
+    if let Some((method, params)) = bootstrap {
+        let seed = wire::Request {
+            id: Some(json!("relay-bootstrap")),
+            key: Some(wire::IdKey::String("relay-bootstrap".into())),
+            method: method.into(),
+            params: Some(params),
+        };
+        let session::Event::Admitted(admission) = session.accept(seed, catalog::known) else {
+            unreachable!("fixed relay bootstrap must be valid")
+        };
+        let prepared = session
+            .prepare(admission.token, json!(null))
+            .expect("bootstrap pending");
+        session.commit(prepared).expect("bootstrap committed");
+        if mode == session::Mode::LegacyReady {
+            let notification = wire::Request {
+                id: None,
+                key: None,
+                method: "notifications/initialized".into(),
+                params: None,
+            };
+            let _ = session.accept(notification, catalog::known);
+        }
+    }
+    let event = session.accept(request, catalog::known);
+    (event, session.mode())
+}
+
 struct McpInputBuffer<'a> {
     workspace: &'a crate::store::topology::WorkspaceIdentity,
     queue: std::collections::VecDeque<crate::mcp::wire::Frame>,
     cancelled_queued: Vec<serde_json::Value>,
+    mode: crate::mcp::session::Mode,
+    active_id: Option<serde_json::Value>,
+    active_key: Option<crate::mcp::wire::IdKey>,
+    cancelled_active: bool,
 }
 
 /// One bounded stdin reader and one response writer survive daemon generations.
@@ -266,6 +322,10 @@ pub fn relay_stdio(
         workspace,
         queue: std::collections::VecDeque::new(),
         cancelled_queued: Vec::new(),
+        mode: crate::mcp::session::Mode::Unselected,
+        active_id: None,
+        active_key: None,
+        cancelled_active: false,
     };
     let mut receive_bytes = Vec::new();
     let mut stdout = io::stdout().lock();
@@ -300,9 +360,10 @@ pub fn relay_stdio(
             }
         };
         let mut value: serde_json::Value = serde_json::from_slice(&line).expect("decoded MCP line");
-        if let Some(id) = admitted.id {
+        if let Some(id) = admitted.id.clone() {
             value["id"] = id;
         }
+        let request_key = admitted.key.clone();
         let method = value.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let has_id = value.get("id").is_some();
         if has_id
@@ -314,6 +375,24 @@ pub fn relay_stdio(
             buffer.cancelled_queued.remove(at);
             continue;
         }
+        let (event, mode) = protocol_event(admitted, buffer.mode);
+        buffer.mode = mode;
+        match event {
+            crate::mcp::session::Event::Error(error) => {
+                wire::write_response(&mut stdout, &error.response())?;
+                continue;
+            }
+            crate::mcp::session::Event::Admitted(admission)
+                if matches!(admission.action, crate::mcp::session::Action::Unknown) =>
+            {
+                wire::write_response(
+                    &mut stdout,
+                    &wire::ProtocolError::new(-32601, admission.id).response(),
+                )?;
+                continue;
+            }
+            _ => (),
+        }
         let read_only = matches!(
             method,
             "server/discover" | "tools/list" | "tools/call" | "initialize"
@@ -322,9 +401,12 @@ pub fn relay_stdio(
             legacy_init = Some(line.clone());
             legacy_ready = false;
         }
-        if method == "notifications/initialized" {
+        if method == "notifications/initialized" && mode == crate::mcp::session::Mode::LegacyReady {
             legacy_ready = true;
         }
+        buffer.active_id = value.get("id").cloned();
+        buffer.active_key = request_key;
+        buffer.cancelled_active = false;
         let mut sent = line.clone();
         sent.push(b'\n');
         let mut retry = 0;
@@ -392,6 +474,19 @@ pub fn relay_stdio(
                 }
                 break;
             };
+            let mut canceled_before_send = false;
+            drain_mcp_input(
+                stream,
+                &receiver,
+                &mut buffer,
+                &mut stdout,
+                &mut eof,
+                value.get("id"),
+                &mut canceled_before_send,
+            )?;
+            if eof || canceled_before_send || buffer.cancelled_active {
+                break;
+            }
             if stream.write_all(&sent).is_err() {
                 current = None;
             } else if !has_id {
@@ -472,6 +567,9 @@ pub fn relay_stdio(
             }
             retry += 1;
         }
+        buffer.active_id = None;
+        buffer.active_key = None;
+        buffer.cancelled_active = false;
         if eof {
             break;
         }
@@ -534,6 +632,10 @@ fn drain_mcp_input(
                 if let Some(id) = cancellation_id(&frame) {
                     if active_id == Some(&id) {
                         *canceled = true;
+                        buffer.cancelled_active = true;
+                    } else if buffer.active_id.as_ref() == Some(&id) {
+                        // The external call may be popped while synthetic setup runs.
+                        buffer.cancelled_active = true;
                     } else if buffer.queue.iter().any(|frame| {
                         matches!(frame,
                         Frame::Line(line) if wire::decode(Frame::Line(line.clone())).ok()
@@ -559,26 +661,57 @@ fn drain_mcp_input(
                     let response = match wire::decode(frame) {
                         Err(error) => Some(error.response()),
                         Ok(Some(request)) if request.id.is_some() => {
-                            let id = request.id.expect("checked ID");
-                            if request.method == "tools/call"
-                                && request
-                                    .params
-                                    .as_ref()
-                                    .and_then(|p| p.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .is_some_and(crate::mcp::catalog::known)
-                            {
-                                let mut value = decoded.expect("decoded MCP request");
-                                value["id"] = id;
-                                Some(mcp_failure(
-                                    &value,
-                                    "selection_unavailable",
-                                    buffer.workspace,
-                                ))
+                            let id = request.id.clone().expect("checked ID");
+                            let duplicate = request.key.as_ref().is_some_and(|key| {
+                                (!buffer.cancelled_active
+                                    && buffer.active_key.as_ref() == Some(key))
+                                    || buffer.queue.iter().any(|queued| {
+                                        matches!(queued,
+                                        Frame::Line(line) if wire::decode(Frame::Line(line.clone()))
+                                            .ok().flatten().is_some_and(|item|
+                                                item.key.as_ref() == Some(key)
+                                                && item.id.as_ref().is_some_and(|id|
+                                                    !buffer.cancelled_queued.contains(id))))
+                                    })
+                            });
+                            if duplicate {
+                                Some(wire::ProtocolError::new(-32600, id).response())
                             } else {
-                                Some(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                                    "code":-32000,"message":"Relay queue is full",
-                                    "data":{"code":"too_many_requests"}}}))
+                                let (event, _) = protocol_event(request, buffer.mode);
+                                match event {
+                                    crate::mcp::session::Event::Error(error) => {
+                                        Some(error.response())
+                                    }
+                                    crate::mcp::session::Event::Admitted(admission)
+                                        if matches!(
+                                            admission.action,
+                                            crate::mcp::session::Action::Unknown
+                                        ) =>
+                                    {
+                                        Some(wire::ProtocolError::new(-32601, id).response())
+                                    }
+                                    crate::mcp::session::Event::Admitted(admission)
+                                        if matches!(
+                                            admission.action,
+                                            crate::mcp::session::Action::Call { .. }
+                                        ) =>
+                                    {
+                                        let mut value = decoded.expect("decoded MCP request");
+                                        value["id"] = id;
+                                        Some(mcp_failure(
+                                            &value,
+                                            "selection_unavailable",
+                                            buffer.workspace,
+                                        ))
+                                    }
+                                    crate::mcp::session::Event::Admitted(_) => {
+                                        Some(serde_json::json!({
+                                        "jsonrpc":"2.0","id":id,"error":{
+                                            "code":-32000,"message":"Relay queue is full",
+                                            "data":{"code":"too_many_requests"}}}))
+                                    }
+                                    crate::mcp::session::Event::Ignore => None,
+                                }
                             }
                         }
                         _ => None,
