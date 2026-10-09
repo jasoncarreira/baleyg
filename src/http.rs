@@ -6777,7 +6777,10 @@ mod dependency_lifecycle_tests {
         let (browse_status, browse) = call(&app, "/api/files").await;
         assert_eq!(browse_status, StatusCode::OK);
         assert_eq!(browse["revision"], json!(current));
-        assert!(browse["files"].is_array());
+        assert!(
+            browse["items"].is_array(),
+            "actual /api/files page must survive marker-only change"
+        );
         *state.outer_fence_hook.lock().unwrap() = None;
         // The second intentional incarnation tamper may also be observed by
         // the timer. Restore from the independently held, exact old owner.
@@ -6799,7 +6802,10 @@ mod dependency_lifecycle_tests {
         assert_eq!(lost_status, StatusCode::CONFLICT);
         assert_eq!(lost["error"]["code"], "root_changed");
         assert!(lost.get("revision").is_none());
-        assert!(lost.get("files").is_none());
+        assert!(
+            lost.get("items").is_none(),
+            "lost root cannot leak a file page"
+        );
         *state.outer_fence_hook.lock().unwrap() = None;
         std::fs::remove_dir(&workspace).unwrap();
         std::fs::rename(&moved, &workspace).unwrap();
