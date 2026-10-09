@@ -6738,12 +6738,15 @@ mod maintenance_telemetry_tests {
 
 /// The socket-only daemon has no HTTP state. This router is constructed only
 /// after a validated explicit serve registration binds a loopback listener.
+type SelectedResponseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ProvisionedBrowser {
     registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
+    response_hook: Arc<Mutex<Option<SelectedResponseHook>>>,
 }
 
 impl ProvisionedBrowser {
@@ -6764,35 +6767,161 @@ impl ProvisionedBrowser {
             token,
             hosts,
             origins,
+            response_hook: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn set_selected_response_hook_for_tests(&self, hook: SelectedResponseHook) {
+        *self.response_hook.lock().unwrap() = Some(hook);
     }
 
     pub fn router(self) -> Router {
         let state = Arc::new(self);
         Router::new()
-            .route("/", get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], include_str!("../web/index.html")) }))
-            .route("/app.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/app.js")) }))
-            .route("/shell.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/shell.js")) }))
-            .route("/style.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../web/style.css")) }))
-            .route("/classes.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/classes.js")) }))
-            .route("/classes.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../web/classes.css")) }))
-            .route("/navigation.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], include_str!("../web/navigation.css")) }))
-            .route("/navigation.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/navigation.js")) }))
-            .route("/sequence.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../web/sequence.js")) }))
-            .route("/fonts/jetbrains-mono-latin.woff2", get(|| async { ([(header::CONTENT_TYPE, "font/woff2")], &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..]) }))
-            .route("/fonts/space-grotesk-latin.woff2", get(|| async { ([(header::CONTENT_TYPE, "font/woff2")], &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..]) }))
-            .route("/fonts/JetBrainsMono-OFL.txt", get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], include_str!("../web/fonts/JetBrainsMono-OFL.txt")) }))
-            .route("/fonts/SpaceGrotesk-OFL.txt", get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], include_str!("../web/fonts/SpaceGrotesk-OFL.txt")) }))
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        include_str!("../web/index.html"),
+                    )
+                }),
+            )
+            .route(
+                "/app.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/app.js"),
+                    )
+                }),
+            )
+            .route(
+                "/shell.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/shell.js"),
+                    )
+                }),
+            )
+            .route(
+                "/style.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/style.css"),
+                    )
+                }),
+            )
+            .route(
+                "/classes.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/classes.js"),
+                    )
+                }),
+            )
+            .route(
+                "/classes.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/classes.css"),
+                    )
+                }),
+            )
+            .route(
+                "/navigation.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/navigation.css"),
+                    )
+                }),
+            )
+            .route(
+                "/navigation.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/navigation.js"),
+                    )
+                }),
+            )
+            .route(
+                "/sequence.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/sequence.js"),
+                    )
+                }),
+            )
+            .route(
+                "/fonts/jetbrains-mono-latin.woff2",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "font/woff2")],
+                        &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..],
+                    )
+                }),
+            )
+            .route(
+                "/fonts/space-grotesk-latin.woff2",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "font/woff2")],
+                        &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..],
+                    )
+                }),
+            )
+            .route(
+                "/fonts/JetBrainsMono-OFL.txt",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        include_str!("../web/fonts/JetBrainsMono-OFL.txt"),
+                    )
+                }),
+            )
+            .route(
+                "/fonts/SpaceGrotesk-OFL.txt",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        include_str!("../web/fonts/SpaceGrotesk-OFL.txt"),
+                    )
+                }),
+            )
             .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
-            .route("/healthz", get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }))
-            .route("/api/checkouts", get(|State(state): State<Arc<Self>>| async move {
-                Json(json!({"checkouts":state.registry.lock().await.known_roots().iter().map(|(key, root)| json!({"rootKey":key,"workspaceRoot":root})).collect::<Vec<_>>() }))
-            }))
-            .route("/api/daemon/status", get(|State(state): State<Arc<Self>>| async move {
-                let registry = state.registry.lock().await;
-                Json(json!({"activeCheckouts":registry.active_count()}))
-            }))
-            .layer(middleware::from_fn_with_state(state.clone(), provision_guard))
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
+            )
+            .route(
+                "/api/checkouts",
+                get(|State(state): State<Arc<Self>>| async move {
+                    Json(json!({"checkouts":state.registry.lock().await.browser_checkouts()}))
+                }),
+            )
+            .route(
+                "/api/daemon/status",
+                get(|State(state): State<Arc<Self>>| async move {
+                    let registry = state.registry.lock().await;
+                    Json(json!({"activeCheckouts":registry.active_count()}))
+                }),
+            )
+            .route(
+                "/api/checkouts/{root_key}/{*suffix}",
+                get(provisioned_core).post(provisioned_core),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                provision_guard,
+            ))
             .with_state(state)
     }
 }
@@ -6803,4 +6932,218 @@ async fn provision_guard(
     next: Next,
 ) -> Response {
     guard_common(&state.token, &state.hosts, &state.origins, req, next).await
+}
+
+/// The provisioned listener has one selection boundary for core checkout routes.
+/// The direct single-checkout router stays available to standalone clients.
+async fn provisioned_core(
+    State(browser): State<Arc<ProvisionedBrowser>>,
+    Path((root_key, suffix)): Path<(String, String)>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
+    use crate::daemon::registry::SelectionError;
+    let identity = {
+        let mut registry = browser.registry.lock().await;
+        match registry.browser_identity(&root_key) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                return browser_selection_error(reason);
+            }
+        }
+    };
+    let root = identity.root.to_string_lossy().to_string();
+    let runtime = {
+        let mut registry = browser.registry.lock().await;
+        match registry.browser_request_at(&identity, Instant::now()) {
+            Ok(_) => registry.activate(&root_key).map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store_unavailable",
+                    "Storage is unavailable",
+                )
+            }),
+            Err(SelectionError::CheckoutCapacity) => Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "checkout_capacity",
+                "Checkout capacity reached",
+            )),
+            Err(error) => Err(ApiError::from(anyhow::anyhow!("{}", error.reason()))),
+        }
+    };
+    let answer: Result<(Response, bool), ApiError> = match runtime {
+        Err(error) => Err(error),
+        Ok(runtime) => {
+            let hook = browser.response_hook.lock().unwrap().clone();
+            let result =
+                provisioned_core_answer(&runtime, &method, &suffix, &uri, body, hook.clone()).await;
+            if let Some(hook) = hook {
+                hook("after_handler");
+            }
+            result.and_then(|(response, catching_up)| {
+                identity.verify_readonly().map_err(|_| {
+                    ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+                })?;
+                Ok((response, catching_up))
+            })
+        }
+    };
+    let (mut response, catching_up) = match answer {
+        Ok(pair) => pair,
+        Err(error) => {
+            let catching_up = browser
+                .registry
+                .lock()
+                .await
+                .runtime(&root_key)
+                .is_none_or(|runtime| runtime.catching_up());
+            (error.into_response(), catching_up)
+        }
+    };
+    if identity.verify_readonly().is_err() {
+        response = ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+            .into_response();
+    }
+    if let Ok(value) = root.parse() {
+        response.headers_mut().insert("X-Baleyg-Workspace", value);
+    }
+    response.headers_mut().insert(
+        "X-Baleyg-Catching-Up",
+        if catching_up { "true" } else { "false" }.parse().unwrap(),
+    );
+    response
+}
+
+fn browser_selection_error(reason: crate::daemon::registry::SelectionError) -> Response {
+    let status = match reason {
+        crate::daemon::registry::SelectionError::NotCheckout
+        | crate::daemon::registry::SelectionError::NotAbsolute => StatusCode::BAD_REQUEST,
+        crate::daemon::registry::SelectionError::IdentityChanged => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(json!({"error":{"code":"workspace_selection_failed", "reason":reason.reason(), "message":"Checkout selection failed"}}))).into_response()
+}
+
+async fn provisioned_core_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    method: &axum::http::Method,
+    suffix: &str,
+    uri: &axum::http::Uri,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> Result<(Response, bool), ApiError> {
+    use axum::http::Method;
+    match (method, suffix) {
+        (&Method::GET, "status") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let runtime = runtime.clone();
+            let (status, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                let mut status = response.status()?;
+                status.catching_up = catching_up;
+                if let Some(hook) = hook {
+                    hook("before_read_finish");
+                }
+                Ok::<_, anyhow::Error>((response.finish(status)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            Ok((Json(status).into_response(), catching_up))
+        }
+        (&Method::GET, "source") => {
+            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.path.is_empty()
+                || q.path.len() > 8192
+                || q.path.contains(['\0', '\\', ':'])
+                || q.path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(invalid());
+            }
+            let pin = q.pin.pin()?;
+            let runtime = runtime.clone();
+            let (file, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                let file = response.source_at(&q.path, pin)?;
+                Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            let (revision, file) = file.ok_or_else(missing)?;
+            Ok((
+                Json(json!({"revision":revision,"file":file})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "query") => {
+            let Query(pin) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let expected = pin.pin()?;
+            let q: ViewQuery = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate().map_err(|_| invalid())?;
+            let runtime = runtime.clone();
+            let (view, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                if let Some(pin) = expected {
+                    response.validate_pin(pin)?;
+                }
+                let view = response.query_view(&q)?;
+                Ok::<_, anyhow::Error>((response.finish(view)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            Ok((Json(view.ok_or_else(missing)?).into_response(), catching_up))
+        }
+        (&Method::POST, "index") | (&Method::GET, "jobs/current") => {
+            let state = runtime.browser_scheduler()?;
+            let response = if method == Method::POST {
+                start_index(State(state), body).await?.into_response()
+            } else {
+                current_job(State(state)).await?.into_response()
+            };
+            Ok((response, runtime.catching_up()))
+        }
+        _ if suffix.starts_with("jobs/") => {
+            let state = runtime.browser_scheduler()?;
+            let tail = suffix.strip_prefix("jobs/").unwrap();
+            let response = if method == Method::GET && !tail.contains('/') {
+                job(State(state), Path(tail.to_owned()))
+                    .await?
+                    .into_response()
+            } else if method == Method::POST && tail.ends_with("/cancel") {
+                let id = tail.strip_suffix("/cancel").unwrap();
+                if id.contains('/') {
+                    return Err(missing());
+                }
+                cancel_job(State(state), Path(id.to_owned()))
+                    .await?
+                    .into_response()
+            } else {
+                return Err(missing());
+            };
+            Ok((response, runtime.catching_up()))
+        }
+        _ => Err(missing()),
+    }
 }

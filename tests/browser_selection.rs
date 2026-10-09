@@ -1,0 +1,946 @@
+use baleyg::store::topology::WorkspaceIdentity;
+use serde_json::Value;
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    process::{Command, Stdio},
+    time::Duration,
+};
+use tempfile::TempDir;
+
+fn command(home: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    cmd.env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME");
+    cmd
+}
+
+fn git(root: &std::path::Path, args: &[&str]) {
+    let result = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+struct Server(std::process::Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn production_browser_selects_two_real_worktrees_without_global_attachment() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    fs::create_dir(&a).unwrap();
+    git(&a, &["init", "-q"]);
+    git(&a, &["config", "user.email", "test@example.invalid"]);
+    git(&a, &["config", "user.name", "Test"]);
+    fs::write(
+        a.join("core.js"),
+        "function alpha_checkout() { return 1; }\n",
+    )
+    .unwrap();
+    git(&a, &["add", "core.js"]);
+    git(&a, &["commit", "-qm", "base"]);
+    git(
+        &a,
+        &["worktree", "add", "-qb", "other", b.to_str().unwrap()],
+    );
+    fs::write(
+        b.join("core.js"),
+        "function beta_checkout() { return 2; }\n",
+    )
+    .unwrap();
+    for root in [&a, &b] {
+        let result = command(&home)
+            .arg("index")
+            .arg("--workspace")
+            .arg(root)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "index: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let a_key = WorkspaceIdentity::discover(Some(&a), &a).unwrap().root_key;
+    let b_key = WorkspaceIdentity::discover(Some(&b), &b).unwrap().root_key;
+    assert_ne!(a_key, b_key);
+    let seeds: Vec<String> = [(&a, "alpha_checkout"), (&b, "beta_checkout")]
+        .into_iter()
+        .map(|(root, name)| {
+            let output = command(&home)
+                .arg("symbols")
+                .arg("--workspace")
+                .arg(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let symbols: Value = serde_json::from_slice(&output.stdout).unwrap();
+            symbols["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|symbol| symbol["name"] == name)
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let token_file = home.join("token");
+    fs::write(&token_file, token).unwrap();
+    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let log = temp.path().join("serve-stderr");
+    let child = command(&home)
+        .arg("serve")
+        .arg("--workspace")
+        .arg(&a)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--token-file")
+        .arg(token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()))
+        .spawn()
+        .unwrap();
+    let mut server = Server(child);
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+                && response.status().is_success()
+            {
+                break;
+            }
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "serve exited: {}",
+                fs::read_to_string(&log).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let global = client
+        .get(format!("{base}/api/daemon/status"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(global.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(global.headers()["cache-control"], "no-store");
+    let global = client
+        .get(format!("{base}/api/daemon/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(global.status(), reqwest::StatusCode::OK);
+    let state: Value = global.json().await.unwrap();
+    assert_eq!(state["activeCheckouts"], 0);
+    let listing = client
+        .get(format!("{base}/api/checkouts"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listing.status(), reqwest::StatusCode::OK);
+    let listing: Value = listing.json().await.unwrap();
+    for key in [&a_key, &b_key] {
+        assert!(
+            listing["checkouts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["rootKey"] == *key),
+            "{listing}"
+        );
+    }
+    let inert = client
+        .get(format!("{base}/api/daemon/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inert.json::<Value>().await.unwrap()["activeCheckouts"], 0);
+    let bad_host = client
+        .get(format!("{base}/api/checkouts/{a_key}/status"))
+        .header("Host", "not-local:1")
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_host.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(!bad_host.headers().contains_key("X-Baleyg-Workspace"));
+    let bad_origin = client
+        .get(format!("{base}/api/checkouts/{a_key}/status"))
+        .header("Origin", "http://not-local:1")
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(!bad_origin.headers().contains_key("X-Baleyg-Workspace"));
+    for (key, root, expected) in [
+        (&a_key, &a, "alpha_checkout"),
+        (&b_key, &b, "beta_checkout"),
+    ] {
+        let verified_root = root.canonicalize().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let response = client
+                    .get(format!("{base}/api/checkouts/{key}/status"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() == reqwest::StatusCode::OK {
+                    break response;
+                }
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    "{}",
+                    response.text().await.unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status.headers()["X-Baleyg-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        let status_header = status.headers()["X-Baleyg-Catching-Up"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let status: Value = status.json().await.unwrap();
+        assert_eq!(status["workspaceRoot"], verified_root.to_str().unwrap());
+        assert!(status["catchingUp"].is_boolean());
+        assert_eq!(
+            status["catchingUp"].as_bool().unwrap().to_string(),
+            status_header
+        );
+        let source = client
+            .get(format!("{base}/api/checkouts/{key}/source"))
+            .query(&[("path", "core.js")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(source.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            source.headers()["X-Baleyg-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        assert!(source.headers().contains_key("X-Baleyg-Catching-Up"));
+        let source: Value = source.json().await.unwrap();
+        assert!(
+            source["file"]["text"].as_str().unwrap().contains(expected),
+            "{source}"
+        );
+    }
+    for (key, other, seed, expected_name) in [
+        (&a_key, &b_key, &seeds[0], "alpha_checkout"),
+        (&b_key, &a_key, &seeds[1], "beta_checkout"),
+    ] {
+        let query = client
+            .post(format!("{base}/api/checkouts/{key}/query"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":seed}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            query.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            query.text().await.unwrap_or_default()
+        );
+        assert!(query.headers().contains_key("X-Baleyg-Catching-Up"));
+        let view: Value = query.json().await.unwrap();
+        assert_eq!(view["query"]["seed"], seed.as_str());
+        assert!(view.to_string().contains(expected_name), "{view}");
+        let foreign_query = client
+            .post(format!("{base}/api/checkouts/{other}/query"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":seed}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_query.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign_query.headers().contains_key("X-Baleyg-Workspace"));
+        let accepted = client
+            .post(format!("{base}/api/checkouts/{key}/index"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+        let accepted: Value = accepted.json().await.unwrap();
+        let id = accepted["id"].as_str().unwrap();
+        let current = client
+            .get(format!("{base}/api/checkouts/{key}/jobs/current"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), reqwest::StatusCode::OK);
+        assert!(current.headers().contains_key("X-Baleyg-Workspace"));
+        let current: Value = current.json().await.unwrap();
+        assert!(current.is_null() || current["id"] == id, "{current}");
+        let own = client
+            .get(format!("{base}/api/checkouts/{key}/jobs/{id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(own.status(), reqwest::StatusCode::OK);
+        assert_eq!(own.json::<Value>().await.unwrap()["id"], id);
+        let foreign = client
+            .get(format!("{base}/api/checkouts/{other}/jobs/{id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        let cancelled = client
+            .post(format!("{base}/api/checkouts/{key}/jobs/{id}/cancel"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancelled.status(),
+            reqwest::StatusCode::CONFLICT | reqwest::StatusCode::OK
+        ));
+        assert!(cancelled.headers().contains_key("X-Baleyg-Catching-Up"));
+        let foreign_cancel = client
+            .post(format!("{base}/api/checkouts/{other}/jobs/{id}/cancel"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_cancel.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+    let missing = client
+        .get(format!("{base}/api/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(!missing.headers().contains_key("X-Baleyg-Workspace"));
+    let unknown = client
+        .get(format!("{base}/api/checkouts/{}/status", "a".repeat(64)))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert!(!unknown.status().is_success());
+    assert!(!unknown.headers().contains_key("X-Baleyg-Workspace"));
+    let unknown: Value = unknown.json().await.unwrap();
+    assert_eq!(unknown["error"]["code"], "workspace_selection_failed");
+    let resolved = client
+        .get(format!("{base}/api/checkouts/{a_key}/source"))
+        .query(&[("path", "absent.js")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resolved.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        resolved.headers()["X-Baleyg-Workspace"],
+        a.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(resolved.headers().contains_key("X-Baleyg-Catching-Up"));
+    let invalid = client
+        .get(format!("{base}/api/checkouts/not-a-key/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(!invalid.headers().contains_key("X-Baleyg-Workspace"));
+    let changed = temp.path().join("moved-a");
+    fs::rename(&a, &changed).unwrap();
+    let drift = client
+        .get(format!("{base}/api/checkouts/{a_key}/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(drift.status(), reqwest::StatusCode::CONFLICT);
+    assert!(!drift.headers().contains_key("X-Baleyg-Workspace"));
+}
+
+#[test]
+fn selected_browser_clock_has_separate_disconnect_release_and_exit_delays() {
+    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let start = std::time::Instant::now();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots_at(roots, start);
+    registry.browser_request_at(&identity, start).unwrap();
+    assert_eq!(registry.active_count(), 1);
+    assert_eq!(registry.idle_exit_deadline(), None);
+    assert!(
+        !registry
+            .advance(start + Duration::from_secs(15 * 60 - 1))
+            .unwrap()
+            .exit
+    );
+    assert_eq!(registry.active_count(), 1);
+    registry
+        .advance(start + Duration::from_secs(15 * 60))
+        .unwrap();
+    assert_eq!(
+        registry.idle_exit_deadline(),
+        Some(start + Duration::from_secs(45 * 60))
+    );
+    assert!(
+        registry
+            .advance(start + Duration::from_secs(30 * 60 - 1))
+            .unwrap()
+            .released
+            .is_empty()
+    );
+    let release = registry
+        .advance(start + Duration::from_secs(30 * 60))
+        .unwrap();
+    assert_eq!(release.released, vec![identity.root_key.clone()]);
+    assert!(!release.exit);
+    assert!(
+        !registry
+            .advance(start + Duration::from_secs(45 * 60 - 1))
+            .unwrap()
+            .exit
+    );
+    assert!(
+        registry
+            .advance(start + Duration::from_secs(45 * 60))
+            .unwrap()
+            .exit
+    );
+}
+
+#[test]
+fn selected_browser_renewal_does_not_extend_other_checkout() {
+    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    let temp = TempDir::new().unwrap();
+    let a = temp.path().join("a");
+    let b = temp.path().join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let a = WorkspaceIdentity::discover(Some(&a), &a).unwrap();
+    let b = WorkspaceIdentity::discover(Some(&b), &b).unwrap();
+    let start = std::time::Instant::now();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots_at(roots, start);
+    registry.browser_request_at(&a, start).unwrap();
+    registry.browser_request_at(&b, start).unwrap();
+    registry
+        .browser_request_at(&a, start + Duration::from_secs(10 * 60))
+        .unwrap();
+    let tick = registry
+        .advance(start + Duration::from_secs(30 * 60))
+        .unwrap();
+    assert_eq!(tick.released, vec![b.root_key]);
+    assert_eq!(registry.active_count(), 1);
+    assert_eq!(
+        registry.idle_exit_deadline(),
+        Some(start + Duration::from_secs(55 * 60))
+    );
+    let tick = registry
+        .advance(start + Duration::from_secs(40 * 60))
+        .unwrap();
+    assert_eq!(tick.released, vec![a.root_key]);
+    assert!(!tick.exit);
+}
+
+#[test]
+fn global_list_marks_corrupt_existing_index_without_attaching() {
+    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index = roots.index_db(&identity);
+    drop(roots.index_use(&identity).unwrap());
+    fs::write(&index, b"not a sqlite index").unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+    let registry = CheckoutRegistry::with_roots(roots);
+    let rows = registry.browser_checkouts();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["rootKey"], identity.root_key);
+    assert_eq!(rows[0]["state"], "corrupt");
+    assert_eq!(rows[0]["active"], false);
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn global_discovery_reuses_live_sqlite_witness_and_never_repairs() {
+    use baleyg::{
+        daemon::registry::CheckoutRegistry,
+        store::{Store, topology::TopologyRoots},
+    };
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let store = Store::open(
+        roots.clone(),
+        WorkspaceIdentity::discover(Some(&root), &root).unwrap(),
+    )
+    .unwrap();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (_, session) = baleyg::index_coordinator::reconcile_workspace(
+        &store,
+        &baleyg::indexer::IndexOptions::new(identity.root.clone()),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    let dir = roots.index_dir(&identity);
+    let names = || {
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names();
+    let witness_count = open_descriptors(&roots.index_db(&identity));
+    let registry = CheckoutRegistry::with_roots(roots.clone());
+    for _ in 0..4 {
+        let rows = registry.browser_checkouts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["state"], "available", "{rows:?}");
+        assert_eq!(
+            Store::browser_index_root_existing(&roots, &identity.root_key).unwrap(),
+            identity.root.to_str().unwrap()
+        );
+        assert_eq!(open_descriptors(&roots.index_db(&identity)), witness_count);
+        session.verify().unwrap();
+        store.status().unwrap();
+        assert_eq!(names(), before);
+    }
+    let sidecar = dir.join("index.db-journal");
+    fs::write(&sidecar, b"hot journal").unwrap();
+    let blocked = registry.browser_checkouts();
+    assert_eq!(blocked[0]["state"], "storage_busy");
+    assert_eq!(fs::read(&sidecar).unwrap(), b"hot journal");
+}
+
+#[tokio::test]
+async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tower::ServiceExt;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    for stage in ["after_handler", "before_read_finish"] {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        registry
+            .register(&identity, CheckoutOptions(serde_json::json!({})))
+            .unwrap();
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let address = "127.0.0.1:7331".parse().unwrap();
+        let browser = ProvisionedBrowser::new(registry.clone(), TOKEN.to_owned(), address).unwrap();
+        let app = browser.clone().router();
+        let route = format!("/api/checkouts/{}/status", identity.root_key);
+        let call = |app: axum::Router| {
+            let route = route.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("host", "127.0.0.1:7331")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let response = call(app.clone()).await;
+                if response.status() == axum::http::StatusCode::OK {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let changed = Arc::new(AtomicBool::new(false));
+        let source = identity.root.clone();
+        let destination = temp.path().join("moved");
+        let changed_for_hook = changed.clone();
+        browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+            if at == stage && !changed_for_hook.swap(true, Ordering::AcqRel) {
+                fs::rename(&source, &destination).unwrap();
+            }
+        }));
+        let response = call(app).await;
+        assert!(changed.load(Ordering::Acquire));
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()["X-Baleyg-Workspace"],
+            identity.root.to_str().unwrap()
+        );
+        assert!(response.headers().contains_key("X-Baleyg-Catching-Up"));
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(error["error"]["code"], "root_changed", "{stage}: {error}");
+    }
+}
+
+#[cfg(unix)]
+fn open_descriptors(path: &std::path::Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let expected = fs::metadata(path).unwrap();
+    (0..1024)
+        .filter(|fd| {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(*fd, stat.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            let stat = unsafe { stat.assume_init() };
+            #[cfg(target_os = "macos")]
+            let dev = stat.st_dev as u64;
+            #[cfg(not(target_os = "macos"))]
+            let dev = stat.st_dev;
+            (dev, stat.st_ino) == (expected.dev(), expected.ino())
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn browser_only_live_listener_releases_resources_then_exits_with_control_present() {
+    use baleyg::{
+        daemon::{
+            BrowserProvisioner,
+            registry::{CheckoutOptions, CheckoutRegistry},
+        },
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let index_lock = roots.leader_lock(&identity);
+    let registry = Arc::new(tokio::sync::Mutex::new(CheckoutRegistry::with_roots(roots)));
+    let mut provisioner = BrowserProvisioner::new();
+    let address = provisioner
+        .register_serve(
+            &registry,
+            &identity,
+            CheckoutOptions(serde_json::json!({})),
+            "127.0.0.1:0".parse().unwrap(),
+            &temp.path().join("token"),
+        )
+        .await
+        .unwrap();
+    let token = fs::read_to_string(temp.path().join("token")).unwrap();
+    // Match run_daemon: its idle driver signals the provisioned listener and
+    // closes the dispatch-owned serve control connection on daemon exit.
+    let (mut serve_control, daemon_control) = std::os::unix::net::UnixStream::pair().unwrap();
+    serve_control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let serve_exit = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Read;
+        let mut one = [0u8; 1];
+        if serve_control.read(&mut one)? == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "serve control received data instead of EOF",
+            ))
+        }
+    });
+    let (shutdown, signal) = tokio::sync::watch::channel(false);
+    let listener = provisioner.spawn_with_shutdown(signal).unwrap();
+    let idle_registry = registry.clone();
+    let daemon_exit = tokio::spawn(async move {
+        baleyg::daemon::run_idle_lifecycle(idle_registry)
+            .await
+            .unwrap();
+        shutdown.send(true).unwrap();
+        drop(daemon_control);
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}");
+    let before_request = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = client
+                .get(format!("{base}/api/checkouts/{}/status", identity.root_key))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            if response.status().is_success()
+                && !response.json::<Value>().await.unwrap()["catchingUp"]
+                    .as_bool()
+                    .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after_request = std::time::Instant::now();
+    let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
+    assert!(runtime.has_active_resources());
+    assert!(!runtime.is_follower());
+    assert!(open_descriptors(&index_lock) > 0);
+    let retained = open_descriptors(&index_lock);
+    for route in ["/healthz", "/", "/api/checkouts", "/api/daemon/status"] {
+        let request = client.get(format!("{base}{route}"));
+        let response = if route.starts_with("/api/") {
+            request.bearer_auth(&token).send().await.unwrap()
+        } else {
+            request.send().await.unwrap()
+        };
+        assert!(response.status().is_success());
+    }
+    let mut checked = registry.lock().await;
+    checked.set_clock_override_for_tests(
+        before_request + Duration::from_secs(15 * 60) - Duration::from_nanos(1),
+    );
+    assert!(!checked.advance(std::time::Instant::now()).unwrap().exit);
+    assert!(runtime.has_active_resources());
+    checked.set_clock_override_for_tests(after_request + Duration::from_secs(15 * 60));
+    checked.advance(std::time::Instant::now()).unwrap();
+    assert!(runtime.has_active_resources());
+    checked.set_clock_override_for_tests(
+        before_request + Duration::from_secs(30 * 60) - Duration::from_nanos(1),
+    );
+    checked.advance(std::time::Instant::now()).unwrap();
+    assert!(runtime.has_active_resources());
+    assert_eq!(open_descriptors(&index_lock), retained);
+    checked.set_clock_override_for_tests(after_request + Duration::from_secs(30 * 60));
+    checked.advance(std::time::Instant::now()).unwrap();
+    drop(checked);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while runtime.has_active_resources() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(open_descriptors(&index_lock), 0);
+    assert!(!listener.is_finished());
+    assert!(!serve_exit.is_finished());
+    assert!(!daemon_exit.is_finished());
+    registry.lock().await.set_clock_override_for_tests(
+        before_request + Duration::from_secs(45 * 60) - Duration::from_nanos(1),
+    );
+    assert!(!listener.is_finished());
+    assert!(!serve_exit.is_finished());
+    registry
+        .lock()
+        .await
+        .set_clock_override_for_tests(after_request + Duration::from_secs(45 * 60));
+    tokio::time::timeout(Duration::from_secs(3), daemon_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    let observed_eof = tokio::time::timeout(Duration::from_secs(3), serve_exit).await;
+    assert!(
+        observed_eof.is_ok(),
+        "serve control did not reach EOF after daemon exit"
+    );
+    observed_eof.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), listener)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(provisioner.address().is_none());
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function old_step() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let app = ProvisionedBrowser::new(
+        registry.clone(),
+        TOKEN.to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let path = format!("/api/checkouts/{}/status", identity.root_key);
+    let status = |app: axum::Router| {
+        let path = path.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("host", "127.0.0.1:7331")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let headers = response.headers().clone();
+            let code = response.status();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                    .unwrap();
+            (code, headers, body)
+        }
+    };
+    let (old_revision, after_request) = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (code, headers, body) = status(app.clone()).await;
+            if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
+                assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
+                break (body["revision"].clone(), std::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut registry = registry.lock().await;
+        let released = registry
+            .advance(after_request + Duration::from_secs(30 * 60))
+            .unwrap();
+        assert_eq!(released.released, vec![identity.root_key.clone()]);
+    }
+    fs::write(root.join("core.js"), "function fresh_step() {}\n").unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry
+            .browser_request_at(&identity, std::time::Instant::now())
+            .unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }));
+        runtime
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (code, headers, prior) = status(app.clone()).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{prior}");
+    assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(prior["catchingUp"], true);
+    assert_eq!(prior["revision"], old_revision);
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if !runtime.catching_up() {
+                let (code, headers, current) = status(app.clone()).await;
+                if code == axum::http::StatusCode::OK && current["catchingUp"] == false {
+                    assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
+                    assert_ne!(current["revision"], old_revision);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}

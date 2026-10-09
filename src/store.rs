@@ -5154,6 +5154,101 @@ impl Store {
             test_publish_post_commit_busy_once: Arc::new(AtomicBool::new(false)),
         })
     }
+    /// Read only bounded index identity metadata for browser discovery. This
+    /// existing-only probe shares the process-wide SQLite witness with readers
+    /// and writers. It does not run recovery or inspect evidence rows.
+    pub fn browser_index_root_existing(
+        roots: &topology::TopologyRoots,
+        key: &str,
+    ) -> std::result::Result<String, &'static str> {
+        use sha2::Digest;
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("unavailable");
+        }
+        let parent = roots.cache.join("indexes");
+        let directory = parent.join(key);
+        for path in [&roots.cache, &parent, &directory] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                _ => return Err("unavailable"),
+            }
+        }
+        let lock = parent.join(format!("{key}.lock"));
+        let _use_guard = topology::UseGuard::acquire_existing_readonly(&lock).map_err(|error| {
+            if error.is::<topology::StorageBusy>() {
+                "storage_busy"
+            } else {
+                "unavailable"
+            }
+        })?;
+        let index = directory.join("index.db");
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = directory.join(format!("index.db{suffix}"));
+            match std::fs::symlink_metadata(sidecar) {
+                Ok(_) => return Err("storage_busy"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("unavailable"),
+            }
+        }
+        // Both the header witness and SQLite descriptor remain registered for
+        // this inode throughout the read, including concurrent active Stores.
+        let db =
+            open_index_marker_probe(&index, false, Duration::from_millis(20)).map_err(|error| {
+                if error.is::<topology::StorageBusy>()
+                    || error.to_string().starts_with("storage_busy")
+                {
+                    "storage_busy"
+                } else if error.to_string().starts_with("incompatible_index")
+                    || error.is::<ExceptionalIndexFormat>()
+                {
+                    "corrupt"
+                } else {
+                    "unavailable"
+                }
+            })?;
+        let marker = read_index_format_marker(&db).map_err(|error| {
+            if error.is::<topology::StorageBusy>() {
+                "storage_busy"
+            } else {
+                "corrupt"
+            }
+        })?;
+        let version: u32 = storage_result(
+            db.pragma_query_value(None, "user_version", |row| row.get(0)),
+        )
+        .map_err(|error| {
+            if error.is::<topology::StorageBusy>() {
+                "storage_busy"
+            } else {
+                "unavailable"
+            }
+        })?;
+        if marker.is_obsolete()
+            || version != DATABASE_SCHEMA_VERSION
+            || marker.schema_version != i64::from(DATABASE_SCHEMA_VERSION)
+        {
+            return Err("corrupt");
+        }
+        let (length, spelling): (i64, Option<String>) = storage_result(db.query_row(
+            "SELECT length(CAST(root_spelling AS BLOB)), CASE WHEN length(CAST(root_spelling AS BLOB))<=8192 THEN root_spelling END FROM index_metadata WHERE singleton=1 LIMIT 2",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )).map_err(|error| if error.is::<topology::StorageBusy>() { "storage_busy" } else { "corrupt" })?;
+        if !(1..=8192).contains(&length) {
+            return Err("corrupt");
+        }
+        let spelling = spelling.ok_or("corrupt")?;
+        if !Path::new(&spelling).is_absolute()
+            || hex::encode(sha2::Sha256::digest(spelling.as_bytes())) != key
+        {
+            return Err("corrupt");
+        }
+        Ok(spelling)
+    }
+
     /// Observe only an already-published index. In particular, this path may
     /// not create HOME/cache, a Git identity marker, an index or a use lock.
     pub fn status_existing_readonly(
@@ -6323,6 +6418,7 @@ impl Store {
         }
         Ok(IndexStatus {
             workspace_root: self.workspace_root.clone(),
+            catching_up: false,
             revision: pin,
             indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
             stats: serde_json::from_str(&row.8)?,
