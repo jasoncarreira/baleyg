@@ -457,7 +457,7 @@ fn exceptional_recovery_requires_closed_readers_and_retains_both_lock_inodes() {
     drop(unrelated);
 
     let exclusive = roots.index_use_exclusive_existing(&identity).unwrap();
-    let mut leader = roots.leader_under_exclusive(&identity, exclusive).unwrap();
+    let leader = roots.leader_under_exclusive(&identity, exclusive).unwrap();
     assert_ne!(leader.incarnation, old_incarnation);
     assert_eq!(
         fs::read(&leader_path).unwrap(),
