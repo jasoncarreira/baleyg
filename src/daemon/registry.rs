@@ -994,6 +994,79 @@ impl CheckoutRuntime {
             .ok_or_else(|| anyhow::anyhow!("index_not_ready: checkout released"))
     }
 
+    /// CLI calls share the activated checkout's Store and scheduler; they never
+    /// reopen a second Store or independently elect a leader.
+    pub fn cli_status(&self) -> anyhow::Result<serde_json::Value> {
+        let (response, _) = self.evidence_response()?;
+        let status = response.status()?;
+        Ok(serde_json::to_value(response.finish(status)?)?)
+    }
+
+    pub fn cli_symbols(&self, search: &str, limit: usize) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!((1..=150).contains(&limit), "limit must be 1..150");
+        let resources = self.resources()?;
+        let (response, _) = self.evidence_response()?;
+        // Store::symbols_at performs selected-document attestation and a
+        // complete-revision fence. The runtime guard additionally fences H.
+        let selected = resources.store.symbols_at(search, limit);
+        response.finish(())?;
+        let (revision, items) = selected?;
+        Ok(serde_json::json!({"revision": revision, "items": items}))
+    }
+
+    pub fn cli_query(&self, query: &crate::model::ViewQuery) -> anyhow::Result<serde_json::Value> {
+        query.validate()?;
+        let (response, _) = self.evidence_response()?;
+        let view = response
+            .query_view(query)?
+            .ok_or_else(|| anyhow::anyhow!("seed not found in current index"))?;
+        Ok(serde_json::to_value(response.finish(view)?)?)
+    }
+
+    pub fn cli_export(&self) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        let (response, _) = self.evidence_response()?;
+        let graph = resources.store.graph();
+        response.finish(())?;
+        Ok(serde_json::to_value(graph?)?)
+    }
+
+    pub fn cli_index(&self, options: &IndexOptions) -> anyhow::Result<serde_json::Value> {
+        let resources = self.resources()?;
+        // Durable acceptance is the single requests.db COMMIT. Only the
+        // checkout scheduler may elect, reconcile and claim this row. A CLI
+        // waiter never creates a second leader or re-enqueues an uncertain job.
+        let accepted = resources.store.enqueue_request(options, None)?;
+        loop {
+            let row = resources
+                .store
+                .request_by_id(&accepted.id)?
+                .ok_or_else(|| anyhow::anyhow!("storage_busy: accepted request disappeared"))?;
+            match row.state.as_str() {
+                "done" => {
+                    let revision = row.revision.ok_or_else(|| {
+                        anyhow::anyhow!("store_unavailable: completed request missing pin")
+                    })?;
+                    let (response, _) = self.evidence_response()?;
+                    response.validate_pin(revision)?;
+                    let status = response.finish(response.status()?)?;
+                    return Ok(
+                        serde_json::json!({"publishedRevision": revision, "status": status}),
+                    );
+                }
+                "failed" => anyhow::bail!(
+                    "{}: request {} failed; inspect job status",
+                    row.error_code.as_deref().unwrap_or("store_unavailable"),
+                    accepted.id
+                ),
+                "queued" | "running" => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => anyhow::bail!("store_unavailable: invalid request state"),
+            }
+        }
+    }
+
     /// A retained runtime handle cannot keep the released Store or watcher alive.
     pub fn has_active_resources(&self) -> bool {
         self.resources.lock().unwrap().is_some()

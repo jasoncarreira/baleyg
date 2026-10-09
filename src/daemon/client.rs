@@ -68,17 +68,7 @@ pub fn call(
         // A partially written request can still have reached the server. Never replay
         // a mutation after attempting its write, including when the reply is lost.
         let reply = protocol::write_frame(&mut stream, request)
-            .and_then(|()| protocol::read_frame::<Reply>(&mut stream))
-            .and_then(|reply| {
-                if reply.id == request.id {
-                    Ok(reply)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "daemon reply ID mismatch",
-                    ))
-                }
-            });
+            .and_then(|()| read_reply(&mut stream, request.id));
         match reply {
             Ok(reply) => return Ok(reply),
             Err(_) if read_only && attempt + 1 < attempts => continue,
@@ -87,4 +77,49 @@ pub fn call(
         }
     }
     Err(CallError::DaemonUnavailable)
+}
+
+/// One large CLI export is a sequence of individually bounded frames. The
+/// final JSON is parsed only after every frame with the same request ID arrives.
+fn read_reply(stream: &mut UnixStream, id: u64) -> io::Result<Reply> {
+    let mut reply: Reply = protocol::read_frame(stream)?;
+    if reply.id != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "daemon reply ID mismatch",
+        ));
+    }
+    if reply.payload.get("chunk").is_none() {
+        return Ok(reply);
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = reply
+            .payload
+            .get("chunk")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon chunk"))?;
+        let part = hex::decode(chunk).map_err(io::Error::other)?;
+        bytes.extend_from_slice(&part);
+        let more = reply
+            .payload
+            .get("more")
+            .and_then(|value| value.as_bool())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing daemon chunk flag")
+            })?;
+        if !more {
+            return Ok(Reply {
+                id,
+                payload: serde_json::from_slice(&bytes).map_err(io::Error::other)?,
+            });
+        }
+        reply = protocol::read_frame(stream)?;
+        if reply.id != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "daemon reply ID mismatch",
+            ));
+        }
+    }
 }

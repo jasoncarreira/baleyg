@@ -1,0 +1,840 @@
+//! Real executable coverage for the user-level socket and provisioned browser.
+//! Selected-workspace HTTP routes remain covered separately by the legacy router;
+//! this control-plane test does not assert that those routes are served by the daemon.
+use serde_json::Value;
+use std::{
+    fs,
+    net::{SocketAddr, TcpListener},
+    path::Path,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+use tempfile::{Builder, TempDir};
+
+fn short_temp() -> TempDir {
+    // macOS Unix domain sockets have a 104-byte path limit. Long-HOME
+    // socket-path behavior has its own regression test in the daemon slice.
+    Builder::new().prefix("bg107-").tempdir_in("/tmp").unwrap()
+}
+
+fn cli(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    command
+        .env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .stdin(Stdio::null());
+    command
+}
+
+struct Owned(Child);
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn detached(mut command: Command) -> Owned {
+    Owned(
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+fn free_address() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+fn checkout(base: &Path, name: &str) -> std::path::PathBuf {
+    let root = base.join(name);
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("sample.js"),
+        format!("function {name}Symbol() {{ return 1; }}\n"),
+    )
+    .unwrap();
+    root
+}
+fn serve(home: &Path, root: &Path, bind: SocketAddr, token: &Path) -> Command {
+    let mut command = cli(home);
+    command
+        .arg("serve")
+        .arg("--workspace")
+        .arg(root)
+        .arg("--bind")
+        .arg(bind.to_string())
+        .arg("--token-file")
+        .arg(token);
+    command
+}
+fn run(home: &Path, command: &str, root: &Path) -> Value {
+    let output = cli(home)
+        .arg(command)
+        .arg("--workspace")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{command} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Ok(reply) = client.get(format!("http://{address}/healthz")).send().await
+            && reply.status().is_success()
+        {
+            return;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "serve process exited before /healthz"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "serve did not provision /healthz"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
+#[tokio::test]
+async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two_checkouts() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let first = checkout(temp.path(), "first");
+    let second = checkout(temp.path(), "second");
+    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    let token_file = temp.path().join("token");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let mut daemon_command = cli(&home);
+    daemon_command.arg("daemon");
+    let mut daemon = detached(daemon_command);
+    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited before socket bind"
+        );
+        assert!(Instant::now() < deadline, "daemon socket was not created");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    // Keep the port reserved until explicit serve. A connect check after
+    // releasing it would race with other tests or processes that bind it.
+    assert!(daemon.0.try_wait().unwrap().is_none());
+    assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+    assert!(
+        !token_file.exists(),
+        "socket-only startup provisioned a browser token"
+    );
+    let duplicate = cli(&home).arg("daemon").output().unwrap();
+    assert!(duplicate.status.success(), "second daemon election failed");
+    assert!(
+        daemon.0.try_wait().unwrap().is_none(),
+        "second daemon displaced socket owner"
+    );
+    assert!(!token_file.exists());
+    drop(reserved);
+
+    let mut first_serve = detached(serve(&home, &first, address, &token_file));
+    ready(&client, address, &mut first_serve.0).await;
+    let token = fs::read_to_string(&token_file).unwrap();
+    let url = format!("http://{address}/api/checkouts");
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("wrong-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let authenticated = || client.get(&url).bearer_auth(token.trim());
+    let response = authenticated().send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let entries = response.json::<Value>().await.unwrap();
+    assert_eq!(entries["checkouts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        entries["checkouts"][0]["workspaceRoot"],
+        fs::canonicalize(&first).unwrap().to_string_lossy().as_ref()
+    );
+    let status = client
+        .get(format!("http://{address}/api/daemon/status"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    assert!(status.json::<Value>().await.unwrap()["activeCheckouts"].is_number());
+    let wrong_origin = authenticated()
+        .header("Origin", "http://not-local.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let conflicting_bind = free_address();
+    let output = serve(&home, &second, conflicting_bind, &token_file)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bind conflicts"));
+    let other_token = temp.path().join("other-token");
+    let output = serve(&home, &second, address, &other_token)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("token file conflicts"));
+    assert!(!other_token.exists());
+    assert_eq!(
+        authenticated()
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["checkouts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut second_serve = detached(serve(&home, &second, address, &token_file));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = authenticated()
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if value["checkouts"].as_array().unwrap().len() == 2 {
+            let roots: Vec<_> = value["checkouts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["workspaceRoot"].as_str().unwrap().to_owned())
+                .collect();
+            assert!(
+                roots.contains(
+                    &fs::canonicalize(&first)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                )
+            );
+            assert!(
+                roots.contains(
+                    &fs::canonicalize(&second)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                )
+            );
+            break;
+        }
+        assert!(
+            second_serve.0.try_wait().unwrap().is_none(),
+            "second registration exited"
+        );
+        assert!(Instant::now() < deadline, "second checkout not registered");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let mut same_serve = detached(serve(&home, &first, address, &token_file));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if same_serve.0.try_wait().unwrap().is_none() {
+            // The same registration keeps the same singleton listener and checkout set.
+            let list = authenticated()
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            if list["checkouts"].as_array().unwrap().len() == 2 {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "same registration did not stay attached"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&first)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "socket index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(
+        run(&home, "status", &first)["revision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let symbols = cli(&home)
+        .arg("symbols")
+        .arg("--workspace")
+        .arg(&first)
+        .arg("--search")
+        .arg("firstSymbol")
+        .output()
+        .unwrap();
+    assert!(
+        symbols.status.success(),
+        "socket symbols failed: {}",
+        String::from_utf8_lossy(&symbols.stderr)
+    );
+    assert!(
+        !serde_json::from_slice::<Value>(&symbols.stdout).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(run(&home, "export", &first).is_object());
+    // Index activated this checkout. A conflicting registration cannot replace
+    // its options until the active checkout is released.
+    let mut conflict = serve(&home, &first, address, &token_file)
+        .arg("--max-file-bytes")
+        .arg("3145728")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = conflict.try_wait().unwrap() {
+            assert!(
+                !status.success(),
+                "active checkout accepted conflicting options"
+            );
+            let output = conflict.wait_with_output().unwrap();
+            assert!(String::from_utf8_lossy(&output.stderr).contains("registration_conflict"));
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = conflict.kill();
+            let _ = conflict.wait();
+            panic!("conflicting registration did not return within deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(first_serve.0.try_wait().unwrap().is_none());
+    assert!(second_serve.0.try_wait().unwrap().is_none());
+    assert!(daemon.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn finite_cli_index_status_symbols_export_fallback_without_daemon() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "fallback");
+    let output = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = run(&home, "status", &root);
+    assert!(status["revision"]["indexRevision"].as_u64().unwrap() >= 1);
+    let symbols = cli(&home)
+        .arg("symbols")
+        .arg("--workspace")
+        .arg(&root)
+        .arg("--search")
+        .arg("fallbackSymbol")
+        .output()
+        .unwrap();
+    assert!(
+        symbols.status.success(),
+        "symbols fallback failed: {}",
+        String::from_utf8_lossy(&symbols.stderr)
+    );
+    let symbols: Value = serde_json::from_slice(&symbols.stdout).unwrap();
+    assert!(!symbols["items"].as_array().unwrap().is_empty());
+    let exported = run(&home, "export", &root);
+    assert!(exported.is_object());
+}
+
+#[tokio::test]
+async fn long_home_socket_names_are_private_distinct_connectable_and_recover_after_crash() {
+    use baleyg::daemon::SocketPaths;
+    use std::os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::UnixStream,
+    };
+    let temp = TempDir::new().unwrap();
+    let long = "long-home-component-".repeat(7);
+    let homes: Vec<_> = ["one", "two"]
+        .into_iter()
+        .map(|label| temp.path().join(label).join(&long))
+        .collect();
+    let data = |home: &Path| home.join("Library/Application Support/dev.odin.baleyg");
+    let paths: Vec<_> = homes
+        .iter()
+        .map(|home| SocketPaths::new(&data(home)))
+        .collect();
+    assert_ne!(
+        paths[0].socket, paths[1].socket,
+        "long HOME identities must not collide"
+    );
+    for paths in &paths {
+        assert!(
+            paths.socket.starts_with("/tmp"),
+            "long HOME should use bounded private socket path"
+        );
+        assert!(paths.socket.as_os_str().as_encoded_bytes().len() <= 103);
+    }
+    let mut owners = Vec::new();
+    for (home, paths) in homes.iter().zip(&paths) {
+        fs::create_dir_all(home).unwrap();
+        let mut command = cli(home);
+        command.arg("daemon");
+        let mut owner = detached(command);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if UnixStream::connect(&paths.socket).is_ok() {
+                break;
+            }
+            assert!(
+                owner.0.try_wait().unwrap().is_none(),
+                "long-HOME daemon exited before accepting socket clients"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "long-HOME daemon did not bind socket"
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let metadata = fs::symlink_metadata(&paths.socket).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(paths.socket.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(owner.0.try_wait().unwrap().is_none());
+        owners.push(owner);
+    }
+    assert!(UnixStream::connect(&paths[0].socket).is_ok());
+    assert!(UnixStream::connect(&paths[1].socket).is_ok());
+    // SIGKILL does not run SocketOwner::drop; election must recover the stale socket.
+    let old_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&paths[0].socket).unwrap());
+    owners[0].0.kill().unwrap();
+    owners[0].0.wait().unwrap();
+    assert!(paths[0].socket.exists());
+    let mut command = cli(&homes[0]);
+    command.arg("daemon");
+    let mut recovered = detached(command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(metadata) = fs::metadata(&paths[0].socket)
+            && std::os::unix::fs::MetadataExt::ino(&metadata) != old_inode
+            && UnixStream::connect(&paths[0].socket).is_ok()
+        {
+            break;
+        }
+        assert!(
+            recovered.0.try_wait().unwrap().is_none(),
+            "crash recovery daemon exited"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "stale long-HOME socket not recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        UnixStream::connect(&paths[1].socket).is_ok(),
+        "unrelated HOME was displaced"
+    );
+}
+
+#[tokio::test]
+async fn daemon_scheduler_follows_held_checkout_leader_then_claims_same_cli_request() {
+    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use std::os::{fd::AsRawFd, unix::net::UnixStream};
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "follower");
+    // Establish the durable index before holding its leader lock. Explicit
+    // isolated roots avoid changing process-wide HOME in this parallel test.
+    let initial = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial: Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let initial_revision = initial["publishedRevision"]["indexRevision"]
+        .as_u64()
+        .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let topology = TopologyRoots::isolated_for_tests(
+        home.join("Library/Caches/dev.odin.baleyg"),
+        home.join("Library/Application Support/dev.odin.baleyg"),
+    );
+    let leader = topology.leader(&identity).unwrap();
+    let held_incarnation = leader.incarnation.to_string();
+    let leader_file = fs::File::open(topology.leader_lock(&identity)).unwrap();
+    let mut daemon_command = cli(&home);
+    daemon_command.arg("daemon");
+    let mut daemon = detached(daemon_command);
+    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon died before socket readiness"
+        );
+        assert!(Instant::now() < deadline, "daemon socket not ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // This command must reach the daemon socket, not the no-daemon fallback.
+    // Its durable queue row is observed while the leader guard remains alive.
+    let stdout = fs::File::create(temp.path().join("index.stdout")).unwrap();
+    let stderr_path = temp.path().join("index.stderr");
+    let stderr = fs::File::create(&stderr_path).unwrap();
+    let mut request = Owned(
+        cli(&home)
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap(),
+    );
+    let queue_path = topology.requests_db(&identity);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (id, seq): (String, i64) = loop {
+        let db = rusqlite::Connection::open_with_flags(
+            &queue_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let rows: Vec<(String, i64, String)> = db
+            .prepare("SELECT id,seq,state FROM requests ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        if rows.len() == 2 {
+            assert_eq!(rows[1].2, "queued", "daemon claimed despite held leader");
+            break (rows[1].0.clone(), rows[1].1);
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "request was unexpectedly duplicated: {rows:?}"
+        );
+        assert!(
+            request.0.try_wait().unwrap().is_none(),
+            "CLI exited before daemon accepted request: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not accept index request"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    // Multiple scheduler ticks must leave the original ACK queued, its claim
+    // empty, and the held leader incarnation unchanged. flock tests the inode,
+    // not just the contents of a possibly stale lock pathname.
+    let hold_until = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < hold_until {
+        assert!(
+            request.0.try_wait().unwrap().is_none(),
+            "request finished during leader hold"
+        );
+        assert_eq!(
+            fs::read_to_string(topology.leader_lock(&identity))
+                .unwrap()
+                .trim(),
+            held_incarnation
+        );
+        assert_ne!(
+            unsafe { libc::flock(leader_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "checkout leader lock was released during hold"
+        );
+        let db = rusqlite::Connection::open_with_flags(
+            &queue_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let rows: Vec<(String, i64, String, Option<String>)> = db
+            .prepare("SELECT id,seq,state,claim_incarnation FROM requests ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "daemon or CLI enqueued twice: {rows:?}");
+        assert_eq!(
+            (
+                &rows[1].0,
+                rows[1].1,
+                rows[1].2.as_str(),
+                rows[1].3.as_ref()
+            ),
+            (&id, seq, "queued", None),
+            "daemon independently claimed while follower"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    drop(leader);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = request.0.try_wait().unwrap() {
+            assert!(
+                status.success(),
+                "request failed: {}",
+                fs::read_to_string(&stderr_path).unwrap()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not complete queued request"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let output: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("index.stdout")).unwrap()).unwrap();
+    let revision = output["publishedRevision"]["indexRevision"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        revision > initial_revision,
+        "daemon may publish mandatory H before the queued request"
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        &queue_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    type CompletedRow = (String, i64, String, Option<String>, Option<i64>);
+    let rows: Vec<CompletedRow> = db
+        .prepare("SELECT id,seq,state,claim_incarnation,result_revision FROM requests ORDER BY seq")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "same request must be completed without re-enqueue"
+    );
+    assert_eq!(
+        (&rows[1].0, rows[1].1, rows[1].2.as_str(), rows[1].4),
+        (&id, seq, "done", Some(revision as i64))
+    );
+    assert_ne!(
+        rows[1].3.as_deref(),
+        Some(held_incarnation.as_str()),
+        "held follower leader claimed job"
+    );
+    assert_eq!(
+        rows[1].3.as_deref(),
+        Some(
+            fs::read_to_string(topology.leader_lock(&identity))
+                .unwrap()
+                .trim()
+        )
+    );
+    assert!(daemon.0.try_wait().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn daemon_served_export_survives_multi_frame_cli_reply() {
+    use std::os::unix::net::UnixStream;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "large-export");
+    let mut source = String::new();
+    for i in 0..6000 {
+        source.push_str(&format!(
+            "function symbol_{i:05}_{}() {{ return {i}; }}\n",
+            "x".repeat(140)
+        ));
+    }
+    fs::write(root.join("large.js"), source).unwrap();
+    let mut command = cli(&home);
+    command.arg("daemon");
+    let mut daemon = detached(command);
+    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited before socket readiness"
+        );
+        assert!(Instant::now() < deadline, "daemon socket not ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let indexed = cli(&home)
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let exported = cli(&home)
+        .arg("export")
+        .arg("--workspace")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert!(
+        exported.stdout.len() > 1_048_576,
+        "fixture did not cross one reply frame: {} bytes",
+        exported.stdout.len()
+    );
+    let graph: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    assert!(graph.is_object(), "daemon export lost its JSON payload");
+    assert!(daemon.0.try_wait().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn serve_arms_sigterm_before_banner_to_control_wait() {
+    use std::os::unix::net::UnixStream;
+
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "signal-window");
+    let token = temp.path().join("token");
+    let address = free_address();
+    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let mut daemon_command = cli(&home);
+    daemon_command.arg("daemon");
+    let mut daemon = detached(daemon_command);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while UnixStream::connect(&socket).is_err() {
+        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
+        assert!(Instant::now() < deadline, "daemon socket not ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let original_pid = daemon.0.id();
+    let log = temp.path().join("serve.log");
+    let mut command = serve(&home, &root, address, &token);
+    command
+        .env("BALEYG_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(&log).unwrap()));
+    let mut served = Owned(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fs::read_to_string(&log)
+            .unwrap()
+            .contains(&format!("Baleyg: http://{address}/"))
+        {
+            break;
+        }
+        assert!(
+            served.0.try_wait().unwrap().is_none(),
+            "serve exited before banner: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        assert!(Instant::now() < deadline, "serve banner not printed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The opt-in pause keeps the serve select unpolled. Without pre-arming
+    // SIGTERM, this signal terminates the process instead of closing control.
+    assert_eq!(
+        unsafe { libc::kill(served.0.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = served.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "serve did not exit on SIGTERM");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        status.success(),
+        "serve did not shut down gracefully: {status}; log: {}",
+        fs::read_to_string(&log).unwrap()
+    );
+    assert_eq!(daemon.0.id(), original_pid);
+    assert!(
+        daemon.0.try_wait().unwrap().is_none(),
+        "daemon owner exited"
+    );
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "daemon socket changed"
+    );
+}

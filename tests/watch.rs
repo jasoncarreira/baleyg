@@ -10,6 +10,131 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Child-process fixture for the pre-daemon HTTP serving path. This preserves
+// selected API and watcher assertions while the production CLI uses its daemon.
+#[tokio::test]
+async fn legacy_http_fixture_entry() -> anyhow::Result<()> {
+    use baleyg::{
+        auth,
+        dependencies::CatalogOptions,
+        http,
+        store::topology::{TopologyRoots, WorkspaceIdentity},
+    };
+    use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering};
+    if std::env::var("BALEYG_LEGACY_HTTP_FIXTURE").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let cwd = std::env::current_dir()?;
+    let workspace =
+        PathBuf::from(std::env::var_os("BALEYG_LEGACY_WORKSPACE").expect("fixture workspace"));
+    let bind: SocketAddr = std::env::var("BALEYG_LEGACY_BIND")?.parse()?;
+    anyhow::ensure!(bind.ip().is_loopback(), "fixture requires loopback bind");
+    let token_path =
+        PathBuf::from(std::env::var_os("BALEYG_LEGACY_TOKEN_FILE").expect("fixture token file"));
+    let max_file_bytes = std::env::var("BALEYG_LEGACY_MAX_FILE_BYTES")
+        .unwrap_or_else(|_| "2097152".into())
+        .parse::<u64>()?;
+    anyhow::ensure!(
+        (1..=16_777_216).contains(&max_file_bytes),
+        "max-file-bytes must be 1..16777216"
+    );
+    let roots = TopologyRoots::production()?;
+    let identity = WorkspaceIdentity::discover_unattached(Some(&workspace), &cwd)?;
+    roots.reject_root_overlap(&identity)?;
+    roots.validate_external(&identity, std::slice::from_ref(&token_path))?;
+    let identity = identity.attach_marker()?;
+    let mut options = IndexOptions::new(identity.root.clone());
+    options.scip_path = std::env::var_os("BALEYG_LEGACY_SCIP").map(PathBuf::from);
+    options.manifest_path = std::env::var_os("BALEYG_LEGACY_MANIFEST").map(PathBuf::from);
+    options.anchor_optional_inputs(&cwd)?;
+    options.max_file_bytes = max_file_bytes;
+    let store = Store::open(roots, identity)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let session =
+        match index_coordinator::establish_serving_session(&store, Some(&options), &cancel) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("Evidence unavailable at startup: {error:#}");
+                None
+            }
+        };
+    let token = auth::load_or_create_token(&token_path)?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let address = listener.local_addr()?;
+    let cargo_home = std::env::var_os("BALEYG_LEGACY_CARGO_HOME")
+        .or_else(|| std::env::var_os("CARGO_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
+    let browse_root = options.workspace_root.clone();
+    let state = http::new_with_dependency_options(
+        store,
+        options,
+        token,
+        address,
+        None,
+        None,
+        browse_root,
+        Vec::new(),
+        Some(CatalogOptions {
+            cargo_home,
+            rust_library: std::env::var_os("RUST_SRC_PATH").map(PathBuf::from),
+        }),
+    )?;
+    if let Some(session) = session {
+        state.retain_serving_session(session);
+    } else {
+        state.retry_failed_serving_startup();
+    }
+    state.start_dependency_index();
+    eprintln!("Baleyg: http://{address}/");
+    let shutdown_state = state.clone();
+    axum::serve(listener, http::router(state))
+        .with_graceful_shutdown(async move {
+            #[cfg(unix)]
+            {
+                if let Ok(mut term) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    let _ = term.recv().await;
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            shutdown_state.cancel_active();
+        })
+        .await?;
+    cancel.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn legacy_http_fixture(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    bind: impl ToString,
+    token: &std::path::Path,
+    max_file_bytes: Option<&str>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("legacy_http_fixture_entry")
+        .arg("--nocapture")
+        .env("HOME", home)
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env("BALEYG_LEGACY_HTTP_FIXTURE", "1")
+        .env("BALEYG_LEGACY_WORKSPACE", root)
+        .env("BALEYG_LEGACY_BIND", bind.to_string())
+        .env("BALEYG_LEGACY_TOKEN_FILE", token);
+    if let Some(max_file_bytes) = max_file_bytes {
+        command.env("BALEYG_LEGACY_MAX_FILE_BYTES", max_file_bytes);
+    }
+    command
+}
 #[test]
 fn leader_reconciles_edit_without_explicit_request() {
     let state = tempfile::tempdir().unwrap();
@@ -716,11 +841,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         .mode(0o600)
         .open(&first_log)
         .unwrap();
-    let server = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let server = legacy_http_fixture(&root, &home, address, &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(first_stderr))
         .spawn()
@@ -773,11 +894,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         .mode(0o600)
         .open(&successor_log)
         .unwrap();
-    let successor_process = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(successor_addr.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let successor_process = legacy_http_fixture(&root, &home, successor_addr, &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(successor_stderr))
         .spawn()
@@ -1056,13 +1173,7 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
         .mode(0o600)
         .open(&stderr_path)
         .unwrap();
-    let child = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token_path)
-        .arg("--max-file-bytes")
-        .arg("8")
+    let child = legacy_http_fixture(&root, &home, address, &token_path, Some("8"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr))
         .spawn()
@@ -1334,11 +1445,7 @@ async fn virgin_queue_v0_does_not_block_mandatory_takeover_without_a_request() {
     let first_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let first_address = first_listener.local_addr().unwrap();
     drop(first_listener);
-    let first = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(first_address.to_string())
-        .arg("--token-file")
-        .arg(&token_path)
+    let first = legacy_http_fixture(&root, &home, first_address, &token_path, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -1455,11 +1562,7 @@ async fn virgin_queue_v0_does_not_block_mandatory_takeover_without_a_request() {
         .mode(0o600)
         .open(&successor_log)
         .unwrap();
-    let successor_child = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token_path)
+    let successor_child = legacy_http_fixture(&root, &home, address, &token_path, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr))
         .spawn()
@@ -1794,11 +1897,7 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let daemon_log = temp.path().join("follower-daemon-stderr.log");
-    let daemon = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let daemon = legacy_http_fixture(&root, &home, address, &token, None)
         .env("BALEYG_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
@@ -2621,11 +2720,7 @@ async fn completed_cli_result_read_busy_keeps_done_and_requires_successor_reconc
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
-    let server = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let server = legacy_http_fixture(&root, &home, address, &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
             fs::File::create(temp.path().join("successor.log")).unwrap(),
@@ -2904,11 +2999,7 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let daemon_log = temp.path().join("follower-daemon-stderr.log");
-    let server = cli(&root, &home, "serve")
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let server = legacy_http_fixture(&root, &home, address, &token, None)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
             fs::File::create(&daemon_log).unwrap(),
@@ -3702,13 +3793,7 @@ async fn real_serve_pending_takeover_preserves_h_before_distinct_a_b_ack_pins() 
     let address = listener.local_addr().unwrap();
     drop(listener);
     let daemon_stderr = temp.path().join("successor-stderr.log");
-    let process = cli(&root, &home, "serve")
-        .arg("--max-file-bytes")
-        .arg("256") // distinct daemon defaults
-        .arg("--bind")
-        .arg(address.to_string())
-        .arg("--token-file")
-        .arg(&token)
+    let process = legacy_http_fixture(&root, &home, address, &token, Some("256"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
             fs::File::create(&daemon_stderr).unwrap(),
