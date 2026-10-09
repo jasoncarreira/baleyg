@@ -8,6 +8,46 @@ use std::{
 };
 use tempfile::TempDir;
 
+async fn selected_json(
+    app: axum::Router,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (axum::http::StatusCode, axum::http::HeaderMap, Value) {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, headers, body)
+}
+
 fn command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     cmd.env("HOME", home)
@@ -53,7 +93,12 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         "function alpha_checkout() { return 1; }\n",
     )
     .unwrap();
-    git(&a, &["add", "core.js"]);
+    fs::write(
+        a.join("core.py"),
+        "class AlphaClass:\n    def execute(self):\n        return 1\n",
+    )
+    .unwrap();
+    git(&a, &["add", "core.js", "core.py"]);
     git(&a, &["commit", "-qm", "base"]);
     git(
         &a,
@@ -62,6 +107,11 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     fs::write(
         b.join("core.js"),
         "function beta_checkout() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        b.join("core.py"),
+        "class BetaClass:\n    def execute(self):\n        return 2\n",
     )
     .unwrap();
     for root in [&a, &b] {
@@ -243,6 +293,170 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             status["catchingUp"].as_bool().unwrap().to_string(),
             status_header
         );
+        let tree = client
+            .get(format!("{base}/api/checkouts/{key}/tree"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tree.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            tree.headers()["X-Baleyg-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        let tree: Value = tree.json().await.unwrap();
+        assert!(tree["items"].to_string().contains("core.py"), "{tree}");
+        let missing_dir = client
+            .get(format!("{base}/api/checkouts/{key}/tree"))
+            .query(&[("path", "absent")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_dir.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_dir.json::<Value>().await.unwrap()["error"]["code"],
+            "directory_missing"
+        );
+        let invalid_dir = client
+            .get(format!("{base}/api/checkouts/{key}/tree"))
+            .query(&[("path", "core.py")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_dir.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            invalid_dir.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_directory"
+        );
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        let forbidden_dir = client
+            .get(format!("{base}/api/checkouts/{key}/tree"))
+            .query(&[("path", "private")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
+        assert_eq!(
+            forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
+            "directory_forbidden"
+        );
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let files = client
+            .get(format!("{base}/api/checkouts/{key}/files"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(files.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            files.headers()["X-Baleyg-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        let files: Value = files.json().await.unwrap();
+        assert!(files["items"].to_string().contains("core.js"), "{files}");
+        let methods = client
+            .get(format!("{base}/api/checkouts/{key}/methods"))
+            .query(&[("path", "core.js")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(methods.status(), reqwest::StatusCode::OK);
+        let methods: Value = methods.json().await.unwrap();
+        assert!(methods.to_string().contains(expected), "{methods}");
+        let class_name = if key == &a_key {
+            "AlphaClass"
+        } else {
+            "BetaClass"
+        };
+        let foreign_class = if key == &a_key {
+            "BetaClass"
+        } else {
+            "AlphaClass"
+        };
+        let classes = client
+            .get(format!("{base}/api/checkouts/{key}/classes"))
+            .query(&[("q", class_name)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(classes.status(), reqwest::StatusCode::OK);
+        let classes: Value = classes.json().await.unwrap();
+        assert!(classes.to_string().contains(class_name), "{classes}");
+        assert!(!classes.to_string().contains(foreign_class), "{classes}");
+        for bad in ["limit=101", "offset=1000001", "path=../core.py", "q=%00"] {
+            let invalid = client
+                .get(format!("{base}/api/checkouts/{key}/classes?{bad}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(
+                invalid.json::<Value>().await.unwrap()["error"]["code"],
+                "invalid_class_request"
+            );
+        }
+        let class_id = classes["items"][0]["symbol"]["id"].as_str().unwrap();
+        let diagram = client
+            .post(format!("{base}/api/checkouts/{key}/class-diagram"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":class_id,"expectedRevision":classes["revision"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            diagram.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            diagram.text().await.unwrap_or_default()
+        );
+        assert!(diagram.headers().contains_key("X-Baleyg-Catching-Up"));
+        let diagram: Value = diagram.json().await.unwrap();
+        assert!(diagram.to_string().contains(class_name), "{diagram}");
+        let navigation = client.post(format!("{base}/api/checkouts/{key}/navigation"))
+            .bearer_auth(token).json(&serde_json::json!({"expectedRevision":classes["revision"],"path":"core.py","line":2}))
+            .send().await.unwrap();
+        assert_eq!(
+            navigation.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            navigation.text().await.unwrap_or_default()
+        );
+        assert!(navigation.headers().contains_key("X-Baleyg-Workspace"));
+        let navigation: Value = navigation.json().await.unwrap();
+        assert_eq!(navigation["revision"], classes["revision"]);
+        let foreign_key = if key == &a_key { &b_key } else { &a_key };
+        let wrong = client
+            .post(format!("{base}/api/checkouts/{foreign_key}/class-diagram"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":class_id,"expectedRevision":classes["revision"]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(!wrong.status().is_success());
+        assert!(wrong.headers().contains_key("X-Baleyg-Workspace"));
+
+        let symbols = client
+            .get(format!("{base}/api/checkouts/{key}/symbols"))
+            .query(&[("q", expected)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(symbols.status(), reqwest::StatusCode::OK);
+        let symbols: Value = symbols.json().await.unwrap();
+        assert!(symbols.to_string().contains(expected), "{symbols}");
         let source = client
             .get(format!("{base}/api/checkouts/{key}/source"))
             .query(&[("path", "core.js")])
@@ -283,6 +497,205 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let view: Value = query.json().await.unwrap();
         assert_eq!(view["query"]["seed"], seed.as_str());
         assert!(view.to_string().contains(expected_name), "{view}");
+        let revision = &view["revision"];
+        let pinned = format!(
+            "indexGeneration={}&indexRevision={}",
+            revision["indexGeneration"].as_str().unwrap(),
+            revision["indexRevision"].as_u64().unwrap()
+        );
+        let record = serde_json::json!({"id":"saved","title":"Mine","query":{"seed":seed},"pins":{},"hidden":[]});
+        let saved = client
+            .put(format!("{base}/api/checkouts/{key}/views/saved?{pinned}"))
+            .bearer_auth(token)
+            .json(&record)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            saved.text().await.unwrap_or_default()
+        );
+        assert!(saved.headers().contains_key("X-Baleyg-Workspace"));
+        let other_view = client
+            .get(format!("{base}/api/checkouts/{other}/views/saved"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        if key == &a_key {
+            assert_eq!(other_view.status(), reqwest::StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(other_view.status(), reqwest::StatusCode::OK);
+            let other_value: Value = other_view.json().await.unwrap();
+            assert_eq!(other_value["view"]["query"]["seed"], seeds[0]);
+        }
+        let note = serde_json::json!({"id":"note","nodeId":seed,"body":"Only here"});
+        let saved = client
+            .put(format!(
+                "{base}/api/checkouts/{key}/annotations/note?{pinned}"
+            ))
+            .bearer_auth(token)
+            .json(&note)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            saved.text().await.unwrap_or_default()
+        );
+        let other_notes = client
+            .get(format!("{base}/api/checkouts/{other}/annotations"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other_notes.status(), reqwest::StatusCode::OK);
+        let other_notes: Value = other_notes.json().await.unwrap();
+        if key == &a_key {
+            assert_eq!(other_notes, serde_json::json!([]));
+        } else {
+            assert_eq!(other_notes[0]["annotation"]["nodeId"], seeds[0]);
+        }
+        let preview = client.post(format!("{base}/api/checkouts/{key}/questions/preview"))
+            .bearer_auth(token).json(&serde_json::json!({"seed":seed,"question":"What calls?","expectedRevision":revision}))
+            .send().await.unwrap();
+        assert_eq!(
+            preview.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            preview.text().await.unwrap_or_default()
+        );
+        let preview: Value = preview.json().await.unwrap();
+        let packet_id = preview["packet"]["packetId"].as_str().unwrap();
+        let exported = client
+            .get(format!(
+                "{base}/api/checkouts/{key}/questions/{packet_id}/jev-request"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), reqwest::StatusCode::OK);
+        let imported = client
+            .post(format!(
+                "{base}/api/checkouts/{key}/questions/{packet_id}/jev-response"
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"model":"jev-1.13.0","answers":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            imported.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            imported.text().await.unwrap_or_default()
+        );
+        assert_eq!(
+            imported.headers()["X-Baleyg-Workspace"],
+            (if key == &a_key {
+                a.canonicalize().unwrap()
+            } else {
+                b.canonicalize().unwrap()
+            })
+            .to_str()
+            .unwrap()
+        );
+        let selection = client
+            .post(format!(
+                "{base}/api/checkouts/{key}/questions/{packet_id}/selection"
+            ))
+            .bearer_auth(token)
+            .json(&preview["selection"])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            selection.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            selection.text().await.unwrap_or_default()
+        );
+        let invalid_selection = client
+            .post(format!(
+                "{base}/api/checkouts/{key}/questions/{packet_id}/selection"
+            ))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"packetId":"wrong","decisions":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_selection.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            invalid_selection.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_question_selection"
+        );
+        let missing_seed = client.post(format!("{base}/api/checkouts/{key}/questions/preview"))
+            .bearer_auth(token).json(&serde_json::json!({"seed":"missing","question":"What calls?","expectedRevision":revision}))
+            .send().await.unwrap();
+        assert_eq!(missing_seed.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_seed.json::<Value>().await.unwrap()["error"]["code"],
+            "not_found"
+        );
+        let foreign = client
+            .get(format!(
+                "{base}/api/checkouts/{other}/questions/{packet_id}/jev-request"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        for (action, payload) in [
+            (
+                "jev-response",
+                serde_json::json!({"model":"jev-1.13.0","answers":{}}),
+            ),
+            ("selection", preview["selection"].clone()),
+        ] {
+            let foreign = client
+                .post(format!(
+                    "{base}/api/checkouts/{other}/questions/{packet_id}/{action}"
+                ))
+                .bearer_auth(token)
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+            assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        }
+        let sequence = client
+            .post(format!("{base}/api/checkouts/{key}/sequence"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":seed,"expectedRevision":view["revision"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            sequence.text().await.unwrap_or_default()
+        );
+        let foreign_symbol = client
+            .get(format!("{base}/api/checkouts/{other}/symbol"))
+            .query(&[("id", seed)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_symbol.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign_symbol.headers().contains_key("X-Baleyg-Workspace"));
         let foreign_query = client
             .post(format!("{base}/api/checkouts/{other}/query"))
             .bearer_auth(token)
@@ -346,6 +759,51 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign_cancel.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+    for suffix in ["views/saved", "annotations/note"] {
+        let deleted = client
+            .delete(format!("{base}/api/checkouts/{a_key}/{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(
+            deleted.headers()["X-Baleyg-Workspace"],
+            a.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(deleted.headers().contains_key("X-Baleyg-Catching-Up"));
+        let surviving = client
+            .get(format!(
+                "{base}/api/checkouts/{b_key}/{}",
+                suffix.split('/').next().unwrap()
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(surviving.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            surviving
+                .json::<Value>()
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let deleted = client
+            .delete(format!("{base}/api/checkouts/{b_key}/{suffix}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+        assert_eq!(
+            deleted.headers()["X-Baleyg-Workspace"],
+            b.canonicalize().unwrap().to_str().unwrap()
+        );
     }
     let missing = client
         .get(format!("{base}/api/status"))
@@ -584,7 +1042,16 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
     };
     use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    for stage in ["after_handler", "before_read_finish"] {
+    for (stage, route_suffix) in [
+        ("after_handler", "status"),
+        ("before_read_finish", "status"),
+        ("after_handler", "files"),
+        ("before_read_finish", "files"),
+        ("after_handler", "tree"),
+        ("before_read_finish", "classes"),
+        ("after_handler", "symbols"),
+        ("before_read_finish", "views"),
+    ] {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("checkout");
         fs::create_dir(&root).unwrap();
@@ -600,7 +1067,7 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let address = "127.0.0.1:7331".parse().unwrap();
         let browser = ProvisionedBrowser::new(registry.clone(), TOKEN.to_owned(), address).unwrap();
         let app = browser.clone().router();
-        let route = format!("/api/checkouts/{}/status", identity.root_key);
+        let route = format!("/api/checkouts/{}/{route_suffix}", identity.root_key);
         let call = |app: axum::Router| {
             let route = route.clone();
             async move {
@@ -648,6 +1115,306 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert_eq!(error["error"]["code"], "root_changed", "{stage}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn selected_question_export_keeps_legacy_oversize_error() {
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("large.js"),
+        format!(
+            "function big() {{\n/*{}*/\nreturn 1;\n}}\n",
+            "x".repeat(180_000)
+        ),
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let app = ProvisionedBrowser::new(
+        Arc::new(tokio::sync::Mutex::new(registry)),
+        TOKEN.to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let pin = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, _, value) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
+                break value["revision"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, _, symbols) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/symbols?q=big"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let seed = symbols["items"][0]["id"].as_str().unwrap();
+    let (status, _, preview) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{prefix}/questions/preview"),
+        serde_json::json!({"seed":seed,"question":"Explain this","expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "{status}: {}",
+        preview["error"]
+    );
+    let id = preview["packet"]["packetId"].as_str().unwrap();
+    let (status, headers, error) = selected_json(
+        app,
+        "GET",
+        &format!("{prefix}/questions/{id}/jev-request"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{error}"
+    );
+    assert_eq!(error["error"]["code"], "evidence_too_large");
+    assert_eq!(
+        headers["X-Baleyg-Workspace"],
+        identity.root.to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn selected_question_preview_keeps_legacy_oversize_error() {
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("checkout");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("large.js"),
+        format!(
+            "function big() {{\n/*{}*/\nreturn 1;\n}}\n",
+            "x".repeat(1_060_000)
+        ),
+    )
+    .unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let app = ProvisionedBrowser::new(
+        Arc::new(tokio::sync::Mutex::new(registry)),
+        TOKEN.to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap()
+    .router();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let pin = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let (status, _, value) =
+                selected_json(app.clone(), "GET", &format!("{prefix}/status"), Value::Null).await;
+            if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
+                break value["revision"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (status, _, symbols) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/symbols?q=big"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let seed = symbols["items"][0]["id"].as_str().unwrap();
+    let (status, headers, error) = selected_json(
+        app,
+        "POST",
+        &format!("{prefix}/questions/preview"),
+        serde_json::json!({"seed":seed,"question":"Explain this","expectedRevision":pin}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{error}"
+    );
+    assert_eq!(error["error"]["code"], "evidence_too_large");
+    assert_eq!(
+        headers["X-Baleyg-Workspace"],
+        identity.root.to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn selected_saved_mutation_reports_committed_drift_and_preserves_real_record_state() {
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::{DurableRecords, TopologyRoots},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    for kind in ["view", "annotation"] {
+        for method in ["PUT", "DELETE"] {
+            for stage in ["before_mutation", "after_handler"] {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("checkout");
+                fs::create_dir(&root).unwrap();
+                fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+                let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+                let roots = TopologyRoots::isolated_for_tests(
+                    temp.path().join("cache"),
+                    temp.path().join("data"),
+                );
+                let mut registry = CheckoutRegistry::with_roots(roots.clone());
+                registry
+                    .register(&identity, CheckoutOptions(serde_json::json!({})))
+                    .unwrap();
+                let browser = ProvisionedBrowser::new(
+                    Arc::new(tokio::sync::Mutex::new(registry)),
+                    TOKEN.to_owned(),
+                    "127.0.0.1:7331".parse().unwrap(),
+                )
+                .unwrap();
+                let app = browser.clone().router();
+                let prefix = format!("/api/checkouts/{}", identity.root_key);
+                let pin = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        let (status, _, value) = selected_json(
+                            app.clone(),
+                            "GET",
+                            &format!("{prefix}/status"),
+                            Value::Null,
+                        )
+                        .await;
+                        if status == axum::http::StatusCode::OK && value["catchingUp"] == false {
+                            break value["revision"].clone();
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let (status, _, symbols) = selected_json(
+                    app.clone(),
+                    "GET",
+                    &format!("{prefix}/symbols?q=stable"),
+                    Value::Null,
+                )
+                .await;
+                assert_eq!(status, axum::http::StatusCode::OK);
+                let seed = symbols["items"][0]["id"].as_str().unwrap();
+                let pin = format!(
+                    "indexGeneration={}&indexRevision={}",
+                    pin["indexGeneration"].as_str().unwrap(),
+                    pin["indexRevision"].as_u64().unwrap()
+                );
+                let (suffix, payload) = if kind == "view" {
+                    (
+                        "views/saved",
+                        serde_json::json!({"id":"saved","title":"Saved","query":{"seed":seed},"pins":{},"hidden":[]}),
+                    )
+                } else {
+                    (
+                        "annotations/note",
+                        serde_json::json!({"id":"note","nodeId":seed,"body":"Saved"}),
+                    )
+                };
+                let uri = format!("{prefix}/{suffix}?{pin}");
+                if method == "DELETE" {
+                    let (status, _, value) =
+                        selected_json(app.clone(), "PUT", &uri, payload.clone()).await;
+                    assert_eq!(status, axum::http::StatusCode::OK, "{value}");
+                }
+                let moved = temp.path().join("moved");
+                let changed = Arc::new(AtomicBool::new(false));
+                let changed_hook = changed.clone();
+                let old_root = root.clone();
+                let target = moved.clone();
+                browser.set_selected_response_hook_for_tests(Arc::new(move |at| {
+                    if at == stage && !changed_hook.swap(true, Ordering::AcqRel) {
+                        fs::rename(&old_root, &target).unwrap();
+                    }
+                }));
+                let (status, headers, value) =
+                    selected_json(app.clone(), method, &uri, payload).await;
+                assert!(changed.load(Ordering::Acquire));
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::CONFLICT,
+                    "{kind} {method} {stage}: {value}"
+                );
+                assert_eq!(value["error"]["code"], "root_changed");
+                assert_eq!(
+                    headers["X-Baleyg-Workspace"],
+                    identity.root.to_str().unwrap()
+                );
+                assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+                if stage == "after_handler" {
+                    assert_eq!(value["mutationOutcome"], "committed");
+                    assert_eq!(headers["X-Baleyg-Mutation-Outcome"], "committed");
+                } else {
+                    assert!(value.get("mutationOutcome").is_none());
+                    assert!(!headers.contains_key("X-Baleyg-Mutation-Outcome"));
+                }
+                fs::rename(&moved, &root).unwrap();
+                let records = DurableRecords::new(&roots, &identity);
+                let exists = if kind == "view" {
+                    records.view_record("saved").unwrap().is_some()
+                } else {
+                    records
+                        .annotation_records()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.id == "note")
+                };
+                assert_eq!(
+                    exists,
+                    (method == "PUT") == (stage == "after_handler"),
+                    "{kind} {method} {stage}"
+                );
+            }
+        }
     }
 }
 
@@ -825,6 +1592,90 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
 }
 
 #[tokio::test]
+async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("cold");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function cold() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        TOKEN.to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = browser.router();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry
+            .browser_request_at(&identity, std::time::Instant::now())
+            .unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }));
+        runtime
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{}/files", identity.root_key))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response.headers()["X-Baleyg-Workspace"],
+        identity.root.to_str().unwrap()
+    );
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["error"]["code"], "index_not_ready");
+    assert!(body.get("revision").is_none());
+    resume_tx.send(()).unwrap();
+    drop(runtime);
+}
+
+#[tokio::test]
 async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
     use axum::{
         body::{Body, to_bytes},
@@ -845,7 +1696,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
-    let mut registry = CheckoutRegistry::with_roots(roots);
+    let mut registry = CheckoutRegistry::with_roots(roots.clone());
     registry
         .register(&identity, CheckoutOptions(serde_json::json!({})))
         .unwrap();
@@ -880,18 +1731,46 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             (code, headers, body)
         }
     };
-    let (old_revision, after_request) = tokio::time::timeout(Duration::from_secs(20), async {
+    let old_revision = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let (code, headers, body) = status(app.clone()).await;
             if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
                 assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
-                break (body["revision"].clone(), std::time::Instant::now());
+                break body["revision"].clone();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
+    let prefix = format!("/api/checkouts/{}", identity.root_key);
+    let (code, _, symbols) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{prefix}/symbols?q=old_step"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    let seed = symbols["items"][0]["id"].as_str().unwrap().to_owned();
+    let pin = format!(
+        "indexGeneration={}&indexRevision={}",
+        old_revision["indexGeneration"].as_str().unwrap(),
+        old_revision["indexRevision"].as_u64().unwrap()
+    );
+    let view = serde_json::json!({"id":"saved","title":"Original","query":{"seed":seed},"pins":{},"hidden":[]});
+    let note = serde_json::json!({"id":"note","nodeId":seed,"body":"Original"});
+    for (path, value) in [("views/saved", &view), ("annotations/note", &note)] {
+        let (code, _, body) = selected_json(
+            app.clone(),
+            "PUT",
+            &format!("{prefix}/{path}?{pin}"),
+            value.clone(),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+    }
+    let after_request = std::time::Instant::now();
     {
         let mut registry = registry.lock().await;
         let released = registry
@@ -922,11 +1801,103 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     })
     .await
     .unwrap();
+    for (path, value) in [("views/saved", &view), ("annotations/note", &note)] {
+        let mut changed = value.clone();
+        if path.starts_with("views/") {
+            changed["title"] = serde_json::json!("Forbidden pre-H");
+        } else {
+            changed["body"] = serde_json::json!("Forbidden pre-H");
+        }
+        let (code, headers, body) = selected_json(
+            app.clone(),
+            "PUT",
+            &format!("{prefix}/{path}?{pin}"),
+            changed,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "index_not_ready");
+        assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+        let (code, _, body) = selected_json(
+            app.clone(),
+            "DELETE",
+            &format!("{prefix}/{path}"),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "index_not_ready");
+    }
+    let records = baleyg::store::topology::DurableRecords::new(&roots, &identity);
+    assert_eq!(
+        records.view_record("saved").unwrap().unwrap().title,
+        "Original"
+    );
+    assert_eq!(records.annotation_records().unwrap()[0].body, "Original");
     let (code, headers, prior) = status(app.clone()).await;
     assert_eq!(code, axum::http::StatusCode::OK, "{prior}");
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     assert_eq!(prior["catchingUp"], true);
     assert_eq!(prior["revision"], old_revision);
+    let file_path = format!("/api/checkouts/{}/files", identity.root_key);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&file_path)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let prior_files: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(prior_files["revision"], old_revision);
+    assert!(prior_files["items"].to_string().contains("core.js"));
+    let pinned = format!(
+        "{file_path}?indexGeneration={}&indexRevision={}",
+        old_revision["indexGeneration"].as_str().unwrap(),
+        old_revision["indexRevision"].as_u64().unwrap()
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(pinned)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let mismatch = format!(
+        "{file_path}?indexGeneration={}&indexRevision={}",
+        old_revision["indexGeneration"].as_str().unwrap(),
+        old_revision["indexRevision"].as_u64().unwrap() + 1
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(mismatch)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+
     resume_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -935,6 +1906,25 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
                 if code == axum::http::StatusCode::OK && current["catchingUp"] == false {
                     assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
                     assert_ne!(current["revision"], old_revision);
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(&file_path)
+                                .header("host", "127.0.0.1:7331")
+                                .header("authorization", format!("Bearer {TOKEN}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::OK);
+                    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "false");
+                    let files: Value = serde_json::from_slice(
+                        &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(files["revision"], current["revision"]);
                     break;
                 }
             }

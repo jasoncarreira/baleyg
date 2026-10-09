@@ -629,6 +629,8 @@ impl ReadFence {
         }
     }
 }
+type TreeOverlays = Vec<(usize, String, usize)>;
+
 impl EvidenceResponse {
     pub fn finish<T>(&self, value: T) -> Result<T> {
         self.fence.verify(&self.store, Some(&self.db))?;
@@ -677,6 +679,268 @@ impl EvidenceResponse {
             None,
             matches!(self.fence, ReadFence::PreH { .. }),
         )
+    }
+    pub fn tree_metadata(
+        &self,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+    ) -> Result<(IndexPin, String)> {
+        let (revision, workspace_root, overlays) = self.store.tree_metadata_in(
+            &self.db,
+            root,
+            items,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
+        for (index, path, count) in overlays {
+            items[index].indexed_path = Some(path);
+            items[index].method_count = Some(count);
+        }
+        Ok((revision, workspace_root))
+    }
+    pub fn files_at(
+        &self,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        self.store.files_in(
+            &self.db,
+            expected,
+            offset,
+            limit,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn methods_at(
+        &self,
+        path: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.store.methods_in(
+            &self.db,
+            path,
+            expected,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn sequence_at(
+        &self,
+        seed: &str,
+        expected: IndexPin,
+        show_all: bool,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        self.store.sequence_in(
+            &self.db,
+            seed,
+            expected,
+            show_all,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn classes_at(
+        &self,
+        path: Option<&str>,
+        query: &str,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::class_diagram::ClassPage> {
+        self.store.classes_in(
+            &self.db,
+            path,
+            query,
+            expected,
+            (offset, limit),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn navigation_at(
+        &self,
+        request: &crate::navigation::NavigationRequest,
+    ) -> Result<crate::navigation::NavigationResult> {
+        self.store.navigation_in(
+            &self.db,
+            request,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn class_diagram_at(
+        &self,
+        request: &crate::class_diagram::ClassDiagramRequest,
+    ) -> Result<crate::class_diagram::ClassDiagram> {
+        self.store.class_diagram_in(
+            &self.db,
+            request,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
+        self.store.symbols_in(
+            &self.db,
+            query,
+            limit,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn symbol_at(
+        &self,
+        id: &str,
+        expected_revision: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, Symbol)>> {
+        self.store.symbol_in(
+            &self.db,
+            id,
+            expected_revision,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    fn saved_pin(&self, expected: Option<IndexPin>) -> Result<IndexPin> {
+        Ok(self
+            .store
+            .read_revision_for(
+                &self.db,
+                expected,
+                matches!(self.fence, ReadFence::PreH { .. }),
+            )?
+            .pin)
+    }
+    pub fn saved_views_at(&self, expected: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .view_records()?
+            .into_iter()
+            .map(|v| {
+                Store::resolve_view(
+                    &self.db,
+                    &self.store,
+                    v,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .collect()
+    }
+    pub fn saved_view_at(
+        &self,
+        id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<SavedViewState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .view_record(id)?
+            .map(|v| {
+                Store::resolve_view(
+                    &self.db,
+                    &self.store,
+                    v,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .transpose()
+    }
+    pub fn saved_annotations_at(&self, expected: Option<IndexPin>) -> Result<Vec<AnnotationState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .annotation_records()?
+            .into_iter()
+            .map(|a| {
+                Store::resolve_annotation(
+                    &self.db,
+                    &self.store,
+                    a,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .collect()
+    }
+    /// A predecessor permit is read-only. Mutations require a current strict
+    /// read, with the root and publication fence checked before sidecar work.
+    pub fn require_mutation_ready(&self) -> Result<()> {
+        if matches!(self.fence, ReadFence::PreH { .. }) {
+            return Err(topology::IndexNotReady::new("pre-H mutation is not ready").into());
+        }
+        self.store.ensure_public_read_ready()?;
+        self.finish(())
+    }
+    pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
+        view.validate()?;
+        self.require_mutation_ready()?;
+        self.saved_pin(Some(pin))?;
+        ensure!(
+            self.status()?.revision == pin,
+            "revision conflict: mutation requires head"
+        );
+        let record = self.store.records().update_view_record(
+            &SavedViewRecord::from_base(view.clone(), None),
+            || {
+                serde_json::value::to_raw_value(&Store::selected_anchor_in(
+                    &self.db,
+                    &self.store,
+                    &view.query.seed,
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )?)
+                .map_err(Into::into)
+            },
+        )?;
+        Store::resolve_view(
+            &self.db,
+            &self.store,
+            record,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn save_annotation_at(
+        &self,
+        pin: IndexPin,
+        request: &AnnotationRequest,
+    ) -> Result<AnnotationState> {
+        request.validate()?;
+        self.require_mutation_ready()?;
+        self.saved_pin(Some(pin))?;
+        ensure!(
+            self.status()?.revision == pin,
+            "revision conflict: mutation requires head"
+        );
+        let title = request
+            .title
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let record = self.store.records().update_annotation_record(
+            &AnnotationRecord::from_base(request.base(), title, None),
+            request.title.is_none(),
+            || {
+                serde_json::value::to_raw_value(&Store::selected_anchor_in(
+                    &self.db,
+                    &self.store,
+                    &request.node_id,
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )?)
+                .map_err(Into::into)
+            },
+        )?;
+        Store::resolve_annotation(
+            &self.db,
+            &self.store,
+            record,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn delete_view(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_view(id)
+    }
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_annotation(id)
     }
     /// Ordinary reads release the snapshot before slow response assembly.
     /// A transitional exact-pin fence retains its predecessor snapshot; T03
@@ -10668,8 +10932,15 @@ impl Store {
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
-        self.with_evidence(|tx| {
-        let selected = self.read_revision(tx, Some(request.expected_revision()))?;
+        self.with_evidence(|tx| self.navigation_in(tx, request, false))
+    }
+    fn navigation_in(
+        &self,
+        tx: &Connection,
+        request: &crate::navigation::NavigationRequest,
+        pre_h: bool,
+    ) -> Result<crate::navigation::NavigationResult> {
+        let selected = self.read_revision_for(tx, Some(request.expected_revision()), pre_h)?;
         let revision = selected.pin;
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
@@ -10703,12 +10974,15 @@ impl Store {
         if let Some(path) = selected_path {
             // Gate allocation of the selected JSON/BLOB before decoding either.
             // This reads only SQLite byte lengths, not every workspace document.
-            let sizes: Option<(i64, i64)> = tx.query_row(
-                "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
+            let sizes: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
                  JOIN document_versions d ON d.id=m.document_version_id
                  WHERE m.revision_id=?2 AND m.path=?1",
-                params![path, selected.key], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
+                    params![path, selected.key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             if let Some((graph_len, native_len)) = sizes {
                 if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
                     return Err(self.report_selected_failure(
@@ -10736,7 +11010,6 @@ impl Store {
             }
         }
         crate::navigation::navigate(tx, request, revision, &selected.key)
-            })
     }
 
     pub fn classes_at(
@@ -10747,7 +11020,20 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::{ClassPage, InvalidRequest};
+        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
+    }
+    fn classes_in(
+        &self,
+        tx: &Connection,
+        path: Option<&str>,
+        query: &str,
+        expected: Option<IndexPin>,
+        pagination: (usize, usize),
+        pre_h: bool,
+    ) -> Result<crate::class_diagram::ClassPage> {
+        use crate::class_diagram::ClassPage;
+        let (offset, limit) = pagination;
+        use crate::class_diagram::InvalidRequest;
         let path = path.filter(|path| !path.is_empty());
         ensure!(
             (1..=100).contains(&limit)
@@ -10767,8 +11053,7 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        self.with_evidence(|tx| {
-        let selected_revision = self.read_revision(tx, expected)?;
+        let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10784,7 +11069,14 @@ impl Store {
             ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
         let ids = stmt
             .query_map(
-                params![path, pattern, query, (limit + 1) as i64, offset as i64, selected_revision.key],
+                params![
+                    path,
+                    pattern,
+                    query,
+                    (limit + 1) as i64,
+                    offset as i64,
+                    selected_revision.key
+                ],
                 |r| r.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -10794,7 +11086,9 @@ impl Store {
         let mut bytes = 0;
         let mut byte_limited = false;
         for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) = presentation_class(self, tx, id, &selected_revision)? else {
+            let Some((class, size, clipped)) =
+                presentation_class(self, tx, id, &selected_revision)?
+            else {
                 // Consume an individually oversized row so pagination always progresses.
                 consumed += 1;
                 byte_limited = true;
@@ -10830,9 +11124,12 @@ impl Store {
         {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
-                params![selected, selected_revision.key], |r| r.get(0),
+                params![selected, selected_revision.key],
+                |r| r.get(0),
             )?;
-            if exists { paths.insert(selected); }
+            if exists {
+                paths.insert(selected);
+            }
         }
         self.attest_selected_classes_for(tx, &paths, &selected_revision)?;
         Ok(ClassPage {
@@ -10843,60 +11140,76 @@ impl Store {
             warnings,
             require_index: false,
         })
-            })
     }
+
     /// Bounded one-hop relation reads and seed resolution share a revision-pinned
     /// read transaction. No filesystem access or graph/provider augmentation.
     pub fn class_diagram_at(
         &self,
         request: &crate::class_diagram::ClassDiagramRequest,
     ) -> Result<crate::class_diagram::ClassDiagram> {
-        use crate::class_diagram::{self, InvalidRequest};
         request.validate()?;
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, Some(request.expected_revision))?;
-            let revision = selected.pin;
-            let (warnings, truncated) = class_metadata(tx, &selected)
-                .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
-            let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
-            // Explicitly selected measured declarations are independent roots, never
-            // connected by lexical type-name matches or candidate relationships.
-            let mut seeds = vec![seed.symbol.id.clone()];
-            let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-            for expanded in &request.expanded {
-                let (class, _) = resolve_class(self, tx, expanded, &selected)?;
-                if !classes.contains_key(&class.symbol.id) {
-                    ensure!(
-                        classes.len() < class_diagram::MAX_NODES,
-                        InvalidRequest("Too many selected classes.")
-                    );
-                    seeds.push(class.symbol.id.clone());
-                    classes.insert(class.symbol.id.clone(), class);
-                }
-            }
-            let paths: BTreeSet<_> = classes
-                .values()
-                .map(|class| class.symbol.path.as_str())
-                .collect();
-            self.attest_selected_classes_for(tx, &paths, &selected)?;
-            class_diagram::project(
-                revision,
-                &seeds,
-                &classes,
-                vec![],
-                vec![],
-                warnings,
-                truncated || clipped,
-            )
-        })
+        self.with_evidence(|tx| self.class_diagram_in(tx, request, false))
     }
+    fn class_diagram_in(
+        &self,
+        tx: &Connection,
+        request: &crate::class_diagram::ClassDiagramRequest,
+        pre_h: bool,
+    ) -> Result<crate::class_diagram::ClassDiagram> {
+        use crate::class_diagram::{self, InvalidRequest};
+        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_h)?;
+        let revision = selected.pin;
+        let (warnings, truncated) = class_metadata(tx, &selected)
+            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
+        let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
+        // Explicitly selected measured declarations are independent roots, never
+        // connected by lexical type-name matches or candidate relationships.
+        let mut seeds = vec![seed.symbol.id.clone()];
+        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
+        for expanded in &request.expanded {
+            let (class, _) = resolve_class(self, tx, expanded, &selected)?;
+            if !classes.contains_key(&class.symbol.id) {
+                ensure!(
+                    classes.len() < class_diagram::MAX_NODES,
+                    InvalidRequest("Too many selected classes.")
+                );
+                seeds.push(class.symbol.id.clone());
+                classes.insert(class.symbol.id.clone(), class);
+            }
+        }
+        let paths: BTreeSet<_> = classes
+            .values()
+            .map(|class| class.symbol.path.as_str())
+            .collect();
+        self.attest_selected_classes_for(tx, &paths, &selected)?;
+        class_diagram::project(
+            revision,
+            &seeds,
+            &classes,
+            vec![],
+            vec![],
+            warnings,
+            truncated || clipped,
+        )
+    }
+
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
-        self.with_evidence(|tx| {
-        let revision = self.read_status(tx)?.revision;
+        self.with_evidence(|tx| self.symbols_in(tx, query, limit, false))
+    }
+    fn symbols_in(
+        &self,
+        tx: &Connection,
+        query: &str,
+        limit: usize,
+        pre_h: bool,
+    ) -> Result<(IndexPin, Vec<Symbol>)> {
+        let selected = self.read_revision_for(tx, None, pre_h)?;
+        let revision = selected.pin;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -10912,11 +11225,11 @@ impl Store {
             .collect::<Result<Vec<Symbol>>>()?;
         let paths: BTreeSet<_> = values.iter().map(|node| node.path.as_str()).collect();
         for path in paths {
-            self.attest_selected_document(tx, path)?;
+            self.attest_selected_document_for(tx, path, &selected)?;
         }
         Ok((revision, values))
-            })
     }
+
     pub fn symbol(&self, id: &str) -> Result<Option<Symbol>> {
         Ok(self.symbol_at(id, None)?.map(|(_, v)| v))
     }
@@ -10928,19 +11241,32 @@ impl Store {
         id: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected_revision)?;
-            let revision = selected.pin;
-            let selected_path: Option<String> = tx
+        self.with_evidence(|tx| self.symbol_in(tx, id, expected_revision, false))
+    }
+    fn symbol_in(
+        &self,
+        tx: &Connection,
+        id: &str,
+        expected_revision: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<(IndexPin, Symbol)>> {
+        let selected = self.read_revision_for(tx, expected_revision, pre_h)?;
+        let revision = selected.pin;
+        let selected_path: Option<String> = tx
                 .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
                 .optional()?;
-            if let Some(path) = selected_path {
-                self.attest_selected_document_for(tx, &path, &selected)?;
-            }
-            let node: Option<Symbol> = one_at(tx, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", id, &selected.key)?;
-            Ok(node.map(|node| (revision, node)))
-        })
+        if let Some(path) = selected_path {
+            self.attest_selected_document_for(tx, &path, &selected)?;
+        }
+        let node: Option<Symbol> = one_at(
+            tx,
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
+            id,
+            &selected.key,
+        )?;
+        Ok(node.map(|node| (revision, node)))
     }
+
     fn selected_source_row_for(
         &self,
         db: &Connection,
@@ -11096,6 +11422,52 @@ impl Store {
         }
         Ok((revision, workspace_root))
     }
+    fn tree_metadata_in(
+        &self,
+        tx: &Connection,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+        pre_h: bool,
+    ) -> Result<(IndexPin, String, TreeOverlays)> {
+        let revision = self.read_status_for(tx, pre_h)?.revision;
+        let workspace = Path::new(&self.workspace_root);
+        let mut valid_stmt = tx.prepare(
+                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+            )?;
+        let mut count_stmt = tx.prepare(
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+            )?;
+        let mut overlays = Vec::new();
+        for (index, item) in items
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.kind == "file")
+        {
+            let absolute = root.join(&item.path);
+            let Ok(relative) = absolute.strip_prefix(workspace) else {
+                continue;
+            };
+            let Some(relative) = relative.to_str() else {
+                continue;
+            };
+            let valid: Option<bool> = valid_stmt
+                .query_row([relative], |row| row.get(0))
+                .optional()
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            let Some(valid) = valid else { continue };
+            if !valid {
+                return Err(self.report_selected_failure(
+                    SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into())
+                        .into(),
+                ));
+            }
+            let count: i64 = count_stmt
+                .query_row([relative], |row| row.get(0))
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            overlays.push((index, relative.to_owned(), usize::try_from(count)?));
+        }
+        Ok((revision, self.workspace_root.clone(), overlays))
+    }
     pub fn files_at(
         &self,
         expected: Option<IndexPin>,
@@ -11106,76 +11478,91 @@ impl Store {
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected)?;
-            let revision = selected.pin;
-            let mut stmt = tx.prepare(
-                "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
+        self.with_evidence(|tx| self.files_in(tx, expected, offset, limit, false))
+    }
+    fn files_in(
+        &self,
+        tx: &Connection,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+        pre_h: bool,
+    ) -> Result<serde_json::Value> {
+        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let revision = selected.pin;
+        let mut stmt = tx.prepare(
+            "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
                  JOIN document_versions d ON d.id=m.document_version_id
                  WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
-            )?;
-            let source_rows: Vec<(String, String, String)> = stmt
-                .query_map(
-                    params![(limit + 1) as i64, offset as i64, selected.key],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut items = Vec::new();
-            for (path, language, projection_id) in source_rows {
-                self.attest_selected_document_for(tx, &path, &selected)?;
-                let methods: i64 = tx.query_row(
-                    "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
+        )?;
+        let source_rows: Vec<(String, String, String)> = stmt
+            .query_map(
+                params![(limit + 1) as i64, offset as i64, selected.key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut items = Vec::new();
+        for (path, language, projection_id) in source_rows {
+            self.attest_selected_document_for(tx, &path, &selected)?;
+            let methods: i64 = tx.query_row(
+                "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
                     AND json_extract(payload,'$.kind') IN ('function','method')",
-                    [&projection_id],
-                    |r| r.get(0),
-                )?;
-                items.push(
-                    serde_json::json!({"path":path,"language":language,"methodCount":methods}),
-                );
-            }
-            let next = (items.len() > limit).then_some(offset + limit);
-            items.truncate(limit);
-            Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
-        })
+                [&projection_id],
+                |r| r.get(0),
+            )?;
+            items.push(serde_json::json!({"path":path,"language":language,"methodCount":methods}));
+        }
+        let next = (items.len() > limit).then_some(offset + limit);
+        items.truncate(limit);
+        Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
     }
+
     pub fn methods_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected)?;
-            let revision = selected.pin;
-            let projection_id: Option<String> = tx
-                .query_row(
-                    "SELECT m.graph_projection_id FROM revision_documents m
+        self.with_evidence(|tx| self.methods_in(tx, path, expected, false))
+    }
+    fn methods_in(
+        &self,
+        tx: &Connection,
+        path: &str,
+        expected: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let revision = selected.pin;
+        let projection_id: Option<String> = tx
+            .query_row(
+                "SELECT m.graph_projection_id FROM revision_documents m
                      WHERE m.revision_id=?2 AND m.path=?1",
-                    params![path, selected.key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(projection_id) = projection_id else {
-                return Ok(None);
-            };
-            self.attest_selected_document_for(tx, path, &selected)?;
-            let mut stmt = tx.prepare(
-                "SELECT payload FROM graph_nodes WHERE projection_id=?1
+                params![path, selected.key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(projection_id) = projection_id else {
+            return Ok(None);
+        };
+        self.attest_selected_document_for(tx, path, &selected)?;
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM graph_nodes WHERE projection_id=?1
                 AND json_extract(payload,'$.kind') IN ('function','method')
                 ORDER BY json_extract(payload,'$.range.startByte'),id LIMIT 1001",
-            )?;
-            let mut items = Vec::new();
-            for payload in stmt.query_map([&projection_id], |r| r.get::<_, String>(0))? {
-                let symbol: Symbol = serde_json::from_str(&payload?)?;
-                items.push(serde_json::json!({"symbol":symbol,"consequential":true,
+        )?;
+        let mut items = Vec::new();
+        for payload in stmt.query_map([&projection_id], |r| r.get::<_, String>(0))? {
+            let symbol: Symbol = serde_json::from_str(&payload?)?;
+            items.push(serde_json::json!({"symbol":symbol,"consequential":true,
                     "reason":"Conservative heuristic: retained; triviality is not proven"}));
-            }
-            let truncated = items.len() > 1000;
-            items.truncate(1000);
-            Ok(Some(
-                serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
-            ))
-        })
+        }
+        let truncated = items.len() > 1000;
+        items.truncate(1000);
+        Ok(Some(
+            serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
+        ))
     }
+
     /// Only cached source and measured calls from the same snapshot are used.
     pub fn sequence_at(
         &self,
@@ -11183,45 +11570,53 @@ impl Store {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| {
-            let selected_revision = self.read_revision(tx, Some(expected))?;
-            let revision = selected_revision.pin;
-            let selected: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
+        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false))
+    }
+    fn sequence_in(
+        &self,
+        tx: &Connection,
+        seed: &str,
+        expected: IndexPin,
+        show_all: bool,
+        pre_h: bool,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        let selected_revision = self.read_revision_for(tx, Some(expected), pre_h)?;
+        let revision = selected_revision.pin;
+        let selected: Option<(String, String)> = tx
+            .query_row(
+                "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
                  ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id
                  WHERE n.id=?1",
-                    params![seed, selected_revision.key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((path, graph_id)) = selected else {
-                return Ok(None);
-            };
-            self.attest_selected_document_for(tx, &path, &selected_revision)?;
-            let payload: String = tx.query_row(
-                "SELECT payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
-                params![graph_id, seed],
-                |r| r.get(0),
-            )?;
-            let symbol: Symbol = serde_json::from_str(&payload)?;
-            ensure!(
-                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-                "invalid sequence symbol kind"
-            );
-            let file = self
-                .selected_source_row_for(tx, &path, &selected_revision)?
-                .context("sequence source missing")?;
-            let mut stmt = tx.prepare(
-                "SELECT payload FROM graph_calls WHERE projection_id=?1
+                params![seed, selected_revision.key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((path, graph_id)) = selected else {
+            return Ok(None);
+        };
+        self.attest_selected_document_for(tx, &path, &selected_revision)?;
+        let payload: String = tx.query_row(
+            "SELECT payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
+            params![graph_id, seed],
+            |r| r.get(0),
+        )?;
+        let symbol: Symbol = serde_json::from_str(&payload)?;
+        ensure!(
+            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
+            "invalid sequence symbol kind"
+        );
+        let file = self
+            .selected_source_row_for(tx, &path, &selected_revision)?
+            .context("sequence source missing")?;
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM graph_calls WHERE projection_id=?1
                 ORDER BY json_extract(payload,'$.range.startByte'),id",
-            )?;
-            let calls: Vec<CallSite> = stmt
-                .query_map([&graph_id], |r| r.get::<_, String>(0))?
-                .map(|payload| Ok(serde_json::from_str(&payload?)?))
-                .collect::<Result<_>>()?;
-            crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
-        })
+        )?;
+        let calls: Vec<CallSite> = stmt
+            .query_map([&graph_id], |r| r.get::<_, String>(0))?
+            .map(|payload| Ok(serde_json::from_str(&payload?)?))
+            .collect::<Result<_>>()?;
+        crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
     }
 
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
@@ -11472,8 +11867,13 @@ impl Store {
         Ok(())
     }
 
-    fn selected_anchor_in(db: &Connection, store: &Self, target: &str) -> Result<DurableAnchor> {
-        let revision = store.read_revision(db, None)?;
+    fn selected_anchor_in(
+        db: &Connection,
+        store: &Self,
+        target: &str,
+        pre_h: bool,
+    ) -> Result<DurableAnchor> {
+        let revision = store.read_revision_for(db, None, pre_h)?;
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
@@ -11564,8 +11964,9 @@ impl Store {
         store: &Self,
         view: SavedViewRecord,
         pin: Option<IndexPin>,
+        pre_h: bool,
     ) -> Result<SavedViewState> {
-        let selected = store.read_revision(db, pin)?;
+        let selected = store.read_revision_for(db, pin, pre_h)?;
         let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
             .chain(view.pins.keys())
             .chain(view.hidden.iter())
@@ -11641,7 +12042,7 @@ impl Store {
         let pin = Self::saved_pin(&response, expected_pin)?;
         let states = views
             .into_iter()
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
             .collect::<Result<Vec<_>>>()?;
         self.finish_saved(&response, states)
     }
@@ -11664,7 +12065,7 @@ impl Store {
         };
         let pin = Self::saved_pin(&response, expected_pin)?;
         let state = view
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
             .transpose()?;
         self.finish_saved(&response, state)
     }
@@ -11687,11 +12088,12 @@ impl Store {
                     &response.db,
                     self,
                     &view.query.seed,
+                    false,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        let state = Self::resolve_view(&response.db, self, record, Some(pin))?;
+        let state = Self::resolve_view(&response.db, self, record, Some(pin), false)?;
         self.finish_saved(&response, state)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
@@ -11708,8 +12110,9 @@ impl Store {
         store: &Self,
         annotation: AnnotationRecord,
         pin: Option<IndexPin>,
+        pre_h: bool,
     ) -> Result<AnnotationState> {
-        let selected = store.read_revision(db, pin)?;
+        let selected = store.read_revision_for(db, pin, pre_h)?;
         let attachment =
             Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
         let orphaned = attachment
@@ -11754,7 +12157,7 @@ impl Store {
         let pin = Self::saved_pin(&response, expected_pin)?;
         let states = annotations
             .into_iter()
-            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin)))
+            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin), false))
             .collect::<Result<Vec<_>>>()?;
         self.finish_saved(&response, states)
     }
@@ -11788,11 +12191,12 @@ impl Store {
                     &response.db,
                     self,
                     &request.node_id,
+                    false,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        let state = Self::resolve_annotation(&response.db, self, record, Some(pin))?;
+        let state = Self::resolve_annotation(&response.db, self, record, Some(pin), false)?;
         self.finish_saved(&response, state)
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {

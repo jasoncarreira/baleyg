@@ -1548,6 +1548,9 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
+        if let Some(directory) = e.downcast_ref::<BrowseDirectoryError>() {
+            return browse_directory_error(&directory.0);
+        }
         if let Some(invalid) = e.downcast_ref::<crate::navigation::InvalidRequest>() {
             Self(
                 StatusCode::BAD_REQUEST,
@@ -1569,6 +1572,14 @@ impl From<anyhow::Error> for ApiError {
                 StatusCode::CONFLICT,
                 "revision_conflict",
                 "The index revision changed",
+            )
+        } else if e.to_string() == "packet_missing" {
+            missing()
+        } else if e.to_string() == "invalid_question_selection" {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_question_selection",
+                "Invalid question or selection",
             )
         } else if e.chain().any(|cause| {
             matches!(
@@ -2308,6 +2319,45 @@ struct TreeQuery {
     #[serde(default = "file_limit")]
     limit: usize,
 }
+#[derive(Debug)]
+struct BrowseDirectoryError(std::io::Error);
+impl std::fmt::Display for BrowseDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("browse directory unavailable")
+    }
+}
+impl std::error::Error for BrowseDirectoryError {}
+
+fn browse_directory_error(e: &std::io::Error) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError(
+            StatusCode::NOT_FOUND,
+            "directory_missing",
+            "Directory no longer exists; refresh its parent",
+        ),
+        std::io::ErrorKind::PermissionDenied => ApiError(
+            StatusCode::FORBIDDEN,
+            "directory_forbidden",
+            "Permission denied while listing directory",
+        ),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_directory",
+            "Path must be a real directory; symlink traversal is not allowed",
+        ),
+        _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
+            StatusCode::FORBIDDEN,
+            "symlink_forbidden",
+            "Symlink traversal is not allowed",
+        ),
+        _ => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "directory_error",
+            "Directory could not be read; check permissions and refresh",
+        ),
+    }
+}
+
 async fn tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<TreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2324,33 +2374,7 @@ async fn tree(
         let (mut items, next_offset, truncated) = s
             .browser
             .list(&q.path, q.offset, q.limit)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => ApiError(
-                    StatusCode::NOT_FOUND,
-                    "directory_missing",
-                    "Directory no longer exists; refresh its parent",
-                ),
-                std::io::ErrorKind::PermissionDenied => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "directory_forbidden",
-                    "Permission denied while listing directory",
-                ),
-                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_directory",
-                    "Path must be a real directory; symlink traversal is not allowed",
-                ),
-                _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "symlink_forbidden",
-                    "Symlink traversal is not allowed",
-                ),
-                _ => ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "directory_error",
-                    "Directory could not be read; check permissions and refresh",
-                ),
-            })?;
+            .map_err(|e| browse_directory_error(&e))?;
         let (revision, indexed_workspace) = s.store.tree_metadata(&s.browser.root, &mut items)?;
         for item in items
             .iter_mut()
@@ -6916,7 +6940,10 @@ impl ProvisionedBrowser {
             )
             .route(
                 "/api/checkouts/{root_key}/{*suffix}",
-                get(provisioned_core).post(provisioned_core),
+                get(provisioned_core)
+                    .post(provisioned_core)
+                    .put(provisioned_core)
+                    .delete(provisioned_core),
             )
             .layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -6981,12 +7008,7 @@ async fn provisioned_core(
             if let Some(hook) = hook {
                 hook("after_handler");
             }
-            result.and_then(|(response, catching_up)| {
-                identity.verify_readonly().map_err(|_| {
-                    ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
-                })?;
-                Ok((response, catching_up))
-            })
+            result
         }
     };
     let (mut response, catching_up) = match answer {
@@ -7002,8 +7024,22 @@ async fn provisioned_core(
         }
     };
     if identity.verify_readonly().is_err() {
-        response = ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
-            .into_response();
+        let outcome = response
+            .headers()
+            .get("X-Baleyg-Mutation-Outcome")
+            .and_then(|value| value.to_str().ok());
+        response = match outcome {
+            Some(outcome) => selected_mutation_error(
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "root_changed",
+                    "Selected checkout changed",
+                ),
+                outcome,
+            ),
+            None => ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+                .into_response(),
+        };
     }
     if let Ok(value) = root.parse() {
         response.headers_mut().insert("X-Baleyg-Workspace", value);
@@ -7023,6 +7059,120 @@ fn browser_selection_error(reason: crate::daemon::registry::SelectionError) -> R
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     (status, Json(json!({"error":{"code":"workspace_selection_failed", "reason":reason.reason(), "message":"Checkout selection failed"}}))).into_response()
+}
+
+async fn selected_evidence<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, ApiError::from).await
+}
+
+async fn selected_question<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, question_error).await
+}
+
+async fn selected_evidence_map<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+    map_error: fn(anyhow::Error) -> ApiError,
+) -> Result<(T, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        let result = work(&response)?;
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        Ok::<_, anyhow::Error>((response.finish(result)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(map_error)
+}
+
+fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
+    let mut response = (
+        error.0,
+        Json(json!({
+            "error": {"code": error.1, "message": error.2},
+            "mutationOutcome": outcome
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+    response
+}
+
+/// Only a strict current head grants sidecar write eligibility. Once the
+/// sidecar is called, later failures carry an explicit committed/unknown
+/// outcome; they cannot claim that the write was rolled back.
+async fn selected_mutation<T: IntoResponse + Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    preflight: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<()>
+    + Send
+    + 'static,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(Response, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        preflight(&response)?;
+        response.finish(())?;
+        if let Some(hook) = &hook {
+            hook("before_mutation");
+        }
+        response.finish(())?;
+        let result = work(&response);
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        let mut answer = match result {
+            Ok(value) => match response.finish(value) {
+                Ok(value) => value.into_response(),
+                Err(error) => selected_mutation_error(ApiError::from(error), "committed"),
+            },
+            Err(_) => selected_mutation_error(
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "outcome_unknown",
+                    "Write outcome is unknown; inspect the saved record before retrying",
+                ),
+                "unknown",
+            ),
+        };
+        if !answer.headers().contains_key("X-Baleyg-Mutation-Outcome") {
+            answer
+                .headers_mut()
+                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+        }
+        Ok::<_, anyhow::Error>((answer, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(ApiError::from)
 }
 
 async fn provisioned_core_answer(
@@ -7058,6 +7208,194 @@ async fn provisioned_core_answer(
                 )
             })??;
             Ok((Json(status).into_response(), catching_up))
+        }
+        (&Method::GET, "tree") => {
+            let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if !crate::file_tree::valid_path(&q.path)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > crate::file_tree::SCAN_LIMIT
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
+                let (mut items, next_offset, truncated) = state
+                    .browser
+                    .list(&q.path, q.offset, q.limit)
+                    .map_err(BrowseDirectoryError)?;
+                let (revision, indexed_workspace) =
+                    response.tree_metadata(&state.browser.root, &mut items)?;
+                for item in items
+                    .iter_mut()
+                    .filter(|item| item.kind == "file" && item.indexed_path.is_none())
+                {
+                    let absolute = state.browser.root.join(&item.path);
+                    let reason = if !absolute.starts_with(&indexed_workspace) {
+                        "Outside indexed workspace"
+                    } else {
+                        match absolute.extension().and_then(|e| e.to_str()) {
+                            Some("ts" | "tsx") => "TypeScript indexing not supported yet",
+                            Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
+                                "Not indexed yet (may be excluded or size-limited)"
+                            }
+                            _ => "Unsupported source type",
+                        }
+                    };
+                    item.unindexed_reason = Some(reason.into());
+                }
+                Ok(crate::file_tree::Page {
+                    root: state.browser.root.to_string_lossy().into_owned(),
+                    indexed_workspace,
+                    path: q.path,
+                    revision,
+                    items,
+                    next_offset,
+                    truncated,
+                })
+            })
+            .await?;
+            Ok((Json(page).into_response(), catching_up))
+        }
+        (&Method::GET, "files") => {
+            let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
+                return Err(browse_invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.files_at(pin, q.offset, q.limit))
+                    .await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "methods") => {
+            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if q.path.is_empty()
+                || q.path.len() > 8192
+                || q.path.contains(['\0', '\\', ':'])
+                || q.path
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == "..")
+            {
+                return Err(browse_invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.methods_at(&q.path, pin)).await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::GET, "classes") => {
+            let Query(q) = Query::<ClassesQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin.pin()?;
+            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+                r.classes_at(q.path.as_deref(), &q.q, pin, q.offset, q.limit)
+            })
+            .await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "symbols") => {
+            let Query(q) = Query::<SymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.q.len() > 8192 || !(1..=150).contains(&q.limit) {
+                return Err(invalid());
+            }
+            let ((revision, items), catching_up) =
+                selected_evidence(runtime, hook, move |r| r.symbols_at(&q.q, q.limit)).await?;
+            Ok((
+                Json(json!({"revision":revision,"items":items})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::GET, "symbol") => {
+            let Query(q) = Query::<SymbolQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
+                return Err(invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.symbol_at(&q.id, pin)).await?;
+            let (revision, symbol) = value.ok_or_else(missing)?;
+            Ok((
+                Json(json!({"revision":revision,"symbol":symbol})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "sequence") => {
+            let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
+            if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
+                return Err(browse_invalid());
+            }
+            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+                r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+            })
+            .await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "class-diagram") => {
+            let q: crate::class_diagram::ClassDiagramRequest =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.class_diagram_at(&q)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::POST, "navigation") => {
+            if body.len() > 32 * 1024 {
+                return Err(invalid());
+            }
+            let q: crate::navigation::NavigationRequest =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "views") => {
+            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.saved_views_at(pin)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "annotations") => {
+            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.saved_annotations_at(pin)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::POST, "questions/preview") => {
+            let request: QuestionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            request.validate().map_err(|_| invalid())?;
+            let state = runtime.browser_scheduler()?;
+            let (value, catching_up) = selected_question(runtime, hook, move |r| {
+                r.validate_pin(request.expected_revision)?;
+                let packet = planning::prepare_in(r, request)?;
+                let selection = planning::preview(&packet)?;
+                let view = planning::assemble(&packet, &selection, "localPreview")?;
+                let bytes = serde_json::to_vec(&packet)?.len();
+                anyhow::ensure!(
+                    bytes <= MAX_PACKET_BYTES,
+                    "complete question packet exceeds 1 MiB"
+                );
+                let result = QuestionPreview {
+                    packet: packet.clone(),
+                    selection,
+                    view,
+                };
+                state
+                    .packets
+                    .lock()
+                    .unwrap()
+                    .remember_fenced(Arc::new(packet), bytes, || r.finish(()))?;
+                Ok(result)
+            })
+            .await?;
+            Ok((Json(value).into_response(), catching_up))
         }
         (&Method::GET, "source") => {
             let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
@@ -7114,6 +7452,165 @@ async fn provisioned_core_answer(
                 )
             })??;
             Ok((Json(view.ok_or_else(missing)?).into_response(), catching_up))
+        }
+        _ if suffix.starts_with("views/") => {
+            let id = suffix.strip_prefix("views/").unwrap();
+            if id.contains('/') {
+                return Err(missing());
+            }
+            validate_record_id(id).map_err(|_| invalid())?;
+            match *method {
+                Method::GET => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?;
+                    let id = id.to_owned();
+                    let (value, catching_up) =
+                        selected_evidence(runtime, hook, move |r| r.saved_view_at(&id, pin))
+                            .await?;
+                    Ok((
+                        Json(value.ok_or_else(missing)?).into_response(),
+                        catching_up,
+                    ))
+                }
+                Method::PUT => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?.ok_or_else(invalid)?;
+                    let value: SavedViewRequest =
+                        serde_json::from_slice(&body).map_err(|_| invalid())?;
+                    if value.id != id {
+                        return Err(invalid());
+                    }
+                    value.validate().map_err(|_| invalid())?;
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_view_at(pin, &value).map(Json),
+                    )
+                    .await;
+                }
+                Method::DELETE => {
+                    let id = id.to_owned();
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_view(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
+                }
+                _ => Err(missing()),
+            }
+        }
+        _ if suffix.starts_with("annotations/") => {
+            let id = suffix.strip_prefix("annotations/").unwrap();
+            if id.contains('/') {
+                return Err(missing());
+            }
+            validate_record_id(id).map_err(|_| invalid())?;
+            match *method {
+                Method::PUT => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?.ok_or_else(invalid)?;
+                    let value: AnnotationRequest =
+                        serde_json::from_slice(&body).map_err(|_| invalid())?;
+                    if value.id != id {
+                        return Err(invalid());
+                    }
+                    value.validate().map_err(|_| invalid())?;
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_annotation_at(pin, &value).map(Json),
+                    )
+                    .await;
+                }
+                Method::DELETE => {
+                    let id = id.to_owned();
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_annotation(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
+                }
+                _ => Err(missing()),
+            }
+        }
+        _ if suffix.starts_with("questions/") => {
+            let tail = suffix.strip_prefix("questions/").unwrap();
+            let Some((id, action)) = tail.split_once('/') else {
+                return Err(missing());
+            };
+            if id.is_empty() || action.contains('/') {
+                return Err(missing());
+            }
+            if !matches!(
+                (method.clone(), action),
+                (Method::GET, "jev-request")
+                    | (Method::POST, "jev-response")
+                    | (Method::POST, "selection")
+            ) {
+                return Err(missing());
+            }
+            let state = runtime.browser_scheduler()?;
+            let id = id.to_owned();
+            let bytes = body.clone();
+            let action = action.to_owned();
+            let (result, catching_up) = selected_question(runtime, hook, move |r| {
+                let revision = r.status()?.revision;
+                let packet = state
+                    .packets
+                    .lock()
+                    .unwrap()
+                    .packets
+                    .iter()
+                    .find(|(packet, _)| packet.packet_id == id)
+                    .map(|(packet, _)| packet.clone())
+                    .ok_or_else(|| anyhow::anyhow!("question seed not found"))?;
+                anyhow::ensure!(
+                    revision == packet.revision,
+                    "revision conflict: cached packet changed"
+                );
+                r.validate_selected_view(&packet.context, &packet.source_files)?;
+                match action.as_str() {
+                    "jev-request" => Ok(serde_json::to_value(jev::request_for(&packet)?)?),
+                    "jev-response" => {
+                        let value: Value = serde_json::from_slice(&bytes)
+                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
+                        let selection = jev::parse_response(&packet, &value)?;
+                        let warnings = jev::response_warnings(&value);
+                        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
+                        view.warnings.extend(warnings);
+                        Ok(json!({"selection":selection,"view":view}))
+                    }
+                    "selection" => {
+                        let selection: SelectionEnvelope = serde_json::from_slice(&bytes)
+                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
+                        let view = planning::assemble(&packet, &selection, "manual")?;
+                        Ok(json!({"selection":selection,"view":view}))
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await?;
+            Ok((Json(result).into_response(), catching_up))
         }
         (&Method::POST, "index") | (&Method::GET, "jobs/current") => {
             let state = runtime.browser_scheduler()?;
