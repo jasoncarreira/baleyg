@@ -1,5 +1,6 @@
 //! Closed application DTO validation and protocol-only, read-only unavailable projections.
 use super::{IdentityError, OpenedWorkspace, wire};
+use crate::daemon::registry::SelectionError;
 use serde_json::{Value, json};
 
 const TOOLS: [&str; 4] = super::catalog::NAMES;
@@ -10,6 +11,7 @@ pub struct PreparedTool {
     pub valid_arguments: bool,
     pub id: Value,
     pub modern: bool,
+    pub answered: bool,
 }
 fn closed(o: &serde_json::Map<String, Value>, fields: &[&str], required: &[&str]) -> bool {
     o.keys().all(|k| fields.contains(&k.as_str())) && required.iter().all(|k| o.contains_key(*k))
@@ -72,9 +74,15 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
         return Err("invalid_request");
     };
     let (fields, required): (&[&str], &[&str]) = match name {
-        "baleyg_workspace_describe" => (&["schemaVersion"], &["schemaVersion"]),
+        "baleyg_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
         "baleyg_find_symbols" => (
-            &["schemaVersion", "query", "limit", "expectedBasis"],
+            &[
+                "schemaVersion",
+                "query",
+                "limit",
+                "expectedBasis",
+                "workspace",
+            ],
             &["schemaVersion", "query"],
         ),
         "baleyg_inspect" => (
@@ -84,6 +92,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "view",
                 "limit",
                 "expectedBasis",
+                "workspace",
             ],
             &["schemaVersion", "symbolId", "view"],
         ),
@@ -95,6 +104,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
                 "endLine",
                 "expectedBasis",
                 "expectedContentHash",
+                "workspace",
             ],
             &["schemaVersion", "path", "startLine", "endLine"],
         ),
@@ -105,7 +115,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
     {
         return Err("invalid_request");
     }
-    match name {
+    let validated = match name {
         "baleyg_workspace_describe" => Ok(()),
         "baleyg_find_symbols" => {
             let q = string(o.get("query")).ok_or("invalid_request")?;
@@ -156,7 +166,14 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             }
             Ok(())
         }
+    };
+    validated?;
+    if o.get("workspace")
+        .is_some_and(|value| value.as_str().is_none_or(|path| path.len() > 4096))
+    {
+        return Err("invalid_request");
     }
+    Ok(())
 }
 fn details(code: &str) -> (&'static str, bool) {
     match code {
@@ -170,6 +187,9 @@ fn details(code: &str) -> (&'static str, bool) {
         "deadline_exceeded" => ("Deadline exceeded", true),
         "root_changed" => ("Workspace root changed", false),
         "store_unavailable" => ("Store is unavailable", false),
+        "checkout_capacity" => ("Checkout capacity reached", true),
+        "daemon_unavailable" => ("Daemon is unavailable", true),
+        "outcome_unknown" => ("Outcome unknown; inspect request status", false),
         _ => ("Store is unavailable", false),
     }
 }
@@ -187,6 +207,38 @@ pub fn describe(id: &Value, label: &str) -> Value {
         "sourceLines":200,"defaultLimit":20,"maxLimit":50,"calleeTextBytes":1024,
         "hintWorkMs":1000,"deadlineMs":5000,"concurrency":4}},
       "warnings":[],"partial":true,"truncated":false,"truncationReason":null})
+}
+pub fn attempted(value: &Value) -> Value {
+    if let Some(path) = value.as_str() {
+        let mut end = path.len().min(256);
+        while !path.is_char_boundary(end) {
+            end -= 1;
+        }
+        json!({"kind":"path","value":&path[..end],"utf8Bytes":path.len(),"truncated":end<path.len()})
+    } else {
+        let kind = match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            Value::String(_) => unreachable!(),
+        };
+        json!({"kind":"invalid_type","jsonType":kind})
+    }
+}
+pub fn selection_failure(id: &Value, error: SelectionError, value: &Value) -> Value {
+    let mut envelope = failure(id, error.code());
+    envelope["error"]["message"] = json!("Workspace selection failed");
+    envelope["error"]["retryable"] = json!(error.retryable());
+    envelope["error"]["reason"] = json!(error.reason());
+    envelope["error"]["attemptedWorkspace"] = attempted(value);
+    envelope
+}
+pub fn attributed(mut envelope: Value, workspace: &OpenedWorkspace, catching_up: bool) -> Value {
+    envelope["workspace"] = json!(workspace.root());
+    envelope["catchingUp"] = json!(catching_up);
+    envelope
 }
 pub fn result(envelope: Value, modern: bool) -> Value {
     let text = serde_json::to_string(&envelope).expect("bounded tool envelope");
@@ -214,19 +266,44 @@ pub fn prepare(
 ) -> PreparedTool {
     let validation = validate(name, args);
     let valid_arguments = validation.is_ok();
+    let invalid_workspace = args.and_then(Value::as_object).and_then(|object| {
+        let value = object
+            .get("workspace")?
+            .as_str()
+            .is_none_or(|path| path.len() > 4096);
+        if !value {
+            return None;
+        }
+        let mut without = object.clone();
+        let attempted = without.remove("workspace")?;
+        validate(name, Some(&Value::Object(without)))
+            .ok()
+            .map(|_| attempted)
+    });
     let envelope = match validation {
-        Err(code) => failure(id, code),
-        Ok(()) => match workspace.check() {
-            Err(e) => failure(id, identity_error(e)),
-            Ok(()) if name == "baleyg_workspace_describe" => describe(id, workspace.label()),
-            Ok(()) => failure(id, "index_not_ready"),
-        },
+        Err(code) => {
+            let mut envelope = failure(id, code);
+            if let Some(value) = invalid_workspace.as_ref() {
+                envelope["error"]["attemptedWorkspace"] = attempted(value);
+            }
+            envelope
+        }
+        Ok(()) => attributed(
+            match workspace.check() {
+                Err(e) => failure(id, identity_error(e)),
+                Ok(()) if name == "baleyg_workspace_describe" => describe(id, workspace.label()),
+                Ok(()) => failure(id, "index_not_ready"),
+            },
+            workspace,
+            false,
+        ),
     };
     PreparedTool {
         response: result(envelope, modern),
         valid_arguments,
         id: id.clone(),
         modern,
+        answered: valid_arguments,
     }
 }
 /// Run immediately before a valid known-tool outcome is committed to the wire.
@@ -236,7 +313,11 @@ pub fn final_check(prepared: &mut PreparedTool, workspace: &OpenedWorkspace) {
         && let Err(error) = workspace.check()
     {
         prepared.response = result(
-            failure(&prepared.id, identity_error(error)),
+            attributed(
+                failure(&prepared.id, identity_error(error)),
+                workspace,
+                false,
+            ),
             prepared.modern,
         );
     }
@@ -594,7 +675,7 @@ mod tests {
         final_check(&mut prepared, &workspace);
         assert_eq!(
             prepared.response["structuredContent"],
-            failure(&json!(5), "store_unavailable")
+            attributed(failure(&json!(5), "store_unavailable"), &workspace, false)
         );
         assert!(!marker.exists());
         let valid = prepare(TOOLS[1], Some(&good(TOOLS[1])), &json!(6), true, &workspace);

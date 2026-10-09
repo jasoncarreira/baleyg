@@ -443,5 +443,21 @@
       "input": "{\"jsonrpc\":\"2.0\",\"id\":4",
       "responses": []
     }
+  },
+  "workspaceSelection": {
+    "inputField": "workspace",
+    "maxUtf8Bytes": 4096,
+    "attemptedValueBytes": 256,
+    "resolvedFields": [
+      "workspace",
+      "catchingUp"
+    ],
+    "reasons": [
+      "not_absolute",
+      "not_checkout",
+      "different_repository",
+      "identity_changed",
+      "unavailable"
+    ]
   }
 }

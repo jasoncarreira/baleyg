@@ -31,6 +31,12 @@ impl OpenedWorkspace {
     pub fn label(&self) -> &str {
         &self.label
     }
+    pub fn root(&self) -> &std::path::Path {
+        &self.identity.root
+    }
+    pub fn identity(&self) -> &WorkspaceIdentity {
+        &self.identity
+    }
     pub fn build_version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
@@ -84,22 +90,28 @@ mod tests {
 /// Run the line-framed transport. The reader owns stdin; this coordinator alone owns stdout.
 /// Input already waiting in the bounded channel is applied before any queued outcome commits.
 pub fn run_stdio(workspace: OpenedWorkspace) -> std::io::Result<()> {
-    run_transport(workspace, std::io::stdin(), std::io::stdout())
+    run_transport(workspace, std::io::stdin(), std::io::stdout(), None)
 }
 
 /// Run the same protocol coordinator on a daemon-owned session socket.
 pub fn run_socket(
     workspace: OpenedWorkspace,
     stream: std::os::unix::net::UnixStream,
+    registry: std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    session_id: u64,
 ) -> std::io::Result<()> {
     let reader = stream.try_clone()?;
-    run_transport(workspace, reader, stream)
+    run_transport(workspace, reader, stream, Some((registry, session_id)))
 }
 
 fn run_transport(
     workspace: OpenedWorkspace,
     input: impl std::io::Read + Send + 'static,
     output: impl std::io::Write,
+    registry: Option<(
+        std::sync::Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+        u64,
+    )>,
 ) -> std::io::Result<()> {
     use std::collections::VecDeque;
     use std::io::BufReader;
@@ -176,16 +188,127 @@ fn run_transport(
                     session::Action::Initialize => catalog::initialize(workspace.build_version()),
                     session::Action::List => catalog::list(modern),
                     session::Action::Call { name, arguments } => {
-                        let tool = tools::prepare(
-                            name,
-                            arguments.as_ref(),
-                            &admission.id,
-                            modern,
-                            &workspace,
-                        );
-                        let result = tool.response.clone();
-                        prepared_tool = Some(tool);
-                        result
+                        let selection = arguments
+                            .as_ref()
+                            .and_then(|v| v.as_object())
+                            .and_then(|o| o.get("workspace"));
+                        let valid = tools::validate(name, arguments.as_ref()).is_ok();
+                        if !valid {
+                            let tool = tools::prepare(
+                                name,
+                                arguments.as_ref(),
+                                &admission.id,
+                                modern,
+                                &workspace,
+                            );
+                            let result = tool.response.clone();
+                            prepared_tool = Some((tool, None));
+                            result
+                        } else {
+                            let selected = if let Some((registry, session_id)) = &registry {
+                                match selection.and_then(serde_json::Value::as_str) {
+                                    Some(path) => registry
+                                        .blocking_lock()
+                                        .select(
+                                            *session_id,
+                                            workspace.identity(),
+                                            std::path::Path::new(path),
+                                        )
+                                        .map(Some),
+                                    None => workspace.check().map(|_| None).map_err(|_| {
+                                        crate::daemon::registry::SelectionError::IdentityChanged
+                                    }),
+                                }
+                            } else {
+                                workspace.check().map(|_| None).map_err(|_| {
+                                    crate::daemon::registry::SelectionError::IdentityChanged
+                                })
+                            };
+                            match selected {
+                                Ok(selected) => {
+                                    let selected_workspace = selected.as_ref().map(|w| {
+                                        OpenedWorkspace::new(
+                                            w.identity
+                                                .as_ref()
+                                                .verified_clone()
+                                                .expect("selected witness verified"),
+                                        )
+                                    });
+                                    let answering =
+                                        selected_workspace.as_ref().unwrap_or(&workspace);
+                                    let catching_up = registry
+                                        .as_ref()
+                                        .and_then(|(registry, _)| {
+                                            registry
+                                                .blocking_lock()
+                                                .runtime(&answering.identity.root_key)
+                                        })
+                                        .is_none_or(|runtime| runtime.catching_up());
+                                    let mut tool = tools::prepare(
+                                        name,
+                                        arguments.as_ref(),
+                                        &admission.id,
+                                        modern,
+                                        answering,
+                                    );
+                                    if tool.answered {
+                                        let mut envelope =
+                                            tool.response["structuredContent"].clone();
+                                        envelope["catchingUp"] = serde_json::json!(catching_up);
+                                        tool.response = tools::result(envelope, modern);
+                                    }
+                                    let result = tool.response.clone();
+                                    prepared_tool = Some((tool, selected));
+                                    result
+                                }
+                                Err(crate::daemon::registry::SelectionError::CheckoutCapacity) => {
+                                    let path = selection
+                                        .and_then(serde_json::Value::as_str)
+                                        .expect("capacity requires an explicit path");
+                                    match registry
+                                        .as_ref()
+                                        .expect("daemon registry required")
+                                        .0
+                                        .blocking_lock()
+                                        .capacity_identity(
+                                            workspace.identity(),
+                                            std::path::Path::new(path),
+                                        ) {
+                                        Ok(identity) => {
+                                            let selected = OpenedWorkspace::new(identity);
+                                            tools::result(
+                                                tools::attributed(
+                                                    tools::failure(
+                                                        &admission.id,
+                                                        "checkout_capacity",
+                                                    ),
+                                                    &selected,
+                                                    true,
+                                                ),
+                                                modern,
+                                            )
+                                        }
+                                        Err(error) => tools::result(
+                                            tools::selection_failure(
+                                                &admission.id,
+                                                error,
+                                                &serde_json::json!(path),
+                                            ),
+                                            modern,
+                                        ),
+                                    }
+                                }
+                                Err(error) => {
+                                    let attempted = selection
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!(workspace.root()));
+                                    tools::result(
+                                        tools::selection_failure(&admission.id, error, &attempted),
+                                        modern,
+                                    )
+                                }
+                            }
+                        }
                     }
                     session::Action::Unknown => {
                         wire::ProtocolError::new(-32601, admission.id.clone()).response()
@@ -214,8 +337,26 @@ fn run_transport(
                         }
                     }
                 }
-                if let Some(mut tool) = prepared_tool {
-                    tools::final_check(&mut tool, &workspace);
+                if let Some((mut tool, selected)) = prepared_tool {
+                    if let Some(witness) = selected.as_ref() {
+                        if let Err(error) = witness.before_answer() {
+                            let attempted = serde_json::json!(witness.identity.root);
+                            tool.response = tools::result(
+                                tools::selection_failure(&admission.id, error, &attempted),
+                                modern,
+                            );
+                        }
+                    } else if tool.valid_arguments && workspace.check().is_err() {
+                        let attempted = serde_json::json!(workspace.root());
+                        tool.response = tools::result(
+                            tools::selection_failure(
+                                &admission.id,
+                                crate::daemon::registry::SelectionError::IdentityChanged,
+                                &attempted,
+                            ),
+                            modern,
+                        );
+                    }
                     prepared.response["result"] = tool.response;
                 }
                 if let Some(value) = session.commit(prepared) {
