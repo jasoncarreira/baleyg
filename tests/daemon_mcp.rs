@@ -340,3 +340,140 @@ fn idle_mcp_connection_outlives_cli_request_deadline() {
     assert!(client.child.wait().unwrap().success());
     client.reaped = true;
 }
+
+#[test]
+fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
+    use std::io::Read;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    // Start once to create the production private directory, then replace its
+    // stale socket under the same singleton lock with a controlled socket peer.
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let mut dirs = vec![home.path().to_path_buf()];
+    let mut lock = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                lock = Some(path);
+                break;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let lock = lock.unwrap();
+    let data = lock.parent().unwrap().parent().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(data))
+        .unwrap()
+        .expect("the killed daemon released its lock");
+    let listener = owner.listener().try_clone().unwrap();
+    let fake = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+        assert_eq!(attach.operation, "mcp");
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Reply {
+                id: attach.id,
+                payload: json!({"result":true}),
+            },
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["method"],
+            "server/discover"
+        );
+        stream
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":")
+            .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("mcp")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0", "id":1,"method":"server/discover",
+            "params":{"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}
+            }}
+        })
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "client did not exit after partial reply"
+        );
+        std::thread::yield_now();
+    };
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .take(65_537)
+        .read_to_end(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .take(65_537)
+        .read_to_string(&mut stderr)
+        .unwrap();
+    fake.join().unwrap();
+    owner.listener().set_nonblocking(true).unwrap();
+    assert!(
+        owner
+            .listener()
+            .accept()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
+        "client reattached after an interrupted MCP response"
+    );
+    assert!(!status.success());
+    assert!(
+        stdout.is_empty(),
+        "partial daemon reply leaked to MCP stdout"
+    );
+    assert!(stderr.contains("daemon_unavailable"), "{stderr}");
+    assert!(!stderr.contains("partial MCP response"), "{stderr}");
+}

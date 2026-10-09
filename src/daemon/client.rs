@@ -176,7 +176,11 @@ pub fn relay_stdio(
     loop {
         let mut line = Vec::new();
         loop {
-            let available = reader.fill_buf()?;
+            let available = reader.fill_buf().map_err(|error| {
+                io::Error::other(format!(
+                    "daemon_unavailable: MCP response interrupted: {error}"
+                ))
+            })?;
             if available.is_empty() {
                 if line.is_empty() {
                     return if stdin_done.load(std::sync::atomic::Ordering::Acquire) {
@@ -190,7 +194,7 @@ pub fn relay_stdio(
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "partial MCP response",
+                    "daemon_unavailable: MCP response interrupted",
                 ));
             }
             let end = available.iter().position(|byte| *byte == b'\n');
