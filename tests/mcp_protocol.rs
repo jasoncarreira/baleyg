@@ -206,7 +206,30 @@ impl Peer {
         cwd: Option<&Path>,
         phase: Option<(&str, &Path)>,
     ) -> Self {
+        Self::start_with_fixture_home(tempfile::tempdir().unwrap(), workspace, cwd, phase, None)
+    }
+    fn start_with_causal_witness(workspace: Option<&Path>) -> (Self, tokio::net::UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = home.path().join("mcp-causal.sock");
+        assert!(socket.is_absolute());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::metadata(home.path()).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket));
+        (peer, listener)
+    }
+    fn start_with_fixture_home(
+        home: tempfile::TempDir,
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+        causal_socket: Option<&Path>,
+    ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
@@ -229,6 +252,9 @@ impl Peer {
         if let Some((stage, socket)) = phase {
             cmd.env("BALEYG_TEST_MCP_PHASE", stage)
                 .env("BALEYG_TEST_MCP_PHASE_SOCKET", socket);
+        }
+        if let Some(socket) = causal_socket {
+            cmd.env("BALEYG_TEST_MCP_CAUSAL_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -2256,11 +2282,33 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
     assert!(peer.finish().0.success());
 }
 
-#[test]
-fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
+/// One bounded, read-only causal event per private fixture socket connection.
+async fn next_causal_event(
+    listener: &tokio::net::UnixListener,
+    deadline: tokio::time::Instant,
+) -> Value {
+    use tokio::io::AsyncReadExt;
+    let (socket, _) = tokio::time::timeout_at(deadline, listener.accept())
+        .await
+        .expect("daemon did not emit a causal H/watch witness")
+        .unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout_at(deadline, socket.take(513).read_to_end(&mut bytes))
+        .await
+        .expect("incomplete causal witness")
+        .unwrap();
+    assert!(
+        !bytes.is_empty() && bytes.len() <= 512,
+        "invalid causal witness size"
+    );
+    serde_json::from_slice(&bytes).expect("causal witness must be JSON")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
-    let mut peer = Peer::start(Some(&root));
+    let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
     let first = peer.ask(call(
         false,
         json!(1),
@@ -2269,13 +2317,16 @@ fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
     ));
     tool(&first, None, true);
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
-    let home = peer._home.path();
+    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let home = peer._home.path().to_path_buf();
     let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     command
         .arg("index")
         .arg("--workspace")
         .arg(&root)
-        .env("HOME", home)
+        .env("HOME", &home)
         .env("XDG_CACHE_HOME", home.join("cache"))
         .env("XDG_DATA_HOME", home.join("data"));
     let indexed = bounded_output(command);
@@ -2284,6 +2335,14 @@ fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
         "index: {}",
         String::from_utf8_lossy(&indexed.stderr)
     );
+    let cli: Value = serde_json::from_slice(&indexed.stdout).expect("CLI index response");
+    let published = &cli["publishedRevision"];
+    assert!(published["indexGeneration"].is_string());
+    assert!(published["indexRevision"].is_u64());
+
+    // A completed CLI queue row pins a publication, not the daemon's mandatory
+    // H or its watcher inventory. The same Peer must keep its launch selection,
+    // but a second tool call may still report catchingUp=true.
     let second = peer.ask(call(
         false,
         json!(2),
@@ -2291,10 +2350,128 @@ fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
         json!({"schemaVersion":1}),
     ));
     tool(&second, None, true);
+    let selected = &first["result"]["structuredContent"]["workspace"];
     assert_eq!(
-        second["result"]["structuredContent"]["workspace"],
-        first["result"]["structuredContent"]["workspace"]
+        &second["result"]["structuredContent"]["workspace"],
+        selected
     );
-    assert_eq!(second["result"]["structuredContent"]["catchingUp"], false);
-    assert!(peer.finish().0.success());
+    assert!(second["result"]["structuredContent"]["catchingUp"].is_boolean());
+
+    // Future opt-in daemon hooks send one bounded JSON record per connection:
+    // {kind,rootKey,pin,watchGeneration,queueEmpty}. H_READY follows verified
+    // owner installation AND phase Ready/H=false. WATCH_ACK follows the initial
+    // full inventory acknowledgment and no unfinished FIFO. WATCH_PENDING is
+    // emitted for a later accepted hint, so an ACK is never a future quiet lease.
+    // The socket is read-only, private to HOME, and does not address a PID.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut events = 0;
+    let mut h_ready = false;
+    let mut acked: Option<u64> = None;
+    let mut pending: Option<u64> = None;
+    let mut next_event = async || {
+        events += 1;
+        assert!(events <= 24, "causal witness transition budget exhausted");
+        let event = next_causal_event(&witness, deadline).await;
+        assert_eq!(event["rootKey"], root_key, "foreign causal witness");
+        event
+    };
+    loop {
+        let event = next_event().await;
+        match event["kind"].as_str().expect("witness kind") {
+            "H_READY" => {
+                assert!(
+                    event["pin"].is_object(),
+                    "H requires its own publication pin"
+                );
+                h_ready = true;
+            }
+            "WATCH_PENDING" => {
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                pending = Some(pending.map_or(generation, |previous| previous.max(generation)));
+            }
+            "WATCH_ACK" => {
+                assert_eq!(event["queueEmpty"], true, "ACK requires an empty FIFO");
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                // An ACK for an earlier H revision may precede the CLI request.
+                // It cannot witness the selected CLI publication's inventory.
+                if event["pin"] == *published {
+                    acked = Some(acked.map_or(generation, |previous| previous.max(generation)));
+                }
+            }
+            kind => panic!("unknown causal witness: {kind}"),
+        }
+        if h_ready && acked.is_some_and(|generation| pending.is_none_or(|p| generation >= p)) {
+            break;
+        }
+    }
+
+    // A newly accepted hint between WATCH_ACK and this tool call makes true
+    // legitimate. Only retry after witnessing that later generation and its
+    // corresponding ACK. Never spin on catchingUp or turn a timeout into false.
+    for id in 3..=5 {
+        let reply = peer.ask(call(
+            false,
+            json!(id),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1}),
+        ));
+        tool(&reply, None, true);
+        let data = &reply["result"]["structuredContent"];
+        assert_eq!(&data["workspace"], selected);
+        if data["catchingUp"] == false {
+            // Describe has no evidenceBasis pin of its own. Check the selected
+            // store's immutable revision through the read-only CLI status path.
+            let mut status_command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+            status_command
+                .arg("status")
+                .arg("--workspace")
+                .arg(&root)
+                .env("HOME", &home)
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("XDG_DATA_HOME", home.join("data"));
+            let status = bounded_output(status_command);
+            assert!(
+                status.status.success(),
+                "status: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            let selected_status: Value =
+                serde_json::from_slice(&status.stdout).expect("selected read-only status");
+            assert_eq!(selected_status["revision"], *published);
+            assert!(peer.finish().0.success());
+            return;
+        }
+        assert_eq!(data["catchingUp"], true);
+        assert!(
+            id < 5,
+            "new watcher hints exceeded the bounded transition budget"
+        );
+        let prior_ack = acked.expect("already witnessed CLI publication ACK");
+        let mut later_hint = None;
+        loop {
+            let event = next_event().await;
+            match event["kind"].as_str().expect("witness kind") {
+                "WATCH_PENDING" => {
+                    let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                    if generation > prior_ack {
+                        later_hint =
+                            Some(later_hint.map_or(generation, |p: u64| p.max(generation)));
+                    }
+                }
+                "WATCH_ACK" => {
+                    assert_eq!(event["queueEmpty"], true);
+                    let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                    if event["pin"] == *published
+                        && later_hint.is_some_and(|hint| generation >= hint)
+                    {
+                        acked = Some(generation);
+                        break;
+                    }
+                }
+                "H_READY" => panic!("H restarted after its ready witness"),
+                kind => panic!("unknown causal witness: {kind}"),
+            }
+        }
+    }
+    unreachable!("bounded tool calls return or fail")
 }
