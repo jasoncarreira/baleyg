@@ -283,6 +283,27 @@ struct McpInputBuffer<'a> {
     cancelled_active: bool,
 }
 
+/// A failed attach has no socket to receive cancellation. Consume ready stdin first.
+fn discard_failed_mcp_result(
+    receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
+    buffer: &mut McpInputBuffer<'_>,
+    stdout: &mut impl std::io::Write,
+    eof: &mut bool,
+    active_id: Option<&serde_json::Value>,
+) -> io::Result<bool> {
+    let mut canceled = false;
+    drain_mcp_input(
+        None,
+        receiver,
+        buffer,
+        stdout,
+        eof,
+        active_id,
+        &mut canceled,
+    )?;
+    Ok(*eof || canceled || buffer.cancelled_active)
+}
+
 /// One bounded stdin reader and one response writer survive daemon generations.
 /// Only an interrupted read can be replayed; unknown methods are never retried.
 pub fn relay_stdio(
@@ -466,7 +487,14 @@ pub fn relay_stdio(
                 break;
             }
             let Some(stream) = current.as_mut() else {
-                if has_id {
+                let discard = discard_failed_mcp_result(
+                    &receiver,
+                    &mut buffer,
+                    &mut stdout,
+                    &mut eof,
+                    value.get("id"),
+                )?;
+                if has_id && !discard {
                     wire::write_response(
                         &mut stdout,
                         &mcp_failure(&value, "daemon_unavailable", workspace),
@@ -476,7 +504,7 @@ pub fn relay_stdio(
             };
             let mut canceled_before_send = false;
             drain_mcp_input(
-                stream,
+                Some(stream),
                 &receiver,
                 &mut buffer,
                 &mut stdout,
@@ -529,18 +557,27 @@ pub fn relay_stdio(
                         }
                         // Never replay a possibly delivered mutation or a truncated reply.
                         if partial || !read_only || retry != 0 {
-                            wire::write_response(
+                            let discard = discard_failed_mcp_result(
+                                &receiver,
+                                &mut buffer,
                                 &mut stdout,
-                                &mcp_failure(
-                                    &value,
-                                    if read_only {
-                                        "daemon_unavailable"
-                                    } else {
-                                        "outcome_unknown"
-                                    },
-                                    workspace,
-                                ),
+                                &mut eof,
+                                value.get("id"),
                             )?;
+                            if !discard {
+                                wire::write_response(
+                                    &mut stdout,
+                                    &mcp_failure(
+                                        &value,
+                                        if read_only {
+                                            "daemon_unavailable"
+                                        } else {
+                                            "outcome_unknown"
+                                        },
+                                        workspace,
+                                    ),
+                                )?;
+                            }
                             break;
                         }
                         retry += 1;
@@ -549,7 +586,14 @@ pub fn relay_stdio(
                 }
             }
             if !read_only || retry != 0 {
-                if has_id {
+                let discard = discard_failed_mcp_result(
+                    &receiver,
+                    &mut buffer,
+                    &mut stdout,
+                    &mut eof,
+                    value.get("id"),
+                )?;
+                if has_id && !discard {
                     wire::write_response(
                         &mut stdout,
                         &mcp_failure(
@@ -610,8 +654,21 @@ fn cancellation_id(frame: &crate::mcp::wire::Frame) -> Option<serde_json::Value>
 
 /// Check all ready input before committing a reply. Once the buffer.queue is full,
 /// reject excess admissions explicitly; never let them hide a later cancellation.
+fn pending_duplicate(buffer: &McpInputBuffer<'_>, key: &crate::mcp::wire::IdKey) -> bool {
+    use crate::mcp::wire::{self, Frame};
+    (!buffer.cancelled_active && buffer.active_key.as_ref() == Some(key))
+        || buffer.queue.iter().any(|queued| {
+            matches!(queued,
+            Frame::Line(line) if wire::decode(Frame::Line(line.clone()))
+                .ok().flatten().is_some_and(|item|
+                    item.key.as_ref() == Some(key)
+                    && item.id.as_ref().is_some_and(|id|
+                        !buffer.cancelled_queued.contains(id))))
+        })
+}
+
 fn drain_mcp_input(
-    stream: &mut UnixStream,
+    mut stream: Option<&mut UnixStream>,
     receiver: &std::sync::mpsc::Receiver<crate::mcp::wire::Frame>,
     buffer: &mut McpInputBuffer<'_>,
     stdout: &mut impl std::io::Write,
@@ -647,10 +704,27 @@ fn drain_mcp_input(
                     if let Frame::Line(mut line) = frame {
                         line.push(b'\n');
                         // Cancellation takes effect locally even if the old socket died.
-                        let _ = stream.write_all(&line);
+                        if let Some(stream) = stream.as_mut() {
+                            let _ = stream.write_all(&line);
+                        }
                     }
                 } else if buffer.queue.len() < 16 {
-                    buffer.queue.push_back(frame);
+                    let duplicate = match &frame {
+                        Frame::Line(line) => wire::decode(Frame::Line(line.clone()))
+                            .ok()
+                            .flatten()
+                            .and_then(|request| request.key.map(|key| (key, request.id)))
+                            .filter(|(key, _)| pending_duplicate(buffer, key)),
+                        _ => None,
+                    };
+                    if let Some((_, Some(id))) = duplicate {
+                        wire::write_response(
+                            stdout,
+                            &wire::ProtocolError::new(-32600, id).response(),
+                        )?;
+                    } else {
+                        buffer.queue.push_back(frame);
+                    }
                 } else {
                     // A finite relay cannot admit this frame for daemon selection.
                     // Decode before refusal so known tools retain their closed DTO shape.
@@ -662,18 +736,10 @@ fn drain_mcp_input(
                         Err(error) => Some(error.response()),
                         Ok(Some(request)) if request.id.is_some() => {
                             let id = request.id.clone().expect("checked ID");
-                            let duplicate = request.key.as_ref().is_some_and(|key| {
-                                (!buffer.cancelled_active
-                                    && buffer.active_key.as_ref() == Some(key))
-                                    || buffer.queue.iter().any(|queued| {
-                                        matches!(queued,
-                                        Frame::Line(line) if wire::decode(Frame::Line(line.clone()))
-                                            .ok().flatten().is_some_and(|item|
-                                                item.key.as_ref() == Some(key)
-                                                && item.id.as_ref().is_some_and(|id|
-                                                    !buffer.cancelled_queued.contains(id))))
-                                    })
-                            });
+                            let duplicate = request
+                                .key
+                                .as_ref()
+                                .is_some_and(|key| pending_duplicate(buffer, key));
                             if duplicate {
                                 Some(wire::ProtocolError::new(-32600, id).response())
                             } else {
@@ -744,7 +810,7 @@ fn read_mcp_line(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         drain_mcp_input(
-            stream,
+            Some(stream),
             receiver,
             buffer,
             stdout,
@@ -766,7 +832,7 @@ fn read_mcp_line(
             match stream.read(&mut buf) {
                 Ok(0) => {
                     drain_mcp_input(
-                        stream,
+                        Some(stream),
                         receiver,
                         buffer,
                         stdout,
@@ -816,7 +882,7 @@ fn read_mcp_line(
             let reply: serde_json::Value = serde_json::from_slice(&line)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             drain_mcp_input(
-                stream,
+                Some(stream),
                 receiver,
                 buffer,
                 stdout,

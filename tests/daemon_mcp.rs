@@ -616,6 +616,100 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
 }
 
 #[test]
+fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/baleyg-107-dup-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
+        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let meta = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}});
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,
+        "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
+    )
+    .unwrap();
+    let (mut phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stage = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut stage)
+        .unwrap();
+    assert_eq!(stage, "launch_final\n");
+    let mut burst = String::new();
+    for id in [8, 8, 9] {
+        burst.push_str(
+            &json!({"jsonrpc":"2.0","id":id,
+            "method":"tools/list","params":meta})
+            .to_string(),
+        );
+        burst.push('\n');
+    }
+    peer.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(burst.as_bytes())
+        .unwrap();
+    let duplicate = peer
+        .lines
+        .recv_timeout(Duration::from_secs(3))
+        .expect("second queued ID8 must be rejected before A is released");
+    assert_eq!(duplicate["id"], 8, "{duplicate}");
+    assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+    // A is still held at this point: the duplicate must be rejected at admission.
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":1}
+        })
+    )
+    .unwrap();
+    // B can finish after A's cancellation while the old daemon hook stays held.
+    let first = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(first["id"], 8, "{first}");
+    assert!(first["result"].is_object(), "{first}");
+    phase.write_all(b"x").unwrap();
+    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(next["id"], 9, "{next}");
+    assert!(next["result"].is_object(), "{next}");
+    let reused = peer.ask(8, "tools/list", meta);
+    assert_eq!(reused["id"], 8, "{reused}");
+    assert!(reused["result"].is_object(), "{reused}");
+    assert!(peer.lines.recv_timeout(Duration::from_millis(200)).is_err());
+    peer.finish_unreaped();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+    fs::remove_file(&phase_path).unwrap();
+}
+
+#[test]
 fn stdin_eof_cancels_in_flight_call_without_stdout() {
     use std::os::unix::net::UnixListener;
     let home = tempfile::tempdir().unwrap();
@@ -750,15 +844,20 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
 
 #[test]
 fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
-    check_legacy_synthetic_reattach_cancel(1);
+    check_legacy_synthetic_reattach_cancel(1, false);
 }
 
 #[test]
 fn legacy_pending_call_cancel_during_synthetic_reattach_is_silent() {
-    check_legacy_synthetic_reattach_cancel(5);
+    check_legacy_synthetic_reattach_cancel(5, false);
 }
 
-fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
+#[test]
+fn legacy_cancel_during_failed_synthetic_reattach_is_silent() {
+    check_legacy_synthetic_reattach_cancel(5, true);
+}
+
+fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
@@ -843,6 +942,9 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
             match method {
                 "initialize" => {
                     assert_eq!(value["id"], 1);
+                    if fail_setup {
+                        break;
+                    }
                     writeln!(
                         socket,
                         "{}",
@@ -877,10 +979,12 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
                 other => panic!("unexpected synthetic MCP method {other}: {steps:?}"),
             }
         }
-        assert!(
-            steps.contains(&"notifications/cancelled".into()),
-            "{steps:?}"
-        );
+        if !fail_setup {
+            assert!(
+                steps.contains(&"notifications/cancelled".into()),
+                "{steps:?}"
+            );
+        }
         assert_eq!(
             steps
                 .iter()
@@ -927,6 +1031,11 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
         assert_eq!(list["id"], 5, "{list}");
         assert!(list["result"]["tools"].is_array(), "{list}");
     }
+    let mut fake = Some(fake);
+    if fail_setup {
+        fake.take().unwrap().join().unwrap();
+        drop(owner);
+    }
     let call = peer.ask(
         6,
         "tools/call",
@@ -936,7 +1045,9 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64) {
     );
     assert_eq!(call["id"], 6, "{call}");
     assert_eq!(call["result"]["isError"], false, "{call}");
-    fake.join().unwrap();
+    if let Some(fake) = fake {
+        fake.join().unwrap();
+    }
     peer.finish_unreaped();
     unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
     assert!(peer.child.wait().unwrap().success());
@@ -995,6 +1106,117 @@ fn legacy_await_initialized_refuses_tool_after_daemon_death() {
     unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
     assert!(peer.child.wait().unwrap().success());
     peer.reaped = true;
+}
+
+#[test]
+fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
+    for close_stdin in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let root = checkout(home.path());
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+            .arg("daemon")
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _ = socket_ready(home.path());
+        let mut peer = Peer::start(home.path(), &root);
+        let meta = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}}});
+        assert_eq!(peer.ask(1, "server/discover", meta.clone())["id"], 1);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        let mut dirs = vec![home.path().to_path_buf()];
+        let mut data = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    data = path.parent().and_then(Path::parent).map(Path::to_path_buf);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+        }
+        let owner =
+            baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
+                .unwrap()
+                .unwrap();
+        let listener = owner.listener().try_clone().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+            assert_eq!(attach.operation, "mcp");
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            protocol::write_frame(
+                &mut stream,
+                &protocol::Reply {
+                    id: attach.id,
+                    payload: json!({"error":"root_changed"}),
+                },
+            )
+            .unwrap();
+        });
+        writeln!(
+            peer.stdin.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc":"2.0","id":7,
+            "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+                "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
+        )
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if close_stdin {
+            peer.stdin.take();
+        } else {
+            writeln!(
+                peer.stdin.as_mut().unwrap(),
+                "{}",
+                json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":7}})
+            )
+            .unwrap();
+        }
+        assert!(
+            peer.lines.recv_timeout(Duration::from_millis(150)).is_err(),
+            "attach still blocked"
+        );
+        release_tx.send(()).unwrap();
+        fake.join().unwrap();
+        if close_stdin {
+            peer.finish_unreaped();
+            assert!(
+                peer.lines.recv_timeout(Duration::from_secs(1)).is_err(),
+                "stdin EOF emitted pending failure"
+            );
+        } else {
+            assert!(
+                peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+                "canceled ID7 emitted pending failure"
+            );
+            drop(owner);
+            let recovered = peer.ask(8, "tools/list", meta.clone());
+            assert_eq!(recovered["id"], 8, "{recovered}");
+            assert!(recovered["result"].is_object(), "{recovered}");
+            peer.finish_unreaped();
+        }
+        unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+        assert!(peer.child.wait().unwrap().success());
+        peer.reaped = true;
+    }
 }
 
 #[test]
