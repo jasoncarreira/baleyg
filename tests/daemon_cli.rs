@@ -106,6 +106,68 @@ async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child)
 }
 
 #[test]
+fn serve_request_preserves_explicit_default_file_cap_presence() {
+    use baleyg::daemon::{SocketOwner, SocketPaths, protocol};
+    use std::sync::mpsc;
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let root = checkout(temp.path(), "request-options");
+    let data = home.join("Library/Application Support/dev.odin.baleyg");
+    let owner = SocketOwner::acquire(&SocketPaths::new(&data))
+        .unwrap()
+        .unwrap();
+    let listener = owner.listener().try_clone().unwrap();
+    let (tx, rx) = mpsc::sync_channel(2);
+    let responder = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+            assert_eq!(request.operation, "serve");
+            tx.send(request.payload["options"].clone()).unwrap();
+            protocol::write_frame(
+                &mut stream,
+                &protocol::Reply {
+                    id: request.id,
+                    payload: serde_json::json!({"result":"127.0.0.1:8877"}),
+                },
+            )
+            .unwrap();
+        }
+    });
+    let mut options = Vec::new();
+    for explicit in [false, true] {
+        let mut command = cli(&home);
+        command
+            .arg("serve")
+            .arg("--workspace")
+            .arg(&root)
+            .arg("--bind")
+            .arg("127.0.0.1:0")
+            .arg("--token-file")
+            .arg(home.join("token"));
+        if explicit {
+            command.arg("--max-file-bytes").arg("2097152");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Baleyg:"),
+            "serve did not receive fake acknowledgement: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        options.push(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    }
+    responder.join().unwrap();
+    assert!(
+        options[0].get("maxFileBytes").is_none(),
+        "omission became explicit: {}",
+        options[0]
+    );
+    assert_eq!(options[1]["maxFileBytes"], 2_097_152, "{}", options[1]);
+    drop(owner);
+}
+
+#[test]
 fn daemon_keeps_private_socket_after_transient_accept_errors() {
     use std::os::unix::{fs::MetadataExt, net::UnixStream};
     for fault in ["emfile", "econnaborted"] {

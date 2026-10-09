@@ -107,8 +107,8 @@ struct IndexArgs {
     #[arg(long, requires = "scip")]
     manifest: Option<PathBuf>,
     /// Larger files are skipped with a diagnostic; valid range 1..16777216.
-    #[arg(long, default_value_t = 2_097_152)]
-    max_file_bytes: u64,
+    #[arg(long)]
+    max_file_bytes: Option<u64>,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -205,8 +205,9 @@ impl WorkspaceArgs {
 }
 impl IndexArgs {
     fn resolve(&self) -> Result<(Store, IndexOptions, PathBuf)> {
+        let max_file_bytes = self.max_file_bytes.unwrap_or(2_097_152);
         ensure!(
-            (1..=16_777_216).contains(&self.max_file_bytes),
+            (1..=16_777_216).contains(&max_file_bytes),
             "max-file-bytes must be 1..16777216"
         );
         let (roots, identity) = self.workspace.resolve()?;
@@ -217,7 +218,7 @@ impl IndexArgs {
         options.scip_path = self.scip.clone();
         options.manifest_path = self.manifest.clone();
         options.anchor_optional_inputs(&std::env::current_dir()?)?;
-        options.max_file_bytes = self.max_file_bytes;
+        options.max_file_bytes = max_file_bytes;
         Ok((store, options, cache))
     }
 }
@@ -1014,7 +1015,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
     let (roots, identity) = workspace.resolve_unattached()?;
     if let Command::Index(args) = command {
         ensure!(
-            (1..=16_777_216).contains(&args.max_file_bytes),
+            (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
             "max-file-bytes must be 1..16777216"
         );
         let mut options = IndexOptions::new(identity.root.clone());
@@ -1023,6 +1024,12 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
         options.anchor_optional_inputs(&std::env::current_dir()?)?;
         payload["scip"] = serde_json::to_value(options.scip_path)?;
         payload["manifest"] = serde_json::to_value(options.manifest_path)?;
+        if args.max_file_bytes.is_none() {
+            payload
+                .as_object_mut()
+                .expect("index args object")
+                .remove("maxFileBytes");
+        }
     }
     if operation == "export"
         && let Command::Export(args) = command
@@ -1095,7 +1102,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let mut index_options = IndexOptions::new(identity.root.clone());
     index_options.scip_path = args.index.scip.clone();
     index_options.manifest_path = args.index.manifest.clone();
-    index_options.max_file_bytes = args.index.max_file_bytes;
+    index_options.max_file_bytes = args.index.max_file_bytes.unwrap_or(2_097_152);
+    ensure!(
+        (1..=16_777_216).contains(&index_options.max_file_bytes),
+        "max-file-bytes must be 1..16777216"
+    );
     index_options.anchor_optional_inputs(&std::env::current_dir()?)?;
     let rust_library = if let Some(path) = args
         .rust_library
@@ -1130,6 +1141,13 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         acp_state_dir: args.acp_state_dir.clone(),
         acp_max_attempts: args.acp_max_attempts,
     };
+    let mut options_json = serde_json::to_value(options)?;
+    if args.index.max_file_bytes.is_none() {
+        options_json
+            .as_object_mut()
+            .expect("browser options object")
+            .remove("maxFileBytes");
+    }
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
         .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
@@ -1140,7 +1158,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             "serve",
             serde_json::json!({
                 "workspace": identity.root, "bind": args.bind, "tokenFile": token_file,
-                "options": options,
+                "options": options_json,
             }),
         ),
     )?;
@@ -1255,6 +1273,28 @@ async fn run_daemon() -> Result<()> {
     Ok(())
 }
 
+fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOptions> {
+    let _: registry::BrowserOptions = serde_json::from_value(raw.clone())?;
+    // Validation must not fill in a missing optional key before lifecycle
+    // compares the caller's explicitly supplied options.
+    Ok(registry::CheckoutOptions(raw))
+}
+
+#[cfg(test)]
+mod serve_option_transport_tests {
+    use super::*;
+    #[test]
+    fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
+        let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
+        let mut omitted = options.clone();
+        omitted.as_object_mut().unwrap().remove("maxFileBytes");
+        let absent = checked_serve_options(omitted).unwrap();
+        let explicit = checked_serve_options(options).unwrap();
+        assert!(absent.0.get("maxFileBytes").is_none(), "{}", absent.0);
+        assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
+    }
+}
+
 fn dispatch_connection(
     mut stream: std::os::unix::net::UnixStream,
     session: u64,
@@ -1340,14 +1380,13 @@ fn dispatch_connection(
         let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
         TopologyRoots::production()?.reject_root_overlap(&identity)?;
         if serve {
-            let options: registry::BrowserOptions = serde_json::from_value(
+            let options = checked_serve_options(
                 request
                     .payload
                     .get("options")
                     .cloned()
                     .context("missing options")?,
             )?;
-            let options = registry::CheckoutOptions(serde_json::to_value(options)?);
             let bind = serde_json::from_value(
                 request
                     .payload
@@ -1419,9 +1458,9 @@ fn dispatch_connection(
                     let mut options = IndexOptions::new(identity.root.clone());
                     options.scip_path = serde_json::from_value(args["scip"].clone())?;
                     options.manifest_path = serde_json::from_value(args["manifest"].clone())?;
-                    options.max_file_bytes = args["maxFileBytes"]
-                        .as_u64()
-                        .context("missing maxFileBytes")?;
+                    if let Some(value) = args.get("maxFileBytes") {
+                        options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
+                    }
                     ensure!(
                         (1..=16_777_216).contains(&options.max_file_bytes),
                         "max-file-bytes must be 1..16777216"
