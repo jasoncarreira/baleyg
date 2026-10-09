@@ -15612,33 +15612,72 @@ mod sqlite_schema_race_tests {
     fn response_post_fence_discards_none_and_empty_results() {
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let leader_path = store.roots.leader_lock(&store.identity);
-        let none = store.with_evidence_hook(
-            |_db| Ok(None::<IndexStatus>),
-            || {
-                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
-                Ok(())
-            },
+        let none = store
+            .with_evidence_hook(
+                |_db| Ok(None::<IndexStatus>),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            none.is_none(),
+            "coherent None survives leader marker replacement"
         );
-        assert!(none.is_err(), "post-fence failure must discard None");
 
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let leader_path = store.roots.leader_lock(&store.identity);
-        let empty = store.with_evidence_hook(
-            |_db| Ok(Vec::<Symbol>::new()),
-            || {
-                std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
-                Ok(())
-            },
-        );
+        let empty = store
+            .with_evidence_hook(
+                |_db| Ok(Vec::<Symbol>::new()),
+                || {
+                    std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
+                    Ok(())
+                },
+            )
+            .unwrap();
         assert!(
-            empty.is_err(),
-            "post-fence failure must discard an empty collection"
+            empty.is_empty(),
+            "coherent [] survives leader marker replacement"
         );
+
+        for empty_collection in [false, true] {
+            let (state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+            let original = work.path().to_owned();
+            let moved = state.path().join("root-moved-during-finish");
+            let error = if empty_collection {
+                store
+                    .with_evidence_hook(
+                        |_db| Ok(Vec::<Symbol>::new()),
+                        || {
+                            std::fs::rename(&original, &moved)?;
+                            std::fs::create_dir(&original)?;
+                            Ok(())
+                        },
+                    )
+                    .map(|_| ())
+            } else {
+                store
+                    .with_evidence_hook(
+                        |_db| Ok(None::<IndexStatus>),
+                        || {
+                            std::fs::rename(&original, &moved)?;
+                            std::fs::create_dir(&original)?;
+                            Ok(())
+                        },
+                    )
+                    .map(|_| ())
+            }
+            .unwrap_err();
+            assert!(error.to_string().contains("root_changed"), "{error:#}");
+            std::fs::remove_dir(&original).unwrap();
+            std::fs::rename(&moved, &original).unwrap();
+        }
     }
 
     #[test]
-    fn direct_response_pre_fence_rejects_root_lock_and_incarnation_changes() {
-        use std::os::unix::fs::PermissionsExt;
+    fn direct_response_pre_fence_rejects_root_and_git_identity_changes() {
         let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let original = work.path().to_owned();
         let moved = original.with_extension("moved-before-read");
@@ -15652,28 +15691,27 @@ mod sqlite_schema_race_tests {
         std::fs::remove_dir(&original).unwrap();
         std::fs::rename(&moved, &original).unwrap();
 
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
         let leader_path = store.roots.leader_lock(&store.identity);
-        std::fs::remove_file(&leader_path).unwrap();
         std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
-        std::fs::set_permissions(&leader_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let lock_error = store.symbol_at("missing", None).unwrap_err();
-        assert!(
-            lock_error.to_string().contains("managed file")
-                || lock_error.to_string().contains("incarnation")
-                || lock_error.to_string().contains("leader lock is not held"),
-            "{lock_error:#}"
-        );
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert!(store.symbol_at("missing", None).unwrap().is_none());
+        assert!(store.symbols_at("never", 10).is_ok());
 
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
-        let leader_path = store.roots.leader_lock(&store.identity);
-        std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
-        let incarnation_error = store.symbols_at("never", 10).unwrap_err();
+        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let git = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work.path())
+            .arg("init")
+            .output()
+            .unwrap();
         assert!(
-            incarnation_error.to_string().contains("incarnation")
-                || incarnation_error.to_string().contains("mismatch"),
-            "{incarnation_error:#}"
+            git.status.success(),
+            "{}",
+            String::from_utf8_lossy(&git.stderr)
         );
+        let foreign = store.status().unwrap_err();
+        assert!(foreign.to_string().contains("root_changed"), "{foreign:#}");
     }
 
     #[test]
@@ -15701,7 +15739,7 @@ mod sqlite_schema_race_tests {
 
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let leader_path = store.roots.leader_lock(&store.identity);
-        let lock_error = store
+        let symbols = store
             .with_evidence_hook(
                 |_db| Ok(Vec::<Symbol>::new()),
                 || {
@@ -15711,11 +15749,10 @@ mod sqlite_schema_race_tests {
                     Ok(())
                 },
             )
-            .unwrap_err();
+            .unwrap();
         assert!(
-            lock_error.to_string().contains("managed file")
-                || lock_error.to_string().contains("incarnation"),
-            "{lock_error:#}"
+            symbols.is_empty(),
+            "leader.lock replacement cannot revoke admitted read"
         );
 
         let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
@@ -15731,8 +15768,8 @@ mod sqlite_schema_race_tests {
                 |fence| {
                     finish_observed.set(true);
                     assert!(
-                        fence.is_err(),
-                        "concurrent incarnation change must fail the final fence"
+                        fence.is_ok(),
+                        "leader incarnation is independent of read authority"
                     );
                 },
             )
@@ -15755,7 +15792,7 @@ mod sqlite_schema_race_tests {
                 },
                 |fence| {
                     finish_observed.set(true);
-                    assert!(fence.is_err());
+                    assert!(fence.is_ok());
                 },
             )
             .unwrap_err();
@@ -15766,10 +15803,39 @@ mod sqlite_schema_race_tests {
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
         );
         assert!(!native_index_unavailable(&io_error));
+        let (state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let original = work.path().to_owned();
+        let moved = state.path().join("moved-error-root");
+        let mut observed_root_failure = false;
+        let sentinel = store
+            .with_evidence_observed::<()>(
+                |_db| anyhow::bail!("original materialization error"),
+                || {
+                    std::fs::rename(&original, &moved)?;
+                    std::fs::create_dir(&original)?;
+                    Ok(())
+                },
+                |fence| {
+                    observed_root_failure = true;
+                    assert!(
+                        fence.is_err(),
+                        "changed root must fail even on error result"
+                    );
+                },
+            )
+            .unwrap_err();
+        assert!(observed_root_failure);
+        assert!(
+            sentinel
+                .to_string()
+                .contains("original materialization error")
+        );
+        std::fs::remove_dir(&original).unwrap();
+        std::fs::rename(&moved, &original).unwrap();
     }
 
     #[test]
-    fn tree_metadata_applies_no_overlay_before_post_fence() {
+    fn tree_metadata_applies_only_after_verified_root_fence() {
         let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
         let mut entries = vec![crate::file_tree::Entry {
             name: "flow.js".into(),
@@ -15780,15 +15846,44 @@ mod sqlite_schema_race_tests {
             unindexed_reason: None,
         }];
         let leader_path = store.roots.leader_lock(&store.identity);
-        let error = store
+        store
             .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
                 std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
                 Ok(())
             })
+            .unwrap();
+        assert_eq!(entries[0].indexed_path.as_deref(), Some("flow.js"));
+        assert!(
+            entries[0].method_count.is_some_and(|n| n > 0),
+            "actual indexed fixture file must receive real method metadata"
+        );
+
+        let (state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let mut entries = vec![crate::file_tree::Entry {
+            name: "flow.js".into(),
+            path: "flow.js".into(),
+            kind: "file",
+            indexed_path: None,
+            method_count: None,
+            unindexed_reason: None,
+        }];
+        let root = work.path().to_owned();
+        let moved = state.path().join("tree-old-root");
+        let error = store
+            .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
+                std::fs::rename(&root, &moved)?;
+                std::fs::create_dir(&root)?;
+                Ok(())
+            })
             .unwrap_err();
-        assert!(error.to_string().contains("incarnation"), "{error:#}");
+        assert!(error.to_string().contains("root_changed"), "{error:#}");
         assert!(entries[0].indexed_path.is_none());
-        assert!(entries[0].method_count.is_none());
+        assert!(
+            entries[0].method_count.is_none(),
+            "no overlay before root fence"
+        );
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&moved, &root).unwrap();
     }
 
     #[test]
@@ -15873,7 +15968,7 @@ mod sqlite_schema_race_tests {
             assert!(error.downcast_ref::<rusqlite::Error>().is_some());
             assert_eq!(store.status().unwrap().revision, pin);
         }
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
         let clone = store.clone();
         let error = store.report_live_read_failure(
             rusqlite::Error::InvalidColumnType(
@@ -15884,26 +15979,22 @@ mod sqlite_schema_race_tests {
             .into(),
         );
         assert!(error.to_string().starts_with("incompatible_index:"));
-        assert!(
-            clone
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("incompatible_index")
+        assert_eq!(
+            clone.status().unwrap().revision,
+            pin,
+            "fabricated InvalidColumnType cannot revoke a healthy selected head"
         );
 
-        let (_state, _work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
         let clone = store.clone();
         let error = store.report_live_read_failure(
             ControlIntegrity("incompatible_index: existing structural check".into()).into(),
         );
         assert!(error.to_string().starts_with("incompatible_index:"));
-        assert!(
-            clone
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("incompatible_index")
+        assert_eq!(
+            clone.status().unwrap().revision,
+            pin,
+            "fabricated ControlIntegrity cannot revoke a healthy selected head"
         );
 
         let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
@@ -15948,8 +16039,28 @@ mod sqlite_schema_race_tests {
         let integrity: anyhow::Error = SelectedIntegrity("selected mismatch".into()).into();
         let returned = store.report_selected_failure(integrity);
         assert!(returned.to_string().contains("incompatible_index"));
-        assert!(store.status().is_err());
-        assert!(clone.status().is_err());
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(
+            clone.status().unwrap().revision,
+            pin,
+            "fabricated selected mismatch cannot revoke a healthy head"
+        );
+        let id = format!("pin:v1:{}:{}", pin.index_generation, pin.index_revision);
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        db.execute(
+            "UPDATE native_revisions SET source_inventory='[]' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+        drop(db);
+        assert!(
+            store.status().is_err(),
+            "physical selected-row corruption must refuse reads"
+        );
+        assert!(
+            clone.status().is_err(),
+            "all Store clones must refuse corrupt pair"
+        );
     }
 
     #[cfg(unix)]
@@ -16145,8 +16256,12 @@ mod sqlite_schema_race_tests {
             error.to_string(),
             "injected pre-transaction takeover failure"
         );
-        assert!(store.status().is_err());
-        assert!(clone.status().is_err());
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(
+            clone.status().unwrap().revision,
+            pin,
+            "failed takeover cannot revoke a complete committed read"
+        );
         let separately_opened = Store::open_for_tests(state.path(), work.path()).unwrap();
         assert_eq!(separately_opened.index_baseline().unwrap(), pin);
         assert!(!separately_opened.recovery_required.load(Ordering::Acquire));
@@ -16218,12 +16333,12 @@ mod sqlite_schema_race_tests {
         db.execute_batch("DROP TRIGGER forged_after_admission")
             .unwrap();
         drop(db);
-        for closed in [store.status().unwrap_err(), clone.status().unwrap_err()] {
-            assert_eq!(
-                closed.to_string(),
-                "incompatible_index: reconciliation required after invalid current index"
-            );
-        }
+        assert_eq!(store.status().unwrap().revision, old);
+        assert_eq!(
+            clone.status().unwrap().revision,
+            old,
+            "dropping foreign trigger restores complete head reads, not H/claim rights"
+        );
     }
 
     #[test]
@@ -16255,8 +16370,11 @@ mod sqlite_schema_race_tests {
             after_external.into_inner().unwrap()
         );
         assert_eq!(store.index_baseline().unwrap(), pin);
-        let closed = store.status().unwrap_err();
-        assert!(closed.to_string().contains("index_not_ready"), "{closed:#}");
+        assert_eq!(
+            store.status().unwrap().revision,
+            pin,
+            "failed owner metadata write leaves complete A readable"
+        );
     }
 
     #[test]
@@ -16288,15 +16406,9 @@ mod sqlite_schema_race_tests {
             .execute_batch("DROP VIEW status_after_admission")
             .unwrap();
         drop(attacker);
-        for closed in [
-            store.status().unwrap_err(),
-            status_clone.status().unwrap_err(),
-        ] {
-            assert_eq!(
-                closed.to_string(),
-                "incompatible_index: reconciliation required after invalid current index"
-            );
-        }
+        let restored_pin = store.index_baseline().unwrap();
+        assert_eq!(store.status().unwrap().revision, restored_pin);
+        assert_eq!(status_clone.status().unwrap().revision, restored_pin);
 
         let (
             _leader_state,
@@ -16356,15 +16468,12 @@ mod sqlite_schema_race_tests {
             .execute_batch("DROP VIEW leader_after_admission")
             .unwrap();
         drop(attacker);
-        for closed in [
-            leader_store.status().unwrap_err(),
-            leader_clone.status().unwrap_err(),
-        ] {
-            assert_eq!(
-                closed.to_string(),
-                "incompatible_index: reconciliation required after invalid current index"
-            );
-        }
+        assert_eq!(leader_store.status().unwrap().revision, leader_pin);
+        assert_eq!(
+            leader_clone.status().unwrap().revision,
+            leader_pin,
+            "writer refusal persists, but repaired coherent head remains readable"
+        );
     }
 }
 
