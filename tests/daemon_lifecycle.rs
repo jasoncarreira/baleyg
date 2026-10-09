@@ -655,3 +655,197 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drai
     assert_eq!(drained.released, vec![id.root_key.clone()]);
     assert!(drained.exit);
 }
+
+#[test]
+fn deleted_or_replaced_orphan_root_with_empty_queue_allows_exit() {
+    for replace in [false, true] {
+        let base = tempfile::tempdir().unwrap();
+        let checkout = base.path().join("work");
+        fs::create_dir(&checkout).unwrap();
+        let id = identity(&checkout);
+        let roots =
+            TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+        drop(baleyg::store::Store::open(roots.clone(), id).unwrap());
+        fs::remove_dir_all(&checkout).unwrap();
+        if replace {
+            fs::create_dir(&checkout).unwrap();
+        }
+        let now = Instant::now();
+        let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+        assert!(
+            registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit,
+            "orphan whose root is gone or replaced cannot keep daemon alive"
+        );
+    }
+}
+
+#[test]
+fn replaced_path_retires_only_quiescent_old_incarnation() {
+    let (base, old, mut registry, now) = fixture();
+    registry.attach_launch(1, &old).unwrap();
+    let moved = base.path().join("old");
+    fs::rename(&old.root, &moved).unwrap();
+    fs::create_dir(&old.root).unwrap();
+    let next = identity(&old.root);
+    assert_ne!(old.inode, next.inode);
+    assert!(
+        registry.attach_launch(2, &next).is_err(),
+        "live old client owns original incarnation"
+    );
+    registry.disconnect_at(1, now);
+    registry
+        .attach_launch(2, &next)
+        .expect("quiescent incarnation can be replaced");
+    registry.disconnect_at(2, now);
+    assert!(registry.release(&next.root_key).unwrap());
+}
+
+#[test]
+fn git_init_retires_quiescent_non_git_identity_at_same_path() {
+    let (_base, old, mut registry, now) = fixture();
+    registry.attach_launch(1, &old).unwrap();
+    let created = std::process::Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(&old.root)
+        .status()
+        .unwrap();
+    assert!(created.success());
+    let next = identity(&old.root);
+    assert_ne!(old.record_id, next.record_id);
+    assert!(registry.attach_launch(2, &next).is_err());
+    registry.disconnect_at(1, now);
+    registry
+        .attach_launch(2, &next)
+        .expect("git-init starts a new incarnation");
+}
+
+#[test]
+fn replaced_path_refuses_live_browser_or_pending_work() {
+    let (base, old, mut registry, now) = fixture();
+    registry.browser_request_at(&old, now).unwrap();
+    let moved = base.path().join("old");
+    fs::rename(&old.root, moved).unwrap();
+    fs::create_dir(&old.root).unwrap();
+    let next = identity(&old.root);
+    assert!(
+        registry
+            .can_register(&next, &CheckoutOptions(serde_json::json!({})))
+            .is_err()
+    );
+    assert!(registry.attach_launch(1, &next).is_err());
+    registry.advance(now + BROWSER_IDLE_DELAY).unwrap();
+    registry.set_pending_work(&old.root_key, true).unwrap();
+    assert!(
+        registry.attach_launch(1, &next).is_err(),
+        "pending old work stays attributed"
+    );
+    registry.set_pending_work(&old.root_key, false).unwrap();
+    let options = CheckoutOptions(serde_json::json!({"maxFileBytes": 4096}));
+    registry.can_register(&next, &options).unwrap();
+    registry.register(&next, options).unwrap();
+    registry.attach_launch(1, &next).unwrap();
+    assert_eq!(
+        registry.browser_identity(&next.root_key).unwrap().record_id,
+        next.record_id
+    );
+}
+
+#[test]
+fn pending_orphan_scans_are_not_repeated_every_tick() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let id = identity(&checkout);
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots.clone(), id).unwrap();
+    store
+        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout), None)
+        .unwrap();
+    drop(store);
+    let now = Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    assert_eq!(registry.orphan_scan_count_for_tests(), 0);
+    registry
+        .advance(now + DAEMON_IDLE_DELAY - Duration::from_nanos(1))
+        .unwrap();
+    assert_eq!(registry.orphan_scan_count_for_tests(), 0);
+    assert!(!registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+    assert_eq!(registry.orphan_scan_count_for_tests(), 1);
+    assert!(
+        !registry
+            .advance(now + DAEMON_IDLE_DELAY + Duration::from_millis(250))
+            .unwrap()
+            .exit
+    );
+    assert_eq!(registry.orphan_scan_count_for_tests(), 1);
+    assert!(
+        !registry
+            .advance(now + DAEMON_IDLE_DELAY + Duration::from_secs(5))
+            .unwrap()
+            .exit
+    );
+    assert_eq!(registry.orphan_scan_count_for_tests(), 2);
+}
+
+#[test]
+fn orphan_published_non_git_root_that_became_git_does_not_pin_exit() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function beforeGit() {}
+",
+    )
+    .unwrap();
+    let old = identity(&checkout);
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots.clone(), old).unwrap();
+    let owner = baleyg::index_coordinator::establish_serving_session(
+        &store,
+        Some(&baleyg::indexer::IndexOptions::new(checkout.clone())),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    drop(owner);
+    drop(store);
+    assert!(
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(&checkout)
+            .status()
+            .unwrap()
+            .success()
+    );
+    identity(&checkout);
+    let now = Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+}
+
+#[test]
+fn orphan_ambiguous_same_inode_git_metadata_stays_busy() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let old = identity(&checkout);
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    drop(baleyg::store::Store::open(roots.clone(), old).unwrap());
+    fs::write(
+        checkout.join(".git"),
+        "invalid pointer
+",
+    )
+    .unwrap();
+    let now = Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots, now);
+    assert!(
+        !registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit,
+        "unreadable same-inode Git identity is not proof the queue is abandoned"
+    );
+}

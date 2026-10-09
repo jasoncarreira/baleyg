@@ -254,6 +254,8 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
     let key = id.root_key.clone();
     let topology = roots(base.path());
     let lock_path = topology.leader_lock(&id);
+    let index_db = topology.index_db(&id);
+    let requests_db = topology.requests_db(&id);
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry
         .register(&id, CheckoutOptions(serde_json::json!({})))
@@ -275,6 +277,8 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
         file_descriptors(&lock_path) > 0,
         "active leader holds checkout lock"
     );
+    assert!(file_descriptors(&index_db) > 0);
+    assert!(file_descriptors(&requests_db) > 0);
     registry.disconnect(1);
     assert!(registry.release(&key).unwrap());
     assert!(!old.has_active_resources());
@@ -283,7 +287,11 @@ async fn retained_registration_and_old_runtime_handle_hold_no_checkout_descripto
         "released handles cannot answer"
     );
     tokio::time::timeout(Duration::from_secs(2), async {
-        while file_descriptors(&checkout) != baseline || file_descriptors(&lock_path) != 0 {
+        while file_descriptors(&checkout) != baseline
+            || file_descriptors(&lock_path) != 0
+            || file_descriptors(&index_db) != 0
+            || file_descriptors(&requests_db) != 0
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -563,4 +571,162 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     })
     .await
     .expect("paused H leaked old-root or leader descriptors");
+}
+
+#[tokio::test]
+async fn cold_activation_preserves_recorded_scip_option() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function recordedScip() {}
+",
+    )
+    .unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let mut options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    options.scip_path = Some(checkout.join("recorded.scip"));
+    options.max_file_bytes = 8192;
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owner =
+        baleyg::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
+            .unwrap();
+    assert!(owner.is_leader());
+    drop(owner);
+    drop(store);
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let observed = Store::open(topology.clone(), identity(&checkout))
+        .unwrap()
+        .recorded_index_options()
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.scip_path, options.scip_path);
+    assert_eq!(observed.max_file_bytes, options.max_file_bytes);
+
+    registry.disconnect(1);
+    assert!(registry.release(&id.root_key).unwrap());
+    registry
+        .register(
+            &id,
+            CheckoutOptions(serde_json::json!({"maxFileBytes":4096})),
+        )
+        .unwrap();
+    registry.attach_launch(2, &id).unwrap();
+    let explicit = registry.activate(&id.root_key).unwrap();
+    ready(&explicit).await;
+    let selected = Store::open(topology, identity(&checkout))
+        .unwrap()
+        .recorded_index_options()
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.max_file_bytes, 4096);
+    assert!(
+        selected.scip_path.is_none(),
+        "explicit browser options override recorded inputs"
+    );
+}
+
+#[tokio::test]
+async fn failed_h_backs_off_and_empty_idle_checkout_can_release() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let id = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected H failure")));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.reconciliation_error().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    registry.disconnect(1);
+    tokio::time::timeout(Duration::from_millis(180), async {
+        while !registry.release(&id.root_key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("idle failed H may release during backoff");
+    assert!(!runtime.has_active_resources());
+}
+
+#[tokio::test]
+async fn failed_h_backoff_never_releases_accepted_fifo_work() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let queued = store
+        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout), None)
+        .unwrap();
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.reconciliation_error().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    registry.disconnect(1);
+    assert!(!registry.release(&id.root_key).unwrap());
+    assert!(runtime.has_active_resources());
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "queued"
+    );
+}
+
+#[tokio::test]
+async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    let moved = base.path().join("old");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function priorIdentity() {}
+",
+    )
+    .unwrap();
+    let old_id = identity(&checkout);
+    let topology = roots(base.path());
+    let mut registry = CheckoutRegistry::with_roots(topology);
+    registry.attach_launch(1, &old_id).unwrap();
+    let prior = registry.activate(&old_id.root_key).unwrap();
+    ready(&prior).await;
+    registry.disconnect(1);
+    assert!(registry.release(&old_id.root_key).unwrap());
+    fs::rename(&checkout, &moved).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function newIdentity() {}
+",
+    )
+    .unwrap();
+    let next = identity(&checkout);
+    registry.attach_launch(2, &next).unwrap();
+    let current = registry.activate(&next.root_key).unwrap();
+    ready(&current).await;
+    let (answer, _) = current.evidence_response().unwrap();
+    let (_, source) = answer.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("newIdentity"));
+    assert!(!source.text.contains("priorIdentity"));
+    answer.finish(()).unwrap();
+    assert!(prior.evidence_response().is_err());
 }

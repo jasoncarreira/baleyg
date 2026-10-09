@@ -1041,6 +1041,7 @@ struct RetainedSqliteWitnesses {
     by_path: std::collections::HashMap<std::path::PathBuf, Vec<Arc<std::fs::File>>>,
     live: std::collections::HashMap<(std::path::PathBuf, u64, u64), usize>,
     count: usize,
+    retired: std::collections::HashSet<std::path::PathBuf>,
 }
 static RETAINED_SQLITE_WITNESSES: std::sync::OnceLock<Mutex<RetainedSqliteWitnesses>> =
     std::sync::OnceLock::new();
@@ -1054,6 +1055,49 @@ pub fn retained_sqlite_witness_count_for_tests() -> usize {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .count
+}
+
+// The opener mutex serializes the last-connection close and retired witness
+// removal. Closing any descriptor for a live SQLite inode releases all this
+// process's fcntl locks, so skip the entire path if any connection or borrower
+// still holds a handle. A later connection drop finishes deferred retirement.
+fn clean_retired_sqlite_witness(registry: &mut RetainedSqliteWitnesses, path: &Path) {
+    if !registry.retired.contains(path) {
+        return;
+    }
+    let Some(files) = registry.by_path.get(path) else {
+        registry.retired.remove(path);
+        return;
+    };
+    let safe = files.iter().all(|file| {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().is_ok_and(|m| {
+            registry
+                .live
+                .get(&(path.to_owned(), m.dev(), m.ino()))
+                .copied()
+                .unwrap_or(0)
+                == 0
+                && Arc::strong_count(file) == 1
+        })
+    });
+    if safe {
+        let files = registry.by_path.remove(path).expect("retired witness path");
+        registry.count -= files.len();
+        registry.retired.remove(path);
+        drop(files);
+    }
+}
+
+struct SqliteWitnessRetirement(Vec<std::path::PathBuf>);
+impl Drop for SqliteWitnessRetirement {
+    fn drop(&mut self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        for path in &self.0 {
+            registry.retired.insert(path.clone());
+            clean_retired_sqlite_witness(&mut registry, path);
+        }
+    }
 }
 
 // Every managed SQLite opener carries a live-inode registration until SQLite closes.
@@ -1084,6 +1128,7 @@ impl Drop for ProtectedSqliteConnection {
         if *live == 0 {
             registry.live.remove(&self.key);
         }
+        clean_retired_sqlite_witness(&mut registry, &self.key.0);
     }
 }
 fn protected_sqlite_open(
@@ -5271,6 +5316,10 @@ impl Store {
             &roots.cache.join("indexes").join(format!("{key}.lock")),
         )?;
         let path = dir.join("index.db");
+        // Orphan probes must not themselves pin two database descriptors for
+        // the rest of the daemon's lifetime. The guard runs after each probe's
+        // managed SQLite connections have closed, including early errors.
+        let _retire = SqliteWitnessRetirement(vec![path.clone(), dir.join("requests.db")]);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let absent = requests::queue_absent_without_sidecars(&dir.join("requests.db"));
@@ -5295,12 +5344,30 @@ impl Store {
             "index identity mismatch"
         );
         let root = Path::new(&spelling);
+        // Only a proved pathname loss or new root inode is disposable. Unreadable
+        // paths, malformed metadata and marker errors are not proof that the old
+        // queue may be abandoned.
+        use std::os::unix::fs::MetadataExt;
+        let old_device = device.parse::<u64>()?;
+        let old_inode = inode.parse::<u64>()?;
+        match std::fs::symlink_metadata(root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+            Ok(named)
+                if !named.is_dir()
+                    || named.file_type().is_symlink()
+                    || (named.dev(), named.ino()) != (old_device, old_inode) =>
+            {
+                return Ok(false);
+            }
+            Ok(_) => {}
+        }
         let identity = topology::WorkspaceIdentity::discover_unattached(Some(root), root)?
             .attach_existing_marker_readonly()?;
         ensure!(
             identity.root_key == key
-                && identity.device == device.parse::<u64>()?
-                && identity.inode == inode.parse::<u64>()?,
+                && identity.device == old_device
+                && identity.inode == old_inode,
             "index root changed"
         );
         guard.verify()?;
@@ -6848,6 +6915,20 @@ impl Store {
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
+    /// Called after the checkout's worker streams stop and its last read ends.
+    /// Other Store users may still hold a connection: defer that exact witness
+    /// until its protected connection closes, never discard their fcntl locks.
+    pub(crate) fn retire_checkout_sqlite_witnesses(&self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        for path in [
+            self.roots.index_db(&self.identity),
+            self.roots.requests_db(&self.identity),
+        ] {
+            registry.retired.insert(path.clone());
+            clean_retired_sqlite_witness(&mut registry, &path);
+        }
+    }
+
     pub(crate) fn root_path_replaced(&self) -> Result<bool> {
         self.identity.root_path_replaced()
     }
@@ -15753,6 +15834,33 @@ mod sqlite_deleted_witness_tests {
         assert!(
             !path.exists(),
             "capacity refusal must precede file creation"
+        );
+    }
+
+    #[test]
+    fn idle_retirement_defers_sqlite_witness_until_last_managed_connection_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let live = open_index(&path, false).unwrap();
+        store.retire_checkout_sqlite_witnesses();
+        assert!(
+            sqlite_witnesses()
+                .lock()
+                .unwrap()
+                .by_path
+                .contains_key(&path),
+            "closing a check FD while SQLite owns an inode drops its process locks"
+        );
+        drop(live);
+        assert!(
+            !sqlite_witnesses()
+                .lock()
+                .unwrap()
+                .by_path
+                .contains_key(&path),
+            "last protected connection completes deferred release"
         );
     }
 
