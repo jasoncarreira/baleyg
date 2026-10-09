@@ -136,7 +136,7 @@ function selectedUrl(path, method, root) {
   const simple = new Set(["status", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "symbols", "symbol", "source", "query", "views", "annotations", "jobs/current", "jev/status", "acp/status", "questions/preview", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
   const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route) || /^(?:views|annotations)\/[^/?]+$/.test(route) || /^questions\/[^/?]+\/(?:jev-request|jev-response|jev-run|acp-answer|selection)$/.test(route);
   if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
-  if (!root || !checkouts.some(row => row.rootKey === root && selectable(row))) throw new Error("Choose an available checkout first.");
+  if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
   return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
 async function api(path, method = "GET", body) {
@@ -206,7 +206,23 @@ async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
   const serial = ++statusSerial, session = epoch;
-  let data = await api("/api/status");
+  let data;
+  try { data = await api("/api/status"); }
+  catch (error) {
+    if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
+      const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
+      resetCheckout();
+      selectedRootKey = root;
+      $("checkout-select").value = root;
+      $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
+      $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
+      window.BaleygShell?.setConnected(true);
+      $("status").textContent = "No validated index head is available yet.";
+      $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
+      stale("Index not ready. Retry status after indexing starts.");
+    }
+    throw error;
+  }
   if (serial !== statusSerial || session !== epoch) return;
   if (typeof data?.workspaceRoot !== "string" || !data.workspaceRoot) throw new Error("Selected checkout identity unavailable. Retry status.");
   $("checkout-root").textContent = data.workspaceRoot;
@@ -370,6 +386,10 @@ function invalidateSelection(message) {
 function selectable(row) {
   return objectValue(row) && validRootKey(row.rootKey) && row.state === "available" && typeof row.workspaceRoot === "string" && row.workspaceRoot.startsWith("/");
 }
+function uniqueSelectableRoot(key) {
+  const matches = checkouts.filter(row => row.rootKey === key);
+  return matches.length === 1 && selectable(matches[0]);
+}
 async function loadCheckouts() {
   const session = epoch;
   $("checkout-state").textContent = "Loading checkouts…";
@@ -378,6 +398,8 @@ async function loadCheckouts() {
     const data = await api("/api/checkouts");
     if (session !== epoch) return;
     if (!Array.isArray(data?.checkouts)) throw new Error("Checkout list is invalid. Retry the list.");
+    const keys = data.checkouts.filter(row => objectValue(row) && typeof row.rootKey === "string").map(row => row.rootKey);
+    if (new Set(keys).size !== keys.length) throw new Error("Duplicate checkout root key. Retry the list.");
     checkouts = data.checkouts.filter(row => objectValue(row) && validRootKey(row.rootKey) && typeof row.state === "string");
     if (selectedRootKey && !checkouts.some(row => row.rootKey === selectedRootKey && selectable(row))) {
       invalidateSelection("Selected checkout is no longer available. Choose again."); return;
@@ -414,7 +436,7 @@ async function loadDaemonStatus() {
 async function selectCheckout(key) {
   resetCheckout();
   $("checkout-select").value = key;
-  if (!selectable(checkouts.find(row => row.rootKey === key))) {
+  if (!uniqueSelectableRoot(key)) {
     $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
   }
   selectedRootKey = key;
