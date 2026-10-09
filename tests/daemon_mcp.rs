@@ -96,21 +96,90 @@ impl Drop for Peer {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
-        // Only our elected daemon in this private test HOME writes this marker.
-        // A direct daemon (owned by its test) never writes it.
-        if let Ok(raw) = fs::read_to_string(&self.auto_daemon_pid) {
-            let home = self.auto_daemon_pid.parent().unwrap();
-            if let Ok(pid) = raw.parse::<u32>()
-                && socket_under(home).is_some_and(|path| UnixStream::connect(path).is_ok())
-            {
-                let _ = Command::new("/bin/kill")
-                    .arg("-TERM")
-                    .arg(pid.to_string())
-                    .status();
-            }
-            let _ = fs::remove_file(&self.auto_daemon_pid);
-        }
+        stop_fixture_daemon(self.auto_daemon_pid.parent().unwrap());
     }
+}
+
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn owned_daemon_connection(home: &Path, pid: u32) -> Option<UnixStream> {
+    let stream = UnixStream::connect(socket_under(home)?).ok()?;
+    if connected_peer_pid(&stream) != Some(pid) {
+        return None;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    (output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim()
+            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+    .then_some(stream)
+}
+
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("auto-daemon.pid");
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    let Some(connection) = owned_daemon_connection(home, pid) else {
+        return;
+    };
+    let sent = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !sent {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if owned_daemon_connection(home, pid).is_none() {
+            let _ = fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // No numeric-PID SIGKILL if the elected process did not stop normally.
+    drop(connection);
 }
 
 fn socket_under(home: &Path) -> Option<PathBuf> {
@@ -171,6 +240,27 @@ fn checkout(home: &Path) -> PathBuf {
     let root = home.join("checkout");
     fs::create_dir_all(root.join(".git")).unwrap();
     root
+}
+
+#[test]
+fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let mut dummy = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+    fs::write(home.path().join("auto-daemon.pid"), dummy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = dummy.try_wait().unwrap().is_none();
+    let _ = dummy.kill();
+    let _ = dummy.wait();
+    drop(owner);
+    assert!(
+        alive,
+        "stale marker signaled an unrelated test-owned process"
+    );
 }
 
 #[test]

@@ -69,6 +69,42 @@ fn git(root: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
 /// Test-scope guard for only the daemon elected under this disposable HOME.
 struct FixtureDaemon(std::path::PathBuf);
 impl FixtureDaemon {
@@ -82,11 +118,9 @@ impl Drop for FixtureDaemon {
         let Ok(raw) = fs::read_to_string(&marker) else {
             return;
         };
-        let _ = fs::remove_file(&marker);
         let Ok(pid) = raw.parse::<u32>() else {
             return;
         };
-        let pid = pid.to_string();
         let mut dirs = vec![self.0.clone()];
         let mut socket = None;
         while let Some(dir) = dirs.pop() {
@@ -110,35 +144,41 @@ impl Drop for FixtureDaemon {
         let Some(socket) = socket else {
             return;
         };
-        let listening = || std::os::unix::net::UnixStream::connect(&socket).is_ok();
-        let own_executable = || {
-            Command::new("ps")
-                .args(["-p", &pid, "-o", "command="])
+        let owned = || {
+            let connection = std::os::unix::net::UnixStream::connect(&socket).ok()?;
+            if connected_peer_pid(&connection) != Some(pid) {
+                return None;
+            }
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
                 .output()
-                .ok()
-                .is_some_and(|output| {
-                    output.status.success()
-                        && String::from_utf8_lossy(&output.stdout).trim()
-                            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg"))
-                })
+                .ok()?;
+            (output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim()
+                    == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+            .then_some(connection)
         };
-        if !listening() || !own_executable() {
+        let Some(connection) = owned() else {
+            return;
+        };
+        let sent = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !sent {
             return;
         }
-        let _ = Command::new("/bin/kill")
-            .args(["-TERM", &pid])
-            .stderr(std::process::Stdio::null())
-            .status();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while listening() && std::time::Instant::now() < deadline {
+        while std::time::Instant::now() < deadline {
+            if owned().is_none() {
+                let _ = fs::remove_file(&marker);
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        if listening() && own_executable() {
-            let _ = Command::new("/bin/kill")
-                .args(["-KILL", &pid])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        // Never SIGKILL a numeric PID after the socket identity becomes ambiguous.
+        drop(connection);
     }
 }
 
