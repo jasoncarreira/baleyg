@@ -1774,17 +1774,36 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
             answer["result"]["structuredContent"]["error"]["reason"],
             "not_checkout"
         );
-        let invalid = describe(&mut peer, 15, json!({"schemaVersion":1,"workspace":[]}));
-        tool(&invalid, Some("invalid_request"), !legacy);
-        assert_eq!(
-            invalid["result"]["structuredContent"]["error"]["attemptedWorkspace"],
-            json!({"kind":"invalid_type","jsonType":"array"})
-        );
-        assert!(
-            invalid["result"]["structuredContent"]
-                .get("workspace")
-                .is_none()
-        );
+        for (offset, (value, json_type)) in [
+            (Value::Null, "null"),
+            (json!(true), "boolean"),
+            (json!(42), "number"),
+            (json!([]), "array"),
+            (json!({"unexpected":"content"}), "object"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invalid = describe(
+                &mut peer,
+                150 + offset as i64,
+                json!({"schemaVersion":1,"workspace":value}),
+            );
+            tool(&invalid, Some("invalid_request"), !legacy);
+            assert!(
+                invalid.get("error").is_none(),
+                "not JSON-RPC invalid_params"
+            );
+            let result = &invalid["result"]["structuredContent"];
+            assert_eq!(
+                result["error"]["attemptedWorkspace"],
+                json!({"kind":"invalid_type","jsonType":json_type}),
+            );
+            assert_eq!(result["error"]["currentBasis"], Value::Null);
+            assert_eq!(result["error"]["currentContentHash"], Value::Null);
+            assert!(result.get("workspace").is_none());
+            assert!(result.get("catchingUp").is_none());
+        }
         let long = format!("{}😀", "é".repeat(2047));
         let invalid = describe(&mut peer, 16, json!({"schemaVersion":1,"workspace":long}));
         tool(&invalid, Some("invalid_request"), !legacy);
