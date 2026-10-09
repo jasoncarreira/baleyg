@@ -18,7 +18,7 @@ assert.ok(chromiumPath.startsWith(`${resolve(browserRoot)}${sep}`), "Chromium mu
 const ROOT = resolve(__dirname, "../..");
 const SOURCE_P = "fn seed(value: i32) -> i32 { old_step(value) }\nfn old_step(value: i32) -> i32 { value + 1 }\nfn other() -> i32 { 0 }\n";
 const SOURCE_Q = "fn seed(value: i64) -> i64 { new_step(value) }\nfn new_step(value: i64) -> i64 { value + 2 }\nfn other() -> i32 { 0 }\n";
-let binary, suiteBinaryDir;
+let binary, watchFixtureBinary, suiteBinaryDir;
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
@@ -56,6 +56,19 @@ test.before(async () => {
   binary = join(suiteBinaryDir, basename(built));
   copyFileSync(built, binary);
   assert.ok(existsSync(binary), `fixed suite binary is unavailable at ${binary}`);
+
+  // Use the dedicated legacy HTTP fixture rather than production's singleton CLI.
+  // Parse Cargo's artifact messages: the hash-suffixed test executable is not
+  // stable in target/debug/deps, and another verification lane may replace it.
+  const compiled = await run("cargo", ["test", "--locked", "--test", "watch", "--no-run", "--message-format=json"], {timeout:900000});
+  const artifacts = compiled.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line))
+    .filter(message => message.reason === "compiler-artifact" && message.target?.name === "watch" && message.executable);
+  assert.equal(artifacts.length, 1, `expected one watch test executable, found ${artifacts.length}`);
+  const executable = artifacts[0].executable;
+  assert.ok(resolve(executable) === executable && existsSync(executable), `watch fixture executable is unavailable at ${executable}`);
+  watchFixtureBinary = join(suiteBinaryDir, basename(executable));
+  copyFileSync(executable, watchFixtureBinary);
+  assert.ok(existsSync(watchFixtureBinary), `fixed watch fixture executable is unavailable at ${watchFixtureBinary}`);
 }, {timeout:960000});
 test.after(() => { if (suiteBinaryDir) rmSync(suiteBinaryDir, {recursive:true, force:true}); });
 
@@ -90,8 +103,15 @@ function findNamed(root, name, found = []) {
   return found;
 }
 async function startDaemon(paths) {
-  const child = spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile, "--cargo-home", paths.cargoHome],
-    {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]});
+  const child = spawn(watchFixtureBinary, ["--exact", "legacy_http_fixture_entry", "--nocapture"],
+    {cwd:ROOT, env:{...paths.env,
+      BALEYG_LEGACY_HTTP_FIXTURE:"1",
+      BALEYG_LEGACY_WORKSPACE:paths.workspace,
+      BALEYG_LEGACY_BIND:"127.0.0.1:0",
+      BALEYG_LEGACY_TOKEN_FILE:paths.tokenFile,
+      BALEYG_LEGACY_CARGO_HOME:paths.cargoHome,
+      BALEYG_LEGACY_MAX_FILE_BYTES:"2097152",
+    }, stdio:["ignore","ignore","pipe"]});
   let stderr = "", base, rejected;
   const address = new Promise((resolveAddress, rejectAddress) => {
     rejected = rejectAddress;

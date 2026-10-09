@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use baleyg::{
-    auth, http,
+    daemon::{self, client, protocol, registry},
     indexer::IndexOptions,
     mcp,
     model::{CancelFlag, ViewQuery},
@@ -58,6 +58,8 @@ struct Cli {
 enum Command {
     /// Build and atomically publish a complete index. Does not execute repository code.
     Index(IndexArgs),
+    /// Run the elected user-level socket service.
+    Daemon,
     /// Serve one read-only MCP connection on line-framed stdin/stdout.
     Mcp(WorkspaceArgs),
     /// Serve the authenticated loopback API and browser inspector. Refresh is explicit.
@@ -413,7 +415,17 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "baleyg=info".into()),
         )
         .init();
+    if matches!(&command, Command::Daemon) {
+        return run_daemon().await;
+    }
+    if let Command::Serve(args) = &command {
+        return serve_via_daemon(args).await;
+    }
+    if try_existing_daemon(&command)? {
+        return Ok(());
+    }
     match command {
+        Command::Daemon | Command::Serve(_) => unreachable!(),
         Command::Mcp(args) => {
             let (_, identity) = args.resolve()?;
             mcp::run_stdio(mcp::OpenedWorkspace::new(identity))?;
@@ -627,141 +639,6 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        }
-        Command::Serve(args) => {
-            ensure!(
-                args.bind.ip().is_loopback(),
-                "only loopback bind addresses are supported"
-            );
-            let token_path = args
-                .token_file
-                .context("serve requires explicit --token-file")?;
-            let (roots, identity) = args.index.workspace.resolve_unattached()?;
-            let mut destinations = vec![token_path.clone()];
-            if let Some(path) = &args.jev_budget_dir {
-                destinations.push(path.clone());
-            }
-            if let Some(path) = &args.acp_state_dir {
-                destinations.push(path.clone());
-            }
-            roots.validate_external(&identity, &destinations)?;
-            let identity = identity.attach_marker()?;
-            ensure!(
-                (1..=16_777_216).contains(&args.index.max_file_bytes),
-                "max-file-bytes must be 1..16777216"
-            );
-            let mut options = IndexOptions::new(identity.root.clone());
-            options.scip_path = args.index.scip.clone();
-            options.manifest_path = args.index.manifest.clone();
-            options.anchor_optional_inputs(&std::env::current_dir()?)?;
-            options.max_file_bytes = args.index.max_file_bytes;
-            let dir = roots.cache.clone();
-            let store = Store::open(roots, identity)?;
-            let startup_cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-            let serving_session = match baleyg::index_coordinator::establish_serving_session(
-                &store,
-                Some(&options),
-                &startup_cancel,
-            ) {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    eprintln!("Evidence unavailable at startup: {error:#}");
-                    None
-                }
-            };
-            let token = auth::load_or_create_token(&token_path)?;
-            let listener = tokio::net::TcpListener::bind(args.bind)
-                .await
-                .context("bind daemon listener")?;
-            let address = listener.local_addr()?;
-            let provider = if let Some(budget_dir) = args.jev_budget_dir {
-                let key = std::env::var("JEV_KEY").map_err(|_| {
-                    anyhow::anyhow!("JEV_KEY must be configured to enable live Jev")
-                })?;
-                Some(Arc::new(baleyg::live_jev::LiveJev::open(
-                    &budget_dir,
-                    key,
-                    args.jev_budget_cents
-                        .context("Jev budget cap is required")?,
-                    &options.workspace_root,
-                )?))
-            } else {
-                None
-            };
-            let acp = if let Some(runner) = args.acp_runner {
-                Some(Arc::new(baleyg::acp::Acp::open(baleyg::acp::AcpConfig {
-                    runner,
-                    state_dir: args
-                        .acp_state_dir
-                        .context("ACP state directory is required")?,
-                    max_attempts: args.acp_max_attempts.context("ACP allowance is required")?,
-                    workspace: options.workspace_root.clone(),
-                })?))
-            } else {
-                None
-            };
-            let inference_notice = match (provider.is_some(), acp.is_some()) {
-                (false, false) => "Live inference disabled. Offline preview/export/import only.",
-                (true, false) => {
-                    "Live Jev enabled with durable reservations; explicit Run Jev requests send indexed source."
-                }
-                (false, true) => {
-                    "ACP enabled with a separate attempt allowance; explicit Explain with ACP requests send indexed source to the existing Claude subscription."
-                }
-                (true, true) => {
-                    "Live Jev and ACP enabled with separate allowances. Explicit inference requests send indexed source; no automatic model calls."
-                }
-            };
-            let browse_root = resolve_browse_root(&options, args.browse_root);
-            let cargo_home = args
-                .cargo_home
-                .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
-                .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
-            let mut rust_library = args
-                .rust_library
-                .or_else(|| std::env::var_os("RUST_SRC_PATH").map(PathBuf::from));
-            if rust_library.is_none()
-                && let Some(compiler) = args.trusted_rustc.as_ref()
-            {
-                rust_library =
-                    Some(discover_rust_library(compiler, &options.workspace_root).await?);
-            }
-            let state = http::new_with_dependency_options(
-                store,
-                options,
-                token,
-                address,
-                provider,
-                acp,
-                browse_root,
-                args.rust_source_roots,
-                Some(baleyg::dependencies::CatalogOptions {
-                    cargo_home,
-                    rust_library,
-                }),
-            )?;
-            if let Some(session) = serving_session {
-                state.retain_serving_session(session);
-            } else {
-                // No selected evidence may be served until a fresh verified
-                // owner completes mandatory H. Retry request-free after source
-                // repair; a TCP listener alone is not readiness.
-                state.retry_failed_serving_startup();
-            }
-            state.start_dependency_index();
-            eprintln!(
-                "Baleyg: http://{address}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.\n{inference_notice}",
-                dir.display(),
-                token_path.display()
-            );
-            let shutdown_state = state.clone();
-            axum::serve(listener, http::router(state))
-                .with_graceful_shutdown(async move {
-                    shutdown_signal().await;
-                    shutdown_state.cancel_active();
-                })
-                .await
-                .context("serve daemon")?;
         }
         Command::Status(args) => {
             let (roots, identity) = args.resolve_unattached()?;
@@ -1030,4 +907,465 @@ mod trusted_toolchain_probe_tests {
             sysroot.join("lib/rustlib/src/rust/library")
         );
     }
+}
+
+fn socket_path() -> Result<PathBuf> {
+    Ok(daemon::SocketPaths::new(&TopologyRoots::production()?.data).socket)
+}
+
+fn start_daemon() -> std::io::Result<client::StartOutcome> {
+    std::process::Command::new(std::env::current_exe()?)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(client::StartOutcome::Started)
+}
+
+fn daemon_request(operation: &str, payload: serde_json::Value) -> protocol::Request {
+    protocol::Request {
+        id: 1,
+        operation: operation.to_owned(),
+        payload,
+    }
+}
+
+fn checked_reply(reply: protocol::Reply) -> Result<serde_json::Value> {
+    if let Some(error) = reply.payload.get("error").and_then(|v| v.as_str()) {
+        anyhow::bail!("{error}");
+    }
+    reply
+        .payload
+        .get("result")
+        .cloned()
+        .context("invalid daemon reply")
+}
+
+fn send_existing(request: &protocol::Request, read_only: bool) -> Result<serde_json::Value> {
+    let socket = socket_path()?;
+    let reply = client::call(request, read_only, || {
+        std::os::unix::net::UnixStream::connect(&socket)
+    })
+    .map_err(|error| anyhow::anyhow!("{}", error.code()))?;
+    checked_reply(reply)
+}
+
+fn try_existing_daemon(command: &Command) -> Result<bool> {
+    let (operation, workspace, mut payload, read_only) = match command {
+        Command::Status(args) => ("status", args, serde_json::json!({}), true),
+        Command::Symbols(args) => (
+            "symbols",
+            &args.workspace,
+            serde_json::json!({"search": args.search, "limit": args.limit}),
+            true,
+        ),
+        Command::Query(args) => (
+            "query",
+            &args.workspace,
+            serde_json::json!({
+                "seed": args.seed, "depth": args.depth, "maxNodes": args.max_nodes,
+                "maxCalls": args.max_calls, "includeCallbacks": args.include_callbacks,
+                "excludePaths": args.exclude_path
+            }),
+            true,
+        ),
+        Command::Export(args) => (
+            "export",
+            &args.workspace,
+            serde_json::json!({"output": args.output}),
+            true,
+        ),
+        Command::Index(args) if std::env::var_os("BALEYG_TEST_FINITE_CLI_FD").is_none() => (
+            "index",
+            &args.workspace,
+            serde_json::json!({
+                "scip": args.scip, "manifest": args.manifest,
+                "maxFileBytes": args.max_file_bytes
+            }),
+            false,
+        ),
+        _ => return Ok(false),
+    };
+    if std::os::unix::net::UnixStream::connect(socket_path()?).is_err() {
+        return Ok(false);
+    }
+    let (roots, identity) = workspace.resolve_unattached()?;
+    if let Command::Index(args) = command {
+        ensure!(
+            (1..=16_777_216).contains(&args.max_file_bytes),
+            "max-file-bytes must be 1..16777216"
+        );
+        let mut options = IndexOptions::new(identity.root.clone());
+        options.scip_path = args.scip.clone();
+        options.manifest_path = args.manifest.clone();
+        options.anchor_optional_inputs(&std::env::current_dir()?)?;
+        payload["scip"] = serde_json::to_value(options.scip_path)?;
+        payload["manifest"] = serde_json::to_value(options.manifest_path)?;
+    }
+    if operation == "export"
+        && let Command::Export(args) = command
+        && let Some(path) = &args.output
+    {
+        roots.validate_external(&identity, std::slice::from_ref(path))?;
+    }
+    let request = daemon_request(
+        operation,
+        serde_json::json!({
+            "workspace": identity.root, "args": payload,
+        }),
+    );
+    let value = send_existing(&request, read_only)?;
+    if let Command::Export(args) = command
+        && let Some(path) = &args.output
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .context("create export (existing files are never overwritten)")?;
+        serde_json::to_writer_pretty(&mut file, &value)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+    } else {
+        print_json(&value)?;
+    }
+    Ok(true)
+}
+
+async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
+    ensure!(
+        args.bind.ip().is_loopback(),
+        "only loopback bind addresses are supported"
+    );
+    let token_file = args
+        .token_file
+        .as_ref()
+        .context("serve requires explicit --token-file")?;
+    let (roots, identity) = args.index.workspace.resolve_unattached()?;
+    let mut destinations = vec![token_file.clone()];
+    destinations.extend(args.jev_budget_dir.iter().cloned());
+    destinations.extend(args.acp_state_dir.iter().cloned());
+    roots.validate_external(&identity, &destinations)?;
+    if args.jev_budget_dir.is_some() {
+        let key = std::env::var("JEV_KEY")
+            .map_err(|_| anyhow::anyhow!("JEV_KEY must be configured to enable live Jev"))?;
+        ensure!(
+            !key.trim().is_empty()
+                && reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_ok(),
+            "JEV_KEY must be configured to enable live Jev"
+        );
+    }
+    let token_parent = token_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let token_file = token_parent.canonicalize()?.join(
+        token_file
+            .file_name()
+            .context("serve token file needs a name")?,
+    );
+    let mut index_options = IndexOptions::new(identity.root.clone());
+    index_options.scip_path = args.index.scip.clone();
+    index_options.manifest_path = args.index.manifest.clone();
+    index_options.max_file_bytes = args.index.max_file_bytes;
+    index_options.anchor_optional_inputs(&std::env::current_dir()?)?;
+    let rust_library = if let Some(path) = args
+        .rust_library
+        .clone()
+        .or_else(|| std::env::var_os("RUST_SRC_PATH").map(PathBuf::from))
+    {
+        Some(path)
+    } else if let Some(rustc) = &args.trusted_rustc {
+        Some(discover_rust_library(rustc, &identity.root).await?)
+    } else {
+        None
+    };
+    let options = registry::BrowserOptions {
+        browse_root: Some(resolve_browse_root(
+            &index_options,
+            args.browse_root.clone(),
+        )),
+        scip: index_options.scip_path,
+        manifest: index_options.manifest_path,
+        max_file_bytes: index_options.max_file_bytes,
+        rust_source_roots: args.rust_source_roots.clone(),
+        rust_library,
+        trusted_rustc: args.trusted_rustc.clone(),
+        cargo_home: args
+            .cargo_home
+            .clone()
+            .or_else(|| std::env::var_os("CARGO_HOME").map(PathBuf::from))
+            .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo"))),
+        jev_budget_dir: args.jev_budget_dir.clone(),
+        jev_budget_cents: args.jev_budget_cents,
+        acp_runner: args.acp_runner.clone(),
+        acp_state_dir: args.acp_state_dir.clone(),
+        acp_max_attempts: args.acp_max_attempts,
+    };
+    let socket = socket_path()?;
+    let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
+        .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    protocol::write_frame(
+        &mut stream,
+        &daemon_request(
+            "serve",
+            serde_json::json!({
+                "workspace": identity.root, "bind": args.bind, "tokenFile": token_file,
+                "options": options,
+            }),
+        ),
+    )?;
+    let reply: protocol::Reply = protocol::read_frame(&mut stream)
+        .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
+    let address = checked_reply(reply)?;
+    eprintln!(
+        "Baleyg: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
+        address.as_str().unwrap_or("unknown"),
+        roots.cache.display(),
+        token_file.display()
+    );
+    // The registration is a control connection, not a checkout attachment. Its
+    // normal EOF is the daemon's intentional idle exit; never respawn here.
+    stream.set_read_timeout(None)?;
+    let signal_stream = stream.try_clone()?;
+    let mut monitor = tokio::task::spawn_blocking(move || {
+        let mut one = [0u8; 1];
+        use std::io::Read;
+        match stream.read(&mut one) {
+            Ok(0) => Ok(()),
+            _ => anyhow::bail!("daemon_unavailable: serve control interrupted"),
+        }
+    });
+    tokio::select! {
+        result = &mut monitor => result??,
+        _ = shutdown_signal() => {
+            signal_stream.shutdown(std::net::Shutdown::Both)?;
+            let _ = monitor.await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_daemon() -> Result<()> {
+    let paths = daemon::SocketPaths::new(&TopologyRoots::production()?.data);
+    let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
+        return Ok(());
+    };
+    owner.listener().set_nonblocking(true)?;
+    let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
+    let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
+    let browser = Arc::new(tokio::sync::Mutex::new(daemon::BrowserProvisioner::new()));
+    let next_session = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let (browser_shutdown, _) = tokio::sync::watch::channel(false);
+    let idle = daemon::run_idle_lifecycle(registry.clone());
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let stream = stream.into_std()?;
+                stream.set_nonblocking(false)?;
+                let registry = registry.clone();
+                let browser = browser.clone();
+                let id = next_session.fetch_add(1, Ordering::Relaxed);
+                let stopping = stopping.clone();
+                let browser_shutdown = browser_shutdown.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = dispatch_connection(stream, id, registry, browser, stopping, browser_shutdown);
+                });
+            }
+        }
+    }
+    stopping.store(true, Ordering::Release);
+    let _ = browser_shutdown.send(true);
+    drop(listener);
+    drop(owner);
+    Ok(())
+}
+
+fn dispatch_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    session: u64,
+    registry: Arc<tokio::sync::Mutex<registry::CheckoutRegistry>>,
+    browser: Arc<tokio::sync::Mutex<daemon::BrowserProvisioner>>,
+    stopping: Arc<AtomicBool>,
+    browser_shutdown: tokio::sync::watch::Sender<bool>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Handle::current();
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let request: protocol::Request = protocol::read_frame(&mut stream)?;
+    let serve = request.operation == "serve";
+    let result = (|| -> Result<serde_json::Value> {
+        let root: PathBuf = serde_json::from_value(
+            request
+                .payload
+                .get("workspace")
+                .cloned()
+                .context("missing workspace")?,
+        )?;
+        let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
+        TopologyRoots::production()?.reject_root_overlap(&identity)?;
+        if serve {
+            let options: registry::BrowserOptions = serde_json::from_value(
+                request
+                    .payload
+                    .get("options")
+                    .cloned()
+                    .context("missing options")?,
+            )?;
+            let options = registry::CheckoutOptions(serde_json::to_value(options)?);
+            let bind = serde_json::from_value(
+                request
+                    .payload
+                    .get("bind")
+                    .cloned()
+                    .context("missing bind")?,
+            )?;
+            let token_file: PathBuf = serde_json::from_value(
+                request
+                    .payload
+                    .get("tokenFile")
+                    .cloned()
+                    .context("missing token file")?,
+            )?;
+            let identity = identity.attach_marker()?;
+            let address = runtime.block_on(async {
+                let mut browser = browser.lock().await;
+                let first = browser.address().is_none();
+                let address = browser
+                    .register_serve(&registry, &identity, options, bind, &token_file)
+                    .await?;
+                if first {
+                    browser.spawn_with_shutdown(browser_shutdown.subscribe())?;
+                }
+                Ok::<_, anyhow::Error>(address)
+            })?;
+            return Ok(serde_json::json!(address.to_string()));
+        }
+        ensure!(
+            matches!(
+                request.operation.as_str(),
+                "status" | "symbols" | "query" | "export" | "index"
+            ),
+            "unknown daemon operation"
+        );
+        let identity = if request.operation == "status" {
+            identity.attach_existing_marker_readonly()?
+        } else {
+            identity.attach_marker()?
+        };
+        let checkout = runtime.block_on(async {
+            let mut checked = registry.lock().await;
+            checked
+                .attach_launch(session, &identity)
+                .map_err(|e| anyhow::anyhow!("{}", e.reason()))?;
+            checked.activate(&identity.root_key)
+        })?;
+        let args = request.payload.get("args").context("missing args")?;
+        let deadline = Instant::now() + CLI_READ_WAIT;
+        loop {
+            let selected = match request.operation.as_str() {
+                "status" => checkout.cli_status(),
+                "symbols" => checkout.cli_symbols(
+                    args["search"].as_str().context("missing search")?,
+                    args["limit"].as_u64().context("missing limit")? as usize,
+                ),
+                "query" => checkout.cli_query(&ViewQuery {
+                    seed: args["seed"].as_str().context("missing seed")?.into(),
+                    depth: args["depth"].as_u64().context("missing depth")? as usize,
+                    max_nodes: args["maxNodes"].as_u64().context("missing maxNodes")? as usize,
+                    max_calls: args["maxCalls"].as_u64().context("missing maxCalls")? as usize,
+                    include_callbacks: args["includeCallbacks"]
+                        .as_bool()
+                        .context("missing includeCallbacks")?,
+                    exclude_paths: serde_json::from_value(args["excludePaths"].clone())?,
+                }),
+                "export" => checkout.cli_export(),
+                "index" => {
+                    let mut options = IndexOptions::new(identity.root.clone());
+                    options.scip_path = serde_json::from_value(args["scip"].clone())?;
+                    options.manifest_path = serde_json::from_value(args["manifest"].clone())?;
+                    options.max_file_bytes = args["maxFileBytes"]
+                        .as_u64()
+                        .context("missing maxFileBytes")?;
+                    ensure!(
+                        (1..=16_777_216).contains(&options.max_file_bytes),
+                        "max-file-bytes must be 1..16777216"
+                    );
+                    options.anchor_optional_inputs(&std::env::current_dir()?)?;
+                    checkout.cli_index(&options)
+                }
+                _ => anyhow::bail!("unknown daemon operation"),
+            };
+            // Mandatory H may be running when a CLI read first attaches.
+            // This only repeats read-only calls; index is never replayed.
+            if request.operation != "index"
+                && selected
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().starts_with("index_not_ready:"))
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            break selected;
+        }
+    })();
+    if !serve {
+        runtime.block_on(async { registry.lock().await.disconnect(session) });
+    }
+    let reply = protocol::Reply {
+        id: request.id,
+        payload: match result {
+            Ok(value) => serde_json::json!({"result": value}),
+            Err(error) => serde_json::json!({"error": format!("{error:#}")}),
+        },
+    };
+    write_daemon_reply(&mut stream, &reply)?;
+    if serve {
+        // This control connection only observes the daemon process lifetime.
+        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        let mut one = [0u8; 1];
+        use std::io::Read;
+        while !stopping.load(Ordering::Acquire) {
+            match stream.read(&mut one) {
+                Ok(0) => break,
+                Ok(_) => (),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_daemon_reply(
+    stream: &mut std::os::unix::net::UnixStream,
+    reply: &protocol::Reply,
+) -> Result<()> {
+    let payload = serde_json::to_vec(&reply.payload)?;
+    if payload.len() + 64 <= protocol::MAX_FRAME {
+        protocol::write_frame(stream, reply)?;
+    } else {
+        const CHUNK_BYTES: usize = 450_000;
+        for (index, chunk) in payload.chunks(CHUNK_BYTES).enumerate() {
+            let more = (index + 1) * CHUNK_BYTES < payload.len();
+            protocol::write_frame(
+                stream,
+                &protocol::Reply {
+                    id: reply.id,
+                    payload: serde_json::json!({"chunk": hex::encode(chunk), "more": more}),
+                },
+            )?;
+        }
+    }
+    Ok(())
 }

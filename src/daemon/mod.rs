@@ -3,6 +3,7 @@ pub mod client;
 pub mod protocol;
 pub mod registry;
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -20,9 +21,32 @@ pub struct SocketPaths {
 impl SocketPaths {
     pub fn new(data_dir: &Path) -> Self {
         let run = data_dir.join("run");
+        let normal = run.join("daemon.sock");
+        // sockaddr_un has a platform-fixed path bound (104 bytes on Darwin).
+        // Only long private data roots use a separate deterministic private
+        // directory. The hash qualifies the full data root and the user ID;
+        // the election lock remains in the original per-user run directory.
+        #[cfg(target_os = "macos")]
+        const MAX_SOCKET_PATH: usize = 103;
+        #[cfg(not(target_os = "macos"))]
+        const MAX_SOCKET_PATH: usize = 107;
+        let socket = if normal.as_os_str().as_encoded_bytes().len() <= MAX_SOCKET_PATH {
+            normal
+        } else {
+            let mut digest = Sha256::new();
+            digest.update(data_dir.as_os_str().as_encoded_bytes());
+            digest.update(unsafe { libc::geteuid() }.to_be_bytes());
+            let digest = digest.finalize();
+            let name = format!(
+                "baleyg-{}-{}",
+                unsafe { libc::geteuid() },
+                hex::encode(&digest[..16])
+            );
+            Path::new("/tmp").join(name).join("daemon.sock")
+        };
         Self {
             lock: run.join("daemon.lock"),
-            socket: run.join("daemon.sock"),
+            socket,
             run,
         }
     }
@@ -65,6 +89,30 @@ impl SocketPaths {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "unsafe daemon directory",
+                ));
+            }
+        }
+        if self.socket.parent() != Some(self.run.as_path()) {
+            let private = self.socket.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "missing private socket directory",
+                )
+            })?;
+            match fs::DirBuilder::new().mode(0o700).create(private) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error),
+            }
+            let metadata = fs::symlink_metadata(private)?;
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.mode() & 0o777 != 0o700
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unsafe private socket directory",
                 ));
             }
         }
@@ -367,6 +415,34 @@ impl BrowserProvisioner {
                 outcome = server => outcome.map_err(anyhow::Error::from),
                 outcome = run_idle_lifecycle(registry) => outcome.map_err(|error| anyhow::anyhow!("{}", error.reason())),
             };
+            closed.store(true, std::sync::atomic::Ordering::Release);
+            result
+        }))
+    }
+
+    /// The elected socket owner drives the only lifecycle clock. Browser
+    /// hosting observes its shutdown signal instead of advancing the same
+    /// registry independently.
+    pub fn spawn_with_shutdown(
+        &mut self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+        let listener = self
+            .listener
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let browser = self
+            .browser
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("browser not provisioned"))?;
+        let closed = self.closed.clone();
+        Ok(tokio::spawn(async move {
+            let result = axum::serve(listener, browser.router())
+                .with_graceful_shutdown(async move {
+                    while !*shutdown.borrow() && shutdown.changed().await.is_ok() {}
+                })
+                .await
+                .map_err(anyhow::Error::from);
             closed.store(true, std::sync::atomic::Ordering::Release);
             result
         }))
