@@ -7103,6 +7103,120 @@ async fn selected_evidence_map<T: Send + 'static>(
     .map_err(map_error)
 }
 
+async fn selected_provider_read<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<(T, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        let value = work(&response)?;
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        Ok((response.finish(value).map_err(ApiError::from)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+}
+
+fn selected_catalog(
+    state: &DaemonState,
+    revision: IndexPin,
+    id: &str,
+) -> Result<Arc<Catalog>, ApiError> {
+    state
+        .catalog_snapshot(revision)
+        .filter(|catalog| catalog.id == id)
+        .ok_or_else(dependency_stale)
+}
+
+async fn selected_provider_preflight(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    packet_id: Option<String>,
+) -> Result<(Option<Arc<QuestionPacket>>, IndexPin, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response().map_err(question_error)?;
+        response.require_mutation_ready().map_err(question_error)?;
+        let revision = response.status().map_err(question_error)?.revision;
+        let packet = if let Some(id) = packet_id {
+            let state = runtime.browser_scheduler().map_err(question_error)?;
+            let packet = state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .find(|(packet, _)| packet.packet_id == id)
+                .map(|(packet, _)| packet.clone())
+                .ok_or_else(missing)?;
+            if packet.revision != revision {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "revision_conflict",
+                    "The index revision changed",
+                ));
+            }
+            response
+                .validate_selected_view(&packet.context, &packet.source_files)
+                .map_err(question_error)?;
+            Some(packet)
+        } else {
+            None
+        };
+        response.finish(()).map_err(question_error)?;
+        if let Some(hook) = hook {
+            hook("before_mutation");
+        }
+        response.finish(()).map_err(question_error)?;
+        Ok((packet, revision, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+}
+
+async fn selected_provider_postflight(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    revision: IndexPin,
+) -> Result<(), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, _) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        anyhow::ensure!(
+            response.status()?.revision == revision,
+            "revision conflict: provider basis changed"
+        );
+        response.finish(())
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(ApiError::from)
+}
+
 fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
     let mut response = (
         error.0,
@@ -7185,6 +7299,317 @@ async fn provisioned_core_answer(
 ) -> Result<(Response, bool), ApiError> {
     use axum::http::Method;
     match (method, suffix) {
+        (&Method::POST, "dependencies/refresh") => {
+            let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            if !request.as_object().is_some_and(|object| object.is_empty()) {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (_, revision, catching_up) =
+                selected_provider_preflight(runtime, hook, None).await?;
+            if state.dependency_options.is_none() {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "dependencies_disabled",
+                    "Dependency catalog is disabled",
+                ));
+            }
+            if state.dependencies.lock().unwrap().stopped {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "shutting_down",
+                    "Daemon is shutting down",
+                ));
+            }
+            // Check once more immediately before scheduling work. Once scheduled,
+            // a later root or head change cannot undo the requested refresh.
+            selected_provider_postflight(runtime, revision).await?;
+            state.start_dependency_index();
+            let mut response = match selected_provider_postflight(runtime, revision).await {
+                Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
+                Err(error) => selected_mutation_error(error, "committed"),
+            };
+            response
+                .headers_mut()
+                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+            Ok((response, catching_up))
+        }
+        _ if method == Method::POST
+            && suffix.starts_with("questions/")
+            && (suffix.ends_with("/jev-run") || suffix.ends_with("/acp-answer")) =>
+        {
+            let tail = suffix.strip_prefix("questions/").unwrap();
+            let (id, action) = tail.split_once('/').ok_or_else(missing)?;
+            if id.is_empty() || action.contains('/') {
+                return Err(missing());
+            }
+            let jev = action == "jev-run";
+            if jev {
+                if !body.is_empty() && body.as_ref() != b"{}" {
+                    return Err(invalid());
+                }
+            } else {
+                let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+                if !request.as_object().is_some_and(|object| object.is_empty()) {
+                    return Err(invalid());
+                }
+            }
+            let state = runtime.browser_scheduler()?;
+            let (packet, revision, catching_up) =
+                selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
+            let packet = packet.unwrap();
+            if jev {
+                let provider = state.provider.clone().ok_or(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "jev_disabled",
+                    "Live Jev is disabled",
+                ))?;
+                // No await before the final current-head check or the provider call.
+                selected_provider_postflight(runtime, revision).await?;
+                let result = provider.run(&packet).await;
+                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
+                }
+                let response = match result {
+                    Err(error) => live_jev_error(error).into_response(),
+                    Ok(result) => {
+                        let selection = result.selection.clone();
+                        let mut view = match planning::assemble(&packet, &selection, "liveJev") {
+                            Ok(view) => view,
+                            Err(error) => {
+                                return Ok((
+                                    selected_mutation_error(question_error(error), "unknown"),
+                                    catching_up,
+                                ));
+                            }
+                        };
+                        view.warnings.extend(result.warnings.clone());
+                        Json(json!({"selection":result.selection,"view":view,
+                            "attemptId":result.attempt_id,"latencyMs":result.latency_ms,
+                            "estimatedUsd":result.estimated_usd,"usage":result.usage,
+                            "warnings":result.warnings}))
+                        .into_response()
+                    }
+                };
+                let mut response = response;
+                let outcome = if response.status().is_success() {
+                    "committed"
+                } else {
+                    "unknown"
+                };
+                response
+                    .headers_mut()
+                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                Ok((response, catching_up))
+            } else {
+                let provider = state.acp.clone().ok_or(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "acp_disabled",
+                    "Live ACP is disabled",
+                ))?;
+                selected_provider_postflight(runtime, revision).await?;
+                let result = provider.run(&packet).await;
+                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
+                }
+                let response = match result {
+                    Err(error) => acp_error(error).into_response(),
+                    Ok(result) => Json(
+                        json!({"packetId":packet.packet_id,"revision":packet.revision,
+                        "source":"liveAcp","attemptId":result.attempt_id,"answer":result.answer,
+                        "latencyMs":result.latency_ms,"estimatedUsd":result.estimated_usd}),
+                    )
+                    .into_response(),
+                };
+                let mut response = response;
+                let outcome = if response.status().is_success() {
+                    "committed"
+                } else {
+                    "unknown"
+                };
+                response
+                    .headers_mut()
+                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                Ok((response, catching_up))
+            }
+        }
+        (&Method::GET, "jev/status") | (&Method::GET, "acp/status") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let jev = suffix == "jev/status";
+            let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                if jev {
+                    match &state.provider {
+                        Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
+                        None => Ok(json!({"enabled":false,"budget":null})),
+                    }
+                } else {
+                    match &state.acp {
+                        Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
+                        None => Ok(json!({"enabled":false,"status":null})),
+                    }
+                }
+            }).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let (index_state, catalog, mut warnings) = {
+                    let index = state.dependencies.lock().unwrap();
+                    (index.state, index.catalog.clone(), index.warnings.clone())
+                };
+                Ok(if let Some(catalog) = catalog {
+                    if catalog.workspace_revision == revision {
+                        json!({"state":index_state,"workspaceRevision":revision,
+                            "catalogId":catalog.id,"packages":catalog.packages,
+                            "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
+                    } else {
+                        warnings.push("Workspace changed; refresh the dependency catalog".into());
+                        json!({"state":"failed","workspaceRevision":revision,
+                            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+                    }
+                } else {
+                    json!({"state":index_state,"workspaceRevision":revision,
+                        "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+                })
+            })
+            .await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies/symbols") => {
+            let Query(q) =
+                Query::<DependencySymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.catalog_id.is_empty()
+                || q.catalog_id.len() > 8192
+                || q.q.len() > 8192
+                || q.package_id.as_ref().is_some_and(|id| id.len() > 8192)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > 50_000
+            {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+                if q.package_id.as_ref().is_some_and(|id| !catalog.packages.iter().any(|p| &p.id == id)) { return Err(missing()); }
+                let search = q.q.to_lowercase();
+                let mut matches = catalog.symbols.iter().filter(|symbol| {
+                    q.package_id.as_ref().is_none_or(|id| &symbol.package_id == id)
+                    && (search.is_empty() || symbol.qualified_name.to_lowercase().contains(&search)
+                        || symbol.name.to_lowercase().contains(&search))
+                }).skip(q.offset);
+                let items: Vec<_> = matches.by_ref().take(q.limit).collect();
+                let next_offset = matches.next().map(|_| q.offset + items.len());
+                let payload = json!({"catalogId":catalog.id,"workspaceRevision":catalog.workspace_revision,
+                    "items":items,"nextOffset":next_offset});
+                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
+                Ok(payload)
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies/source") => {
+            let Query(q) =
+                Query::<DependencySourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.catalog_id.is_empty()
+                || q.catalog_id.len() > 8192
+                || q.source_ref.is_empty()
+                || q.source_ref.len() > 8192
+            {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+                let source = catalog.sources.get(&q.source_ref).ok_or_else(missing)?;
+                let text = source.directory.read_file(&source.path).map_err(rust_source_error)?;
+                let hash = hex::encode(Sha256::digest(text.as_bytes()));
+                if hash != source.hash { return Err(dependency_stale()); }
+                let package = catalog.packages.iter().find(|p| p.id == source.package_id).ok_or_else(missing)?;
+                let definitions: Vec<_> = catalog.symbols.iter().filter(|symbol| symbol.source_ref == q.source_ref)
+                    .map(|symbol| json!({"id":symbol.id,"name":symbol.name,"kind":symbol.kind,
+                        "parent":symbol.parent,"path":symbol.path,"range":symbol.range})).collect();
+                let file = SourceFile { path: source.path.clone(), hash: hash.clone(), language: "rust".into(), text };
+                let payload = json!({"id":q.source_ref,"rootId":package.id,"rootLabel":package.name,
+                    "path":source.path,"hash":hash,"file":file,"definitions":definitions,
+                    "warnings":["Definitional candidates only; not confirmed callees. Separate from the workspace graph and source-sharing scope."]});
+                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
+                Ok(payload)
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                Ok(json!({"roots":state.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+                    "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources/tree") => {
+            let Query(q) = Query::<RustTreeQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if !crate::file_tree::valid_path(&q.path)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > crate::file_tree::SCAN_LIMIT
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let root = state
+                    .rust_sources
+                    .iter()
+                    .find(|root| root.label == q.root)
+                    .ok_or_else(missing)?;
+                let (items, next_offset, truncated) = root
+                    .directory
+                    .list(&q.path, q.offset, q.limit)
+                    .map_err(rust_source_error)?;
+                Ok(crate::file_tree::Page {
+                    root: root.directory.root.to_string_lossy().into_owned(),
+                    indexed_workspace: String::new(),
+                    path: q.path,
+                    revision,
+                    items,
+                    next_offset,
+                    truncated,
+                })
+            })
+            .await?;
+            Ok((Json(page).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources/file") => {
+            let Query(q) = Query::<RustFileQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.path.is_empty()
+                || !crate::file_tree::valid_path(&q.path)
+                || !q.path.ends_with(".rs")
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                let root = state
+                    .rust_sources
+                    .iter()
+                    .find(|root| root.label == q.root)
+                    .ok_or_else(missing)?;
+                root.snapshot(&q.path).map_err(rust_source_error)
+            })
+            .await?;
+            Ok((Json(file).into_response(), catching_up))
+        }
         (&Method::GET, "status") => {
             if uri.query().is_some() {
                 return Err(invalid());
