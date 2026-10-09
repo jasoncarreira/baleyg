@@ -1183,7 +1183,7 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     assert!(old.evidence_response().is_err());
 }
 
-async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
+async fn root_loss_restricted_ex_case(owner_mode: u8) {
     use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{Arc, atomic::AtomicU64};
     let base = tempfile::tempdir().unwrap();
@@ -1207,6 +1207,7 @@ async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
     store.bind_runtime_epoch(epoch.clone());
     store.remember_read_only_predecessor(&prior, epoch).unwrap();
     drop(prior);
+    let stale_follower = store.follower_session().unwrap();
     drop(first);
     let restricted = store.leader_session().unwrap();
     assert!(store.restricted_owner_associated());
@@ -1218,18 +1219,21 @@ async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
         "127.0.0.1:7331".parse().unwrap(),
     )
     .unwrap();
-    if with_serving_owner {
+    if owner_mode == 1 {
         state.retain_serving_session_without_tick_for_tests(restricted.clone());
+    } else if owner_mode == 2 {
+        // Retained stale follower must not shadow the separately live H EX.
+        state.retain_serving_session_without_tick_for_tests(stale_follower.clone());
     }
-    // In the other case only the H worker owns EX. The weak association must
-    // let the root-loss tick borrow it until durable FIFO failure completes.
-    let h_worker_owner = (!with_serving_owner).then(|| restricted.clone());
+    // In modes 0 and 2 only the H worker owns EX. The weak association must
+    // let root loss borrow it until durable FIFO failure completes.
+    let h_worker_owner = (owner_mode != 1).then(|| restricted.clone());
     drop(restricted);
     fs::rename(&work, &moved).unwrap();
     fs::create_dir(&work).unwrap();
     state.force_root_transition_tick_for_tests().unwrap();
     let db = rusqlite::Connection::open(requests_db).unwrap();
-    let (result, reason): (String, String) = db
+    let (result, reason): (String, Option<String>) = db
         .query_row(
             "SELECT state,error_code FROM requests WHERE id=?1",
             [&accepted.id],
@@ -1237,8 +1241,8 @@ async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
         )
         .unwrap();
     assert_eq!(
-        (result.as_str(), reason.as_str()),
-        ("failed", "root_changed")
+        (result.as_str(), reason.as_deref()),
+        ("failed", Some("root_changed"))
     );
     drop(db);
     assert_eq!(
@@ -1260,8 +1264,9 @@ async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
 
 #[tokio::test]
 async fn root_loss_drops_restricted_ex_before_old_path_returns() {
-    root_loss_restricted_ex_case(false).await;
-    root_loss_restricted_ex_case(true).await;
+    for mode in [0, 1, 2] {
+        root_loss_restricted_ex_case(mode).await;
+    }
 }
 
 async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
@@ -1370,7 +1375,86 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     fs::create_dir(&work).unwrap();
     fs::write(work.join("a.js"), "function source() {}\n").unwrap();
     let topology = roots(base.path());
-    let store = Store::open(topology, identity(&work)).unwrap();
+    let id = identity(&work);
+    let requests_db = topology.requests_db(&id);
+    let index_db = topology.index_db(&id);
+    let store = Store::open(topology.clone(), identity(&work)).unwrap();
+    let options = IndexOptions::new(work.clone());
+    let first =
+        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
+            .unwrap();
+    let prior = store.evidence_response().unwrap();
+    let epoch = Arc::new(AtomicU64::new(1));
+    let permit = store.pre_h_read_permit(&prior, &first, epoch).unwrap();
+    drop(prior);
+    drop(first);
+    let restricted = store.leader_session().unwrap();
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    // A real obsolete on-disk marker is classified at a new Store admission.
+    // Preserve only the H worker's weak restricted association across it.
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    db.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+    )
+    .unwrap();
+    drop(db);
+    drop(store);
+    let recovering = Store::open(topology, identity(&work)).unwrap();
+    recovering.associate_restricted_owner_for_tests(&restricted, permit);
+    assert!(recovering.restricted_owner_associated());
+    let state = http::new(
+        recovering.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7333".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session_without_tick_for_tests(restricted.clone());
+    drop(restricted);
+    state
+        .force_root_transition_tick_for_tests()
+        .expect("exceptional recreate must finish");
+    assert!(
+        !recovering.restricted_owner_associated(),
+        "exceptional path kept pre-H read slot"
+    );
+    let replacement = state
+        .retained_serving_session()
+        .expect("EX retry must become serving owner");
+    assert!(replacement.is_leader());
+    replacement
+        .verify()
+        .expect("recreated EX must remain verified");
+    let db = rusqlite::Connection::open(requests_db).unwrap();
+    let row_state: String = db
+        .query_row(
+            "SELECT state FROM requests WHERE id=?1",
+            [&accepted.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        matches!(row_state.as_str(), "done" | "failed"),
+        "FIFO row did not reach terminal state: {row_state}"
+    );
+}
+
+#[tokio::test]
+async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
+    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    };
+    let base = tempfile::tempdir().unwrap();
+    let work = base.path().join("work");
+    let moved = base.path().join("old-work");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("a.js"), "function initial() {}\n").unwrap();
+    let id = identity(&work);
+    let topology = roots(base.path());
+    let requests_db = topology.requests_db(&id);
+    let store = Store::open(topology.clone(), identity(&work)).unwrap();
     let options = IndexOptions::new(work.clone());
     let initial =
         establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
@@ -1381,28 +1465,53 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     store.remember_read_only_predecessor(&prior, epoch).unwrap();
     drop(prior);
     drop(initial);
-    let restricted = store.leader_session().unwrap();
-    assert!(store.restricted_owner_associated());
-    let _accepted = store.enqueue_request(&options, None).unwrap();
+    let accepted = store.enqueue_request(&options, None).unwrap();
     let state = http::new(
         store.clone(),
         options,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7333".parse().unwrap(),
+        "127.0.0.1:7334".parse().unwrap(),
     )
     .unwrap();
-    state.retain_serving_session_without_tick_for_tests(restricted.clone());
-    drop(restricted);
-    store.force_recreate_pending_for_tests();
-    let result = state.force_root_transition_tick_for_tests();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    state.set_checkout_takeover_h_hook_for_tests(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    let worker = state.clone();
+    let ticking = std::thread::spawn(move || worker.force_root_transition_tick_for_tests());
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("takeover never reached H hook");
     assert!(
-        !store.restricted_owner_associated(),
-        "exceptional path kept pre-H read slot"
+        store.restricted_owner_associated(),
+        "new EX was not associated at H hook"
     );
-    if let Err(error) = result {
-        assert!(
-            !format!("{error:#}").contains("storage_busy"),
-            "EX remained held during recreate: {error:#}"
-        );
-    }
+    fs::rename(&work, &moved).unwrap();
+    fs::create_dir(&work).unwrap();
+    resume_tx.send(()).unwrap();
+    let _ = ticking.join().unwrap();
+    let db = rusqlite::Connection::open(requests_db).unwrap();
+    let (result, reason): (String, Option<String>) = db
+        .query_row(
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&accepted.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (result.as_str(), reason.as_deref()),
+        ("failed", Some("root_changed"))
+    );
+    drop(db);
+    assert!(!store.restricted_owner_associated());
+    assert!(store.orphan_root_loss_owner().is_none());
+    fs::remove_dir(&work).unwrap();
+    fs::rename(&moved, &work).unwrap();
+    let fresh = topology
+        .leader(&id)
+        .expect("old EX retires only after FIFO root_changed");
+    assert!(fresh.verify().is_ok());
 }

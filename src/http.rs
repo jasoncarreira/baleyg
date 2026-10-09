@@ -975,9 +975,10 @@ impl DaemonState {
                 .lock()
                 .unwrap()
                 .clone()
+                .filter(|session| session.is_leader())
                 .or_else(|| self.store.restricted_owner_for_root_loss())
                 .or_else(|| self.store.orphan_root_loss_owner());
-            if let Some(session) = retained.filter(|session| session.is_leader()) {
+            if let Some(session) = retained {
                 *self.root_loss_session.lock().unwrap() = Some(session);
             }
             // Transfer the sole restricted EX to root-loss authority BEFORE
@@ -1118,17 +1119,15 @@ impl DaemonState {
                 }
             }
         }
-        let retained = self
-            .serving_session
-            .lock()
-            .unwrap()
-            .clone()
-            .or_else(|| self.store.restricted_owner_for_root_loss())
-            .or_else(|| self.store.orphan_root_loss_owner());
+        let retained = self.serving_session.lock().unwrap().clone();
         if self.store.root_path_replaced()? {
-            if let Some(ref session) = retained
-                && session.is_leader()
-            {
+            let root_loss_owner = retained
+                .as_ref()
+                .filter(|session| session.is_leader())
+                .cloned()
+                .or_else(|| self.store.restricted_owner_for_root_loss())
+                .or_else(|| self.store.orphan_root_loss_owner());
+            if let Some(ref session) = root_loss_owner {
                 self.store.fail_changed_root_requests(session)?;
             }
             self.store.clear_orphan_root_loss_owner();
@@ -1230,6 +1229,8 @@ impl DaemonState {
                     (|| -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
                         match self.store.leader_session() {
                             Ok(session) => {
+                                let mut root_loss_lease =
+                                    self.store.root_loss_owner_lease(&session);
                                 self.store.fail_changed_root_requests(&session)?;
                                 let coordinator =
                                 crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -1247,6 +1248,7 @@ impl DaemonState {
                                     &Arc::new(AtomicBool::new(false)),
                                     |_| {},
                                 )?;
+                                root_loss_lease.disarm();
                                 Ok(session)
                             }
                             Err(error)
@@ -1303,6 +1305,7 @@ impl DaemonState {
         self.queue_takeover_attempts.fetch_add(1, Ordering::AcqRel);
         match self.store.leader_session() {
             Ok(session) => {
+                let mut root_loss_lease = self.store.root_loss_owner_lease(&session);
                 // A new EX may not drain FIFO until its mandatory selected-head
                 // reconciliation has completed under this same incarnation.
                 let mut mandatory_reconcile_incomplete = true;
@@ -1338,8 +1341,8 @@ impl DaemonState {
                         // No failed pre-COMMIT H (including a virgin-head H)
                         // may claim or terminal-fail Q1. Keep its durable FIFO
                         // row queued and drop this unreconciled EX/session.
-                        self.store.verify_leader_session(&session)?;
                         self.store.fail_changed_root_requests(&session)?;
+                        self.store.verify_leader_session(&session)?;
                         if self.store.index_baseline()? != before {
                             // A possibly committed revision is not inferred
                             // from a transient error; a new owner retries H.
@@ -1398,6 +1401,7 @@ impl DaemonState {
                     // Only a completed mandatory inventory or a verified cached
                     // FIFO terminal result may retain this exact EX/session.
                     self.replace_serving_session(Some(session));
+                    root_loss_lease.disarm();
                 } else {
                     // RetryMandatory Ok(None) and every incomplete-H Err drop
                     // even a stale retained follower. No old EX/LeaderWork may

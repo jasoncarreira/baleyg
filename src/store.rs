@@ -107,10 +107,15 @@ impl Drop for RestrictedAssociationGuard {
 // If metadata admission fails after EX is acquired, the H caller never
 // receives the session. Settle old-root FIFO while that EX still exists, or
 // retain it for the scheduler's retry instead of abandoning accepted work.
-struct RootLossOwnerLease<'a> {
+pub(crate) struct RootLossOwnerLease<'a> {
     store: &'a Store,
     owner: Arc<topology::LeaderSession>,
     armed: bool,
+}
+impl RootLossOwnerLease<'_> {
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 impl Drop for RootLossOwnerLease<'_> {
     fn drop(&mut self) {
@@ -7144,11 +7149,6 @@ impl Store {
     pub(crate) fn is_ready_disposition(&self) -> bool {
         self.disposition() == RecoveryDisposition::Ready
     }
-    #[doc(hidden)]
-    pub fn force_recreate_pending_for_tests(&self) {
-        self.mark_recovery(RecoveryDisposition::RecreatePending);
-    }
-
     pub(crate) fn is_recreate_pending(&self) -> bool {
         matches!(
             self.disposition(),
@@ -7504,6 +7504,17 @@ impl Store {
     }
 
     /// Restricted association is neither a serving owner nor an H proof.
+    /// Fixture only: emulate a restricted H owner surviving Store replacement
+    /// while testing exceptional index recreation and EX retirement.
+    #[doc(hidden)]
+    pub fn associate_restricted_owner_for_tests(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+        permit: PreHReadPermit,
+    ) {
+        *self.restricted_predecessor.lock().unwrap() = Some((Arc::downgrade(owner), permit));
+    }
+
     pub fn restricted_owner_associated(&self) -> bool {
         self.restricted_predecessor
             .lock()
@@ -7520,6 +7531,19 @@ impl Store {
             .unwrap()
             .as_ref()
             .and_then(|(owner, _)| owner.upgrade())
+    }
+
+    /// Retain an acquired EX until the caller either hands it to a verified
+    /// serving owner or disposes old-root work on an error.
+    pub(crate) fn root_loss_owner_lease(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+    ) -> RootLossOwnerLease<'_> {
+        RootLossOwnerLease {
+            store: self,
+            owner: owner.clone(),
+            armed: true,
+        }
     }
 
     pub fn orphan_root_loss_owner(&self) -> Option<Arc<topology::LeaderSession>> {
