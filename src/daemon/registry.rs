@@ -319,6 +319,8 @@ impl CheckoutRegistry {
         };
         let resources = runtime.resources()?;
         if runtime.h_in_flight.load(Ordering::Acquire)
+            || runtime.unsettled_root_loss_owner(&resources)
+            || runtime.use_transition_uncertain(&resources)
             || (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
             || runtime.active_reads.load(Ordering::Acquire) != 0
             || CheckoutRuntime::queue_pending(&resources)
@@ -341,7 +343,11 @@ impl CheckoutRegistry {
             match resources.store.root_path_replaced() {
                 Ok(false) => {}
                 Ok(true) if session.is_leader() => {
-                    if resources.store.fail_changed_root_requests(session).is_err()
+                    if resources
+                        .store
+                        .complete_uncertain_use_transition(session)
+                        .is_err()
+                        || resources.store.fail_changed_root_requests(session).is_err()
                         || !resources.store.root_path_replaced().is_ok_and(|lost| lost)
                     {
                         return Ok(false);
@@ -930,7 +936,9 @@ impl CheckoutRegistry {
                     let resources = runtime
                         .resources()
                         .map_err(|_| SelectionError::Unavailable)?;
-                    (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
+                    runtime.unsettled_root_loss_owner(&resources)
+                        || runtime.use_transition_uncertain(&resources)
+                        || (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
                         || runtime.active_reads.load(Ordering::Acquire) != 0
                         || CheckoutRuntime::queue_pending(&resources)
                 }
@@ -1433,6 +1441,27 @@ impl CheckoutRuntime {
         }
     }
 
+    /// A root-loss H owner cannot be released or counted idle because a
+    /// read-only SELECT misses a second writer's uncommitted FIFO row.
+    fn unsettled_root_loss_owner(&self, resources: &ActiveResources) -> bool {
+        let phase = self.phase.lock().unwrap();
+        matches!(&*phase,
+            RuntimePhase::HOwned(owner) | RuntimePhase::Ready(owner) if owner.is_leader())
+            && !resources.store.root_path_replaced().is_ok_and(|lost| !lost)
+    }
+
+    /// Never open a second index-use SH while our exact H owner may still
+    /// hold EX from a failed exceptional downgrade. The worker repairs it.
+    fn use_transition_uncertain(&self, resources: &ActiveResources) -> bool {
+        let phase = self.phase.lock().unwrap();
+        match &*phase {
+            RuntimePhase::HOwned(owner) | RuntimePhase::Ready(owner) => {
+                resources.store.use_transition_uncertain(owner)
+            }
+            RuntimePhase::Reconciling => false,
+        }
+    }
+
     fn queue_pending(resources: &ActiveResources) -> bool {
         // A failed old-root write may hide an uncommitted Q1 from SELECT.
         // Its orphaned exact EX remains busy until a serialized terminal proof.
@@ -1494,6 +1523,13 @@ impl CheckoutRuntime {
         let mut phase = self.phase.lock().unwrap();
         Self::refresh_phase(&mut phase, &resources);
         if self.h_in_flight.load(Ordering::Acquire) {
+            return true;
+        }
+        if let RuntimePhase::HOwned(owner) | RuntimePhase::Ready(owner) = &*phase
+            && (resources.store.use_transition_uncertain(owner)
+                || (owner.is_leader()
+                    && !resources.store.root_path_replaced().is_ok_and(|lost| !lost)))
+        {
             return true;
         }
         if resources.scheduler.checkout_root_loss_retired() {
@@ -1616,32 +1652,38 @@ impl CheckoutRuntime {
             return false;
         }
         let mut phase = self.phase.lock().unwrap();
-        // The Store can acquire EX and fail metadata admission before our
-        // on_owner callback receives an Arc. RootLossOwnerLease then retains
-        // that exact owner as an orphan. A read-only empty queue probe cannot
-        // observe another writer's uncommitted BEGIN IMMEDIATE row.
+        // Metadata can fail before on_owner receives its Arc. Clone the Store's
+        // orphan while it still owns the lease and install the SAME Arc in our
+        // phase before conditionally removing the Store slot.
         let orphan = resources.store.orphan_root_loss_owner();
         let owner = match (&*phase, orphan.as_ref()) {
-            (RuntimePhase::HOwned(session), Some(orphan)) => {
-                if !Arc::ptr_eq(session, orphan) {
-                    return false;
-                }
-                Some(session.clone())
+            (RuntimePhase::HOwned(session), Some(orphan)) if !Arc::ptr_eq(session, orphan) => {
+                return false;
             }
-            (RuntimePhase::HOwned(session), None) => Some(session.clone()),
-            (_, Some(orphan)) => Some(orphan.clone()),
+            (RuntimePhase::HOwned(session), _) => Some(session.clone()),
+            (RuntimePhase::Reconciling, Some(orphan)) => {
+                *phase = RuntimePhase::HOwned(orphan.clone());
+                Some(orphan.clone())
+            }
+            (RuntimePhase::Ready(_), Some(_)) => return false,
             _ => None,
         };
         if let Some(owner) = owner {
-            if resources.store.fail_changed_root_requests(&owner).is_err()
+            // A failed exceptional use-lock downgrade may still hold EX. Never
+            // open another SH for FIFO until its original SH is proved again.
+            if resources
+                .store
+                .complete_uncertain_use_transition(&owner)
+                .is_err()
+                || resources.store.fail_changed_root_requests(&owner).is_err()
                 || !resources.store.root_path_replaced().is_ok_and(|lost| lost)
             {
-                // Never clear either EX lease after BUSY, ambiguous COMMIT or
-                // unstable moved-root proof. Retry under the same owner.
+                // BUSY, ambiguous COMMIT, or uncertain use lock retain HOwned
+                // and any matching orphan Store slot for the next retry.
                 return false;
             }
             if orphan.is_some() {
-                resources.store.clear_orphan_root_loss_owner();
+                resources.store.clear_orphan_root_loss_owner_if_same(&owner);
             }
         } else if !matches!(resources.store.old_root_unfinished_request(), Ok(None)) {
             return false;
@@ -1658,17 +1700,40 @@ impl CheckoutRuntime {
         let resources = self.resources()?;
         let store = &resources.store;
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        // A metadata failure may have orphaned EX before the callback installed
+        // HOwned. Transfer ownership by CLONING under our phase lock, then
+        // repair uncertain index-use EX to verified SH before any queue/status
+        // probe or attempt to elect a different leader.
+        let retained = {
+            let mut phase = self.phase.lock().unwrap();
+            let orphan = store.orphan_root_loss_owner();
+            let owner = match (&*phase, orphan.as_ref()) {
+                (RuntimePhase::HOwned(session), Some(orphan)) if !Arc::ptr_eq(session, orphan) => {
+                    anyhow::bail!("storage_busy: conflicting old-root owners");
+                }
+                (RuntimePhase::HOwned(session), _) => Some(session.clone()),
+                (RuntimePhase::Reconciling, Some(orphan)) => {
+                    *phase = RuntimePhase::HOwned(orphan.clone());
+                    Some(orphan.clone())
+                }
+                (RuntimePhase::Ready(_), Some(_)) => {
+                    anyhow::bail!("storage_busy: orphan conflicts with ready owner");
+                }
+                _ => None,
+            };
+            if let Some(owner) = &owner {
+                store.complete_uncertain_use_transition(owner)?;
+                if matches!(&*phase, RuntimePhase::HOwned(held) if Arc::ptr_eq(held, owner)) {
+                    store.clear_orphan_root_loss_owner_if_same(owner);
+                }
+            }
+            owner
+        };
         // Implicit CLI/MCP activation must retain a published head's recorded
         // options. A replaced root recreates its own index instead.
         let supplied = explicit_options
             || store.is_recreate_pending()
             || store.recorded_index_options()?.is_none();
-        let retained = match &*self.phase.lock().unwrap() {
-            // Even after root loss, keep this exact old EX while its FIFO
-            // failure is retried. Re-electing here could drop it prematurely.
-            RuntimePhase::HOwned(session) => Some(session.clone()),
-            _ => None,
-        };
         // The elected EX is held by HOwned as soon as it exists. If an initial-H
         // error follows root loss, retire_lost_root_h must fail every old-root
         // FIFO row before the final EX lease is dropped or this worker retries.
