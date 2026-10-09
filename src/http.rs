@@ -970,17 +970,25 @@ impl DaemonState {
         // capture after its root identity changes. Retire the watcher with its
         // leader session; the moved spelling opens independently.
         if self.store.root_path_replaced()? {
-            let retained = self.serving_session.lock().unwrap().clone();
+            let retained = self
+                .serving_session
+                .lock()
+                .unwrap()
+                .clone()
+                .or_else(|| self.store.restricted_owner_for_root_loss())
+                .or_else(|| self.store.orphan_root_loss_owner());
             if let Some(session) = retained.filter(|session| session.is_leader()) {
                 *self.root_loss_session.lock().unwrap() = Some(session);
             }
-            // Drop the watcher and serving owner before a possibly blocked
-            // requests.db write. Keep only the verified old-root EX authority
-            // for the idempotent queued/running -> root_changed transition.
+            // Transfer the sole restricted EX to root-loss authority BEFORE
+            // revoking its selected-read association. Accepted FIFO work must
+            // reach root_changed while an old-owner EX still exists.
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             let authority = self.root_loss_session.lock().unwrap().clone();
             if let Some(session) = authority {
                 self.store.fail_changed_root_requests(&session)?;
+                self.store.clear_orphan_root_loss_owner();
                 *self.root_loss_session.lock().unwrap() = None;
             }
             return Ok(());
@@ -1081,7 +1089,8 @@ impl DaemonState {
         }
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
             // The native stream excludes the tick while the old owner is removed.
-            // No retained SH guard may enter the nonblocking EX attempt.
+            // A restricted predecessor's EX must not pin exceptional recreation.
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             match self
                 .store
@@ -1109,13 +1118,21 @@ impl DaemonState {
                 }
             }
         }
-        let retained = self.serving_session.lock().unwrap().clone();
+        let retained = self
+            .serving_session
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.store.restricted_owner_for_root_loss())
+            .or_else(|| self.store.orphan_root_loss_owner());
         if self.store.root_path_replaced()? {
             if let Some(ref session) = retained
                 && session.is_leader()
             {
                 self.store.fail_changed_root_requests(session)?;
             }
+            self.store.clear_orphan_root_loss_owner();
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             return Ok(());
         }

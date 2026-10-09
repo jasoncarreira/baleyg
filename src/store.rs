@@ -83,7 +83,7 @@ impl Drop for OwnerValidationLease {
     }
 }
 
-type RestrictedOwnerSlot = Arc<Mutex<Option<(Arc<topology::LeaderSession>, PreHReadPermit)>>>;
+type RestrictedOwnerSlot = Arc<Mutex<Option<(Weak<topology::LeaderSession>, PreHReadPermit)>>>;
 struct RestrictedAssociationGuard {
     slot: RestrictedOwnerSlot,
     incarnation: uuid::Uuid,
@@ -93,12 +93,35 @@ impl Drop for RestrictedAssociationGuard {
     fn drop(&mut self) {
         if self.armed {
             let mut slot = self.slot.lock().unwrap();
-            if slot
-                .as_ref()
-                .is_some_and(|(owner, _)| owner.incarnation() == self.incarnation)
-            {
+            if slot.as_ref().is_some_and(|(owner, _)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| owner.incarnation() == self.incarnation)
+            }) {
                 slot.take();
             }
+        }
+    }
+}
+
+// If metadata admission fails after EX is acquired, the H caller never
+// receives the session. Settle old-root FIFO while that EX still exists, or
+// retain it for the scheduler's retry instead of abandoning accepted work.
+struct RootLossOwnerLease<'a> {
+    store: &'a Store,
+    owner: Arc<topology::LeaderSession>,
+    armed: bool,
+}
+impl Drop for RootLossOwnerLease<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && self.store.root_path_replaced().is_ok_and(|lost| lost)
+            && self.store.fail_changed_root_requests(&self.owner).is_err()
+            // No old FIFO obligation means the EX need not outlive this failed
+            // admission. An ambiguous queue probe must retain it for retry.
+            && !matches!(self.store.old_root_unfinished_request(), Ok(None))
+        {
+            *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
         }
     }
 }
@@ -189,6 +212,7 @@ pub struct Store {
     runtime_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
     read_only_predecessor: Arc<Mutex<Option<PreHReadPermit>>>,
     restricted_predecessor: RestrictedOwnerSlot,
+    orphan_root_loss_owner: Arc<Mutex<Option<Arc<topology::LeaderSession>>>>,
     recovery_disposition: Arc<AtomicU8>,
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
@@ -5525,6 +5549,7 @@ impl Store {
             runtime_epoch: Arc::new(Mutex::new(None)),
             read_only_predecessor: Arc::new(Mutex::new(None)),
             restricted_predecessor: Arc::new(Mutex::new(None)),
+            orphan_root_loss_owner: Arc::new(Mutex::new(None)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
             pending_request_completion: Arc::new(Mutex::new(None)),
@@ -6382,7 +6407,13 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
-        self.leader_with_owner(before_write, |guard| guard, |guard| guard, |_| Ok(false))
+        self.leader_with_owner(
+            before_write,
+            |guard| guard,
+            |guard| guard,
+            |_| None,
+            |_| Ok(false),
+        )
     }
 
     fn leader_with_owner<T>(
@@ -6390,6 +6421,7 @@ impl Store {
         before_write: impl FnOnce(&Connection) -> Result<()>,
         wrap: impl FnOnce(topology::LeaderGuard) -> T,
         guard: impl Fn(&T) -> &topology::LeaderGuard,
+        root_loss_owner: impl Fn(&T) -> Option<Arc<topology::LeaderSession>>,
         publish: impl FnOnce(&T) -> Result<bool>,
     ) -> Result<T> {
         // Leader startup has its own live data_version→COMMIT interval before
@@ -6425,6 +6457,11 @@ impl Store {
         drop(state);
         let _validation = OwnerValidationLease(self.owner_validation.clone());
         let owner = wrap(self.roots.leader(&self.identity)?);
+        let mut root_loss_lease = root_loss_owner(&owner).map(|session| RootLossOwnerLease {
+            store: self,
+            owner: session,
+            armed: true,
+        });
         let leader = guard(&owner);
         // This incarnation is durable, but the old SQLite marker has not yet
         // been validated or rebound. Never serve unproven evidence here.
@@ -6483,6 +6520,9 @@ impl Store {
             self.recovery_required.store(false, Ordering::Release);
         }
         association_guard.armed = false;
+        if let Some(lease) = &mut root_loss_lease {
+            lease.armed = false;
+        }
         Ok(owner)
     }
     fn cache(&self) -> Result<IndexConnection> {
@@ -7104,6 +7144,11 @@ impl Store {
     pub(crate) fn is_ready_disposition(&self) -> bool {
         self.disposition() == RecoveryDisposition::Ready
     }
+    #[doc(hidden)]
+    pub fn force_recreate_pending_for_tests(&self) {
+        self.mark_recovery(RecoveryDisposition::RecreatePending);
+    }
+
     pub(crate) fn is_recreate_pending(&self) -> bool {
         matches!(
             self.disposition(),
@@ -7174,6 +7219,7 @@ impl Store {
                 ))
             },
             |session| session.leader_guard().expect("wrapped EX owner"),
+            |session| Some(session.clone()),
             |session| {
                 let Some(permit) = self.read_only_predecessor.lock().unwrap().clone() else {
                     return Ok(false);
@@ -7185,7 +7231,8 @@ impl Store {
                 {
                     return Ok(false);
                 }
-                *self.restricted_predecessor.lock().unwrap() = Some((session.clone(), permit));
+                *self.restricted_predecessor.lock().unwrap() =
+                    Some((Arc::downgrade(session), permit));
                 let mut state = self.owner_validation.state.lock().unwrap();
                 state.associated = true;
                 state.serial = state.serial.wrapping_add(1);
@@ -7458,7 +7505,29 @@ impl Store {
 
     /// Restricted association is neither a serving owner nor an H proof.
     pub fn restricted_owner_associated(&self) -> bool {
-        self.restricted_predecessor.lock().unwrap().is_some()
+        self.restricted_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(owner, _)| owner.strong_count() > 0)
+    }
+
+    /// Root-loss-only authority: borrow the live H worker's exact old EX to
+    /// terminally fail accepted work. A weak slot cannot pin that owner itself.
+    pub fn restricted_owner_for_root_loss(&self) -> Option<Arc<topology::LeaderSession>> {
+        self.restricted_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(owner, _)| owner.upgrade())
+    }
+
+    pub fn orphan_root_loss_owner(&self) -> Option<Arc<topology::LeaderSession>> {
+        self.orphan_root_loss_owner.lock().unwrap().clone()
+    }
+
+    pub fn clear_orphan_root_loss_owner(&self) {
+        self.orphan_root_loss_owner.lock().unwrap().take();
     }
 
     pub fn restricted_predecessor_read(&self) -> Result<EvidenceResponse> {
@@ -7468,6 +7537,9 @@ impl Store {
             .unwrap()
             .clone()
             .ok_or_else(|| topology::IndexNotReady::new("owner has not proved a predecessor"))?;
+        let owner = owner
+            .upgrade()
+            .ok_or_else(|| topology::IndexNotReady::new("restricted EX owner was released"))?;
         self.evidence_response_pre_h(&permit, owner)
     }
 
@@ -12761,7 +12833,12 @@ mod selected_manifest_query_plan_tests {
                 }
                 "intervening_owner" => {
                     let intermediate = store.leader_session().unwrap();
+                    assert!(store.restricted_owner_associated());
                     drop(intermediate);
+                    assert!(
+                        !store.restricted_owner_associated(),
+                        "abandoned EX remained held"
+                    );
                 }
                 "root_replaced" => {
                     fs::rename(work.path(), work.path().with_extension("old")).unwrap();
@@ -12770,7 +12847,10 @@ mod selected_manifest_query_plan_tests {
                 _ => unreachable!(),
             }
             let probe = store.clone();
+            let hook_seen = Arc::new(AtomicBool::new(false));
+            let seen = hook_seen.clone();
             store.set_leader_before_metadata_hook_for_tests(move || {
+                seen.store(true, Ordering::Release);
                 assert!(
                     probe.restricted_predecessor_read().is_err(),
                     "{damaged}: unproved head was admitted before metadata validation"
@@ -12780,6 +12860,15 @@ mod selected_manifest_query_plan_tests {
             if damaged == "root_replaced" {
                 assert!(outcome.is_err());
                 assert!(!store.restricted_owner_associated());
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "{damaged}: second EX acquisition: {outcome:?}"
+                );
+                assert!(
+                    hook_seen.load(Ordering::Acquire),
+                    "{damaged}: metadata hook never ran"
+                );
             }
         }
     }

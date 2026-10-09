@@ -1182,3 +1182,227 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     answer.finish(()).unwrap();
     assert!(old.evidence_response().is_err());
 }
+
+async fn root_loss_restricted_ex_case(with_serving_owner: bool) {
+    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
+    use std::sync::{Arc, atomic::AtomicU64};
+    let base = tempfile::tempdir().unwrap();
+    let work = base.path().join("work");
+    let moved = base.path().join("moved");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("a.js"), "function previous() {}\n").unwrap();
+    let id = identity(&work);
+    let topology = roots(base.path());
+    let requests_db = topology.requests_db(&id);
+    let store = Store::open(topology.clone(), identity(&work)).unwrap();
+    let options = IndexOptions::new(work.clone());
+    let first = establish_serving_session(
+        &store,
+        Some(&options),
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    let prior = store.evidence_response().unwrap();
+    let epoch = Arc::new(AtomicU64::new(1));
+    store.bind_runtime_epoch(epoch.clone());
+    store.remember_read_only_predecessor(&prior, epoch).unwrap();
+    drop(prior);
+    drop(first);
+    let restricted = store.leader_session().unwrap();
+    assert!(store.restricted_owner_associated());
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    if with_serving_owner {
+        state.retain_serving_session_without_tick_for_tests(restricted.clone());
+    }
+    // In the other case only the H worker owns EX. The weak association must
+    // let the root-loss tick borrow it until durable FIFO failure completes.
+    let h_worker_owner = (!with_serving_owner).then(|| restricted.clone());
+    drop(restricted);
+    fs::rename(&work, &moved).unwrap();
+    fs::create_dir(&work).unwrap();
+    state.force_root_transition_tick_for_tests().unwrap();
+    let db = rusqlite::Connection::open(requests_db).unwrap();
+    let (result, reason): (String, String) = db
+        .query_row(
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&accepted.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (result.as_str(), reason.as_str()),
+        ("failed", "root_changed")
+    );
+    drop(db);
+    assert_eq!(
+        state.root_loss_retirement_for_tests(),
+        (false, false, false)
+    );
+    assert!(
+        !store.restricted_owner_associated(),
+        "root-loss retained old restricted EX"
+    );
+    drop(h_worker_owner);
+    fs::remove_dir(&work).unwrap();
+    fs::rename(&moved, &work).unwrap();
+    let fresh = topology
+        .leader(&id)
+        .expect("returned old root can acquire EX promptly");
+    assert!(fresh.verify().is_ok());
+}
+
+#[tokio::test]
+async fn root_loss_drops_restricted_ex_before_old_path_returns() {
+    root_loss_restricted_ex_case(false).await;
+    root_loss_restricted_ex_case(true).await;
+}
+
+async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
+    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let base = tempfile::tempdir().unwrap();
+    let work = base.path().join("work");
+    let moved = base.path().join("old-work");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("a.js"), "function old() {}\n").unwrap();
+    let id = identity(&work);
+    let topology = roots(base.path());
+    let requests_db = topology.requests_db(&id);
+    let store = Store::open(topology.clone(), identity(&work)).unwrap();
+    let options = IndexOptions::new(work.clone());
+    let initial =
+        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
+            .unwrap();
+    let prior = store.evidence_response().unwrap();
+    let epoch = Arc::new(AtomicU64::new(1));
+    store.bind_runtime_epoch(epoch.clone());
+    store.remember_read_only_predecessor(&prior, epoch).unwrap();
+    drop(prior);
+    drop(initial);
+    let accepted = store.enqueue_request(&options, None).unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7332".parse().unwrap(),
+    )
+    .unwrap();
+    let entered = Arc::new(AtomicBool::new(false));
+    let mark = entered.clone();
+    let to_move = work.clone();
+    let destination = moved.clone();
+    store.set_leader_before_metadata_hook_for_tests(move || {
+        fs::rename(&to_move, &destination).unwrap();
+        fs::create_dir(&to_move).unwrap();
+        mark.store(true, Ordering::Release);
+    });
+    let external_writer = if block_fifo_write {
+        let db = rusqlite::Connection::open(&requests_db).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        Some(db)
+    } else {
+        None
+    };
+    assert!(
+        store.leader_session().is_err(),
+        "metadata admission must fail on root drift"
+    );
+    assert!(
+        entered.load(Ordering::Acquire),
+        "post-EX metadata hook never ran"
+    );
+    if let Some(db) = external_writer {
+        assert!(
+            store.orphan_root_loss_owner().is_some(),
+            "inconclusive write lost EX"
+        );
+        db.execute_batch("ROLLBACK").unwrap();
+    }
+    state.force_root_transition_tick_for_tests().unwrap();
+    let db = rusqlite::Connection::open(requests_db).unwrap();
+    let (result, reason): (String, String) = db
+        .query_row(
+            "SELECT state,error_code FROM requests WHERE id=?1",
+            [&accepted.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (result.as_str(), reason.as_str()),
+        ("failed", "root_changed")
+    );
+    drop(db);
+    assert!(!store.restricted_owner_associated());
+    assert!(store.orphan_root_loss_owner().is_none());
+    fs::remove_dir(&work).unwrap();
+    fs::rename(&moved, &work).unwrap();
+    let owner = topology
+        .leader(&id)
+        .expect("old EX retired after durable root loss");
+    assert!(owner.verify().is_ok());
+}
+
+#[tokio::test]
+async fn failed_metadata_admission_disposes_old_root_fifo_before_ex_release() {
+    failed_metadata_root_fifo_case(false).await;
+    failed_metadata_root_fifo_case(true).await;
+}
+
+#[tokio::test]
+async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
+    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64},
+    };
+    let base = tempfile::tempdir().unwrap();
+    let work = base.path().join("work");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("a.js"), "function source() {}\n").unwrap();
+    let topology = roots(base.path());
+    let store = Store::open(topology, identity(&work)).unwrap();
+    let options = IndexOptions::new(work.clone());
+    let initial =
+        establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
+            .unwrap();
+    let prior = store.evidence_response().unwrap();
+    let epoch = Arc::new(AtomicU64::new(1));
+    store.bind_runtime_epoch(epoch.clone());
+    store.remember_read_only_predecessor(&prior, epoch).unwrap();
+    drop(prior);
+    drop(initial);
+    let restricted = store.leader_session().unwrap();
+    assert!(store.restricted_owner_associated());
+    let _accepted = store.enqueue_request(&options, None).unwrap();
+    let state = http::new(
+        store.clone(),
+        options,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        "127.0.0.1:7333".parse().unwrap(),
+    )
+    .unwrap();
+    state.retain_serving_session_without_tick_for_tests(restricted.clone());
+    drop(restricted);
+    store.force_recreate_pending_for_tests();
+    let result = state.force_root_transition_tick_for_tests();
+    assert!(
+        !store.restricted_owner_associated(),
+        "exceptional path kept pre-H read slot"
+    );
+    if let Err(error) = result {
+        assert!(
+            !format!("{error:#}").contains("storage_busy"),
+            "EX remained held during recreate: {error:#}"
+        );
+    }
+}
