@@ -229,6 +229,10 @@ pub struct Store {
     #[cfg(test)]
     test_exclusive_recovery_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
+    test_after_replacement_validation: Arc<TestOneShotHook>,
+    #[cfg(test)]
+    test_claim_before_commit_hook: Arc<TestOneShotHook>,
+    #[cfg(test)]
     test_refresh_between_check_and_open: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -5379,6 +5383,10 @@ impl Store {
             #[cfg(test)]
             test_exclusive_recovery_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
+            test_after_replacement_validation: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
+            test_claim_before_commit_hook: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
             test_refresh_between_check_and_open: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -6107,6 +6115,8 @@ impl Store {
                     classified_marker: initial_marker.clone(),
                 });
             }
+            #[cfg(test)]
+            self.test_after_replacement_validation.run();
             leader.downgrade_use_to_shared()?;
             leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
             self.identity.verify()?;
@@ -6346,6 +6356,14 @@ impl Store {
         }
     }
     fn mark_recovery(&self, disposition: RecoveryDisposition) {
+        if matches!(
+            disposition,
+            RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
+        ) {
+            // A previously attested H cannot authorize FIFO claims through
+            // exceptional replacement, even under the SAME leader EX.
+            *self.reconciled_leader.lock().unwrap() = None;
+        }
         self.recovery_disposition
             .fetch_max(disposition as u8, Ordering::AcqRel);
         self.recovery_required.store(true, Ordering::Release);
@@ -7216,22 +7234,56 @@ impl Store {
     }
     /// The public Store::claim_request entry point must refuse pre-COMMIT
     /// claims, including the leader's own request and direct API callers.
+    pub(crate) fn claim_authority_guard(
+        &self,
+        session: &topology::LeaderSession,
+    ) -> Result<topology::UseGuard> {
+        // Nonblocking gate first; no queue transaction can start under a
+        // successor's sidecar EX. Hold this SH through claim COMMIT.
+        let gate = self.roots.sidecar_mutation_shared(&self.identity)?;
+        self.verify_reconciled_leader_claim(session)?;
+        Ok(gate)
+    }
     pub(crate) fn verify_reconciled_leader_claim(
         &self,
         session: &topology::LeaderSession,
     ) -> Result<()> {
+        ensure!(
+            self.disposition() == RecoveryDisposition::Ready
+                && !self.recovery_required.load(Ordering::Acquire),
+            "index_not_ready: mandatory exceptional H not attested"
+        );
         self.verify_leader_session(session)?;
-        if *self.reconciled_leader.lock().unwrap() != Some(session.incarnation()) {
-            return Err(topology::IndexNotReady::new(
-                "mandatory leader reconciliation not committed",
-            )
-            .into());
-        }
-        // A later request's failed publication can leave the selected-read
-        // latch closed until retry, but cannot undo this leader's committed H.
-        // Root/EX/marker verification still fences every claim. The selected
-        // revision itself is attested when the proof is minted after COMMIT.
-        self.verify_leader_session(session)
+        ensure!(
+            *self.reconciled_leader.lock().unwrap() == Some(session.incarnation()),
+            "index_not_ready: mandatory leader reconciliation not committed"
+        );
+        // A readable prior head is not claim authority. Prove the current
+        // selected FULL pair and exact H marker inside this claim's own read
+        // snapshot, including when called inside requests.db BEGIN IMMEDIATE.
+        let db = self.cache()?;
+        let baseline = self.recovery_baseline_full(&db)?;
+        let selected = ReadRevision::current(&db)?;
+        let marker: Option<String> = db.query_row(
+            "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            baseline.compatible
+                && baseline.pin() == Some(selected.pin)
+                && selected.pin.index_revision > 0
+                && marker.as_deref() == Some(session.incarnation().to_string().as_str()),
+            "index_not_ready: current selected H/pin does not match claim owner"
+        );
+        self.verify_leader_session(session)?;
+        ensure!(
+            self.disposition() == RecoveryDisposition::Ready
+                && !self.recovery_required.load(Ordering::Acquire)
+                && *self.reconciled_leader.lock().unwrap() == Some(session.incarnation()),
+            "index_not_ready: claim authority changed before commit"
+        );
+        Ok(())
     }
     fn compose_selected_class_catalog(
         graph: &Graph,
@@ -13485,6 +13537,7 @@ mod rebaseline_fault_tests {
             .unwrap()
             .release_sidecar_mutation_gate()
             .unwrap();
+        let q1 = store.enqueue_request(&options, Some(first)).unwrap();
         let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
         db.execute_batch(
             "PRAGMA ignore_check_constraints=ON;
@@ -13498,12 +13551,134 @@ mod rebaseline_fault_tests {
             .expect("obsolete evidence refused");
         assert!(error.to_string().contains("recovery_required"), "{error:#}");
         assert_eq!(store.disposition(), RecoveryDisposition::RecreatePending);
+        assert!(
+            store.claim_request(&owner).is_err(),
+            "cached old H must not claim Q1 after exceptional classification"
+        );
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
         let (pin, same) = store
             .recreate_pending_with_owner(&owner, &options, &cancel)
             .unwrap();
         assert!(Arc::ptr_eq(&owner, &same));
         assert_ne!(pin.index_generation, first.index_generation);
         assert_eq!(store.status().unwrap().revision, pin);
+        let claimed = store.claim_request(&same).unwrap().unwrap();
+        assert_eq!(claimed.id, q1.id);
+        store.finish_request(&same, &claimed, Ok(pin)).unwrap();
+        assert_eq!(store.request_by_id(&q1.id).unwrap().unwrap().state, "done");
+    }
+
+    #[test]
+    fn direct_fifo_claim_holds_native_mutation_sh_through_durable_commit() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let owner = store.leader_session().unwrap();
+        let first = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        store
+            .attest_post_acquisition_reconciliation(&owner, first)
+            .unwrap();
+        let q1 = store.enqueue_request(&options, Some(first)).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        store.test_claim_before_commit_hook.set(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        });
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| store.claim_request(&owner));
+            entered_rx.recv().unwrap();
+            assert!(
+                store
+                    .roots
+                    .sidecar_mutation_exclusive(&store.identity)
+                    .is_err(),
+                "successor H EX must not enter claim's pre-COMMIT interval"
+            );
+            resume_tx.send(()).unwrap();
+            let claimed = worker.join().unwrap().unwrap().unwrap();
+            assert_eq!(claimed.id, q1.id);
+            store.finish_request(&owner, &claimed, Ok(first)).unwrap();
+            assert_eq!(store.request_by_id(&q1.id).unwrap().unwrap().state, "done");
+        });
+    }
+
+    #[test]
+    fn direct_fifo_claim_refused_after_replacement_rename_before_same_owner_h_attestation() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let owner = store.leader_session().unwrap();
+        let first = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        owner
+            .leader_guard()
+            .unwrap()
+            .release_sidecar_mutation_gate()
+            .unwrap();
+        let q1 = store.enqueue_request(&options, Some(first)).unwrap();
+        let db = Connection::open(store.roots.index_db(&store.identity)).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+        drop(db);
+        assert!(store.evidence_response().is_err());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        store.test_after_replacement_validation.set(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        });
+        std::thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| store.recreate_pending_with_owner(&owner, &options, &cancel));
+            entered_rx.recv().unwrap();
+            let refused = store.claim_request(&owner).unwrap_err();
+            assert!(
+                refused.to_string().contains("storage_busy")
+                    || refused.to_string().contains("index_not_ready"),
+                "{refused:#}"
+            );
+            resume_tx.send(()).unwrap();
+            let (pin, same) = worker.join().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&owner, &same));
+            let claimed = store.claim_request(&same).unwrap().unwrap();
+            assert_eq!(claimed.id, q1.id);
+            store.finish_request(&same, &claimed, Ok(pin)).unwrap();
+            assert_eq!(store.request_by_id(&q1.id).unwrap().unwrap().state, "done");
+        });
     }
 
     #[test]

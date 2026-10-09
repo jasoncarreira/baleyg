@@ -957,10 +957,10 @@ impl Store {
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
         // EX ownership alone is not authority to claim. The same incarnation
         // must first commit and attest its selected post-acquisition H.
-        self.verify_reconciled_leader_claim(session)?;
+        let _claim_gate = self.claim_authority_guard(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.verify_leader_session(session)?;
+        self.verify_reconciled_leader_claim(session)?;
         let row=tx.query_row(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"), [],read).optional()?;
         let Some(row) = row else { return Ok(None) };
         self.verify_request_root(&Some(row.clone()))?;
@@ -977,7 +977,11 @@ impl Store {
             [row.seq],
             read,
         )?;
+        self.verify_reconciled_leader_claim(session)?;
+        #[cfg(test)]
+        self.test_claim_before_commit_hook.run();
         tx.commit()?;
+        // _claim_gate remains held through the durable queue commit.
         Ok(Some(claimed))
     }
     /// Resolve an operational publish BUSY before retrying an accepted claim.
