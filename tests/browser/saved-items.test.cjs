@@ -126,13 +126,22 @@ async function startDaemon(paths, expectedRevision) {
     }
     const selected = {child, base, stderr:() => stderr};
     const discoveryDeadline = Date.now()+25000;
+    let lastBusyRow = null;
     while (Date.now() < discoveryDeadline) {
       const listing = await api(base,paths.token,"GET","/api/checkouts");
       assert.equal(listing.status,200,JSON.stringify(listing.data));
-      const rows = listing.data.checkouts.filter(row => row.workspaceRoot === realpathSync(paths.workspace) && row.state === "available");
-      assert.equal(rows.length,1,`expected one available workspace: ${JSON.stringify(listing.data)}`);
-      selected.rootKey = rows[0].rootKey;
-      assert.match(selected.rootKey,/^[a-f0-9]{64}$/);
+      const rows = listing.data.checkouts.filter(row => row.workspaceRoot === realpathSync(paths.workspace));
+      assert.equal(rows.length,1,`expected exactly one matching workspace: ${JSON.stringify(listing.data)}`);
+      const row = rows[0];
+      assert.ok(typeof row.rootKey === "string" && /^[a-f0-9]{64}$/.test(row.rootKey),`invalid checkout key: ${JSON.stringify(row)}`);
+      if (row.state === "storage_busy") {
+        lastBusyRow = row;
+        await delay(50);
+        continue;
+      }
+      assert.equal(row.state,"available",`checkout is not selectable: ${JSON.stringify(row)}`);
+      lastBusyRow = null;
+      selected.rootKey = row.rootKey;
       const status = await api(base,paths.token,"GET",scoped(selected.rootKey,"status"));
       if (status.status === 200) {
         if (status.data.revision?.indexRevision === expectedRevision) return selected;
@@ -142,7 +151,7 @@ async function startDaemon(paths, expectedRevision) {
       assert.equal(status.status,503,JSON.stringify(status.data));
       await delay(50);
     }
-    throw new Error(`selected checkout did not become ready: ${stderr.replaceAll(paths.token,"[redacted]")}`);
+    throw new Error(`selected checkout did not become ready within 25s${lastBusyRow ? `: persistent ${JSON.stringify(lastBusyRow)}` : ""}: ${stderr.replaceAll(paths.token,"[redacted]")}`);
   } catch (error) { child.kill("SIGTERM"); throw error; }
 }
 async function stopDaemon(server) {
