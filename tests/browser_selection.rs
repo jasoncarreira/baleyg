@@ -1901,7 +1901,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 }
 
 #[tokio::test]
-async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
+async fn selected_status_serves_committed_head_before_h_and_clears_freshness_after_h() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -2040,8 +2040,8 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             changed,
         )
         .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
+        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "storage_busy");
         assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
         let (code, _, body) = selected_json(
             app.clone(),
@@ -2050,8 +2050,8 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             Value::Null,
         )
         .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
+        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "storage_busy");
     }
     let records = baleyg::store::topology::DurableRecords::new(&roots, &identity);
     assert_eq!(
@@ -2886,7 +2886,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
 }
 
 #[tokio::test]
-async fn selected_reads_validated_predecessor_through_owner_handoff() {
+async fn selected_reads_committed_head_through_owner_handoff() {
     use baleyg::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
@@ -2983,10 +2983,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         selected_json(pending_browser, "GET", &files_path, Value::Null).await
     });
     // The owner remains paused *before* SQLite metadata validation. A proved
-    // predecessor must answer without waiting for that validation or H.
+    // prior published head must answer without waiting for that validation or H.
     let (code, headers, files) = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
-        .expect("proved predecessor waited for metadata validation")
+        .expect("published head waited for metadata validation")
         .unwrap();
     assert_eq!(code, axum::http::StatusCode::OK, "{files}");
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
@@ -3000,14 +3000,14 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     .await;
     assert_eq!(
         mutation_code,
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::http::StatusCode::CONFLICT,
         "{mutation_body}"
     );
-    assert_eq!(mutation_body["error"]["code"], "index_not_ready");
+    assert_eq!(mutation_body["error"]["code"], "storage_busy");
     let owner_paused_at = std::time::Instant::now();
     tokio::time::sleep(Duration::from_millis(310)).await;
     eprintln!(
-        "restricted predecessor served before owner validation; metadata held {:?}",
+        "coherent published head served before owner validation; metadata held {:?}",
         owner_paused_at.elapsed()
     );
     // This request ARRIVES after the old 250ms wait cap, while owner SQLite
