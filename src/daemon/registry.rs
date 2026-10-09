@@ -334,6 +334,22 @@ impl CheckoutRegistry {
         {
             return Ok(false);
         }
+        if let RuntimePhase::HOwned(session) | RuntimePhase::Ready(session) = &*phase {
+            // A read-only SELECT may miss an uncommitted Q1 held by another
+            // BEGIN IMMEDIATE. Before dropping ANY old EX, serialize its
+            // root-loss terminal write under that exact owner's proof.
+            match resources.store.root_path_replaced() {
+                Ok(false) => {}
+                Ok(true) if session.is_leader() => {
+                    if resources.store.fail_changed_root_requests(session).is_err()
+                        || !resources.store.root_path_replaced().is_ok_and(|lost| lost)
+                    {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
         runtime.active.store(false, Ordering::Release);
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
@@ -1418,6 +1434,11 @@ impl CheckoutRuntime {
     }
 
     fn queue_pending(resources: &ActiveResources) -> bool {
+        // A failed old-root write may hide an uncommitted Q1 from SELECT.
+        // Its orphaned exact EX remains busy until a serialized terminal proof.
+        if resources.store.orphan_root_loss_owner().is_some() {
+            return true;
+        }
         if resources.scheduler.checkout_root_loss_retired() {
             !matches!(resources.store.old_root_unfinished_request(), Ok(None))
         } else {
@@ -1595,16 +1616,35 @@ impl CheckoutRuntime {
             return false;
         }
         let mut phase = self.phase.lock().unwrap();
-        match &*phase {
-            RuntimePhase::HOwned(session) => {
-                if resources.store.fail_changed_root_requests(session).is_err() {
+        // The Store can acquire EX and fail metadata admission before our
+        // on_owner callback receives an Arc. RootLossOwnerLease then retains
+        // that exact owner as an orphan. A read-only empty queue probe cannot
+        // observe another writer's uncommitted BEGIN IMMEDIATE row.
+        let orphan = resources.store.orphan_root_loss_owner();
+        let owner = match (&*phase, orphan.as_ref()) {
+            (RuntimePhase::HOwned(session), Some(orphan)) => {
+                if !Arc::ptr_eq(session, orphan) {
                     return false;
                 }
+                Some(session.clone())
             }
-            _ if !matches!(resources.store.old_root_unfinished_request(), Ok(None)) => {
+            (RuntimePhase::HOwned(session), None) => Some(session.clone()),
+            (_, Some(orphan)) => Some(orphan.clone()),
+            _ => None,
+        };
+        if let Some(owner) = owner {
+            if resources.store.fail_changed_root_requests(&owner).is_err()
+                || !resources.store.root_path_replaced().is_ok_and(|lost| lost)
+            {
+                // Never clear either EX lease after BUSY, ambiguous COMMIT or
+                // unstable moved-root proof. Retry under the same owner.
                 return false;
             }
-            _ => {}
+            if orphan.is_some() {
+                resources.store.clear_orphan_root_loss_owner();
+            }
+        } else if !matches!(resources.store.old_root_unfinished_request(), Ok(None)) {
+            return false;
         }
         *phase = RuntimePhase::Reconciling;
         true
