@@ -299,6 +299,12 @@ impl CheckoutRegistry {
             .idle_epochs
             .remove(key)
             .unwrap_or_else(|| Arc::new(AtomicU64::new(1)));
+        // Epoch binding exists even for cold H: a later independently verified
+        // publication can supply a predecessor without a selected read.
+        store.bind_runtime_epoch(epoch.clone());
+        if let Ok(read) = store.evidence_response() {
+            let _ = store.remember_read_only_predecessor(&read, epoch.clone());
+        }
         let runtime = Arc::new(CheckoutRuntime {
             resources: std::sync::Mutex::new(Some(Arc::new(ActiveResources { store, scheduler }))),
             epoch,
@@ -346,6 +352,7 @@ impl CheckoutRegistry {
         runtime.epoch.fetch_add(1, Ordering::AcqRel);
         let permit = runtime.release_permit(&phase, &resources).ok().flatten();
         runtime.active.store(false, Ordering::Release);
+        resources.store.notify_owner_validation_release();
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
         runtime.resources.lock().unwrap().take();
@@ -1413,6 +1420,15 @@ impl CheckoutRuntime {
     }
 
     #[doc(hidden)]
+    pub fn set_leader_before_metadata_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(resources) = self.resources() {
+            resources
+                .store
+                .set_leader_before_metadata_hook_for_tests(hook);
+        }
+    }
+
+    #[doc(hidden)]
     pub fn set_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(resources) = self.resources() {
             resources
@@ -1450,6 +1466,13 @@ impl CheckoutRuntime {
     /// Snapshot freshness and the read basis are sampled under the same phase
     /// lock. The Store's own finish fence then validates the admitted revision.
     pub fn evidence_response(&self) -> anyhow::Result<(CheckoutEvidence, bool)> {
+        self.evidence_response_with_validation_wait(true)
+    }
+
+    fn evidence_response_with_validation_wait(
+        &self,
+        allow_wait: bool,
+    ) -> anyhow::Result<(CheckoutEvidence, bool)> {
         let mut phase = self.phase.lock().unwrap();
         anyhow::ensure!(
             self.active.load(Ordering::Acquire),
@@ -1461,12 +1484,60 @@ impl CheckoutRuntime {
             || !matches!(*phase, RuntimePhase::Ready(_))
             || resources.scheduler.checkout_watch_pending()
             || Self::queue_pending(&resources);
-        let response = match &*phase {
+        let admitted = match &*phase {
             RuntimePhase::Transitional(permit, leader) => resources
                 .store
-                .evidence_response_pre_h(permit, leader.clone())?,
+                .evidence_response_pre_h(permit, leader.clone()),
             RuntimePhase::Reconciling | RuntimePhase::Ready(_) => {
-                resources.store.evidence_response()?
+                resources.store.evidence_response()
+            }
+        };
+        let response = match admitted {
+            Ok(response) => response,
+            Err(error) => {
+                if !allow_wait
+                    || error
+                        .downcast_ref::<crate::store::topology::IndexNotReady>()
+                        .is_none()
+                    || !resources
+                        .store
+                        .has_read_only_predecessor_for_epoch(&self.epoch)
+                {
+                    return Err(error);
+                }
+                resources.store.verify_root()?;
+                let epoch = self.epoch.load(Ordering::Acquire);
+                // The gate begins before a new EX may write its incarnation.
+                // Do not hold phase/registry locks while it publishes proof.
+                drop(phase);
+                if !resources.store.restricted_owner_associated()
+                    && resources.store.owner_validation_pending()
+                    && !resources
+                        .store
+                        .wait_for_restricted_owner(Duration::from_secs(5))
+                {
+                    return Err(error);
+                }
+                anyhow::ensure!(
+                    self.active.load(Ordering::Acquire)
+                        && self.epoch.load(Ordering::Acquire) == epoch,
+                    "index_not_ready: checkout epoch changed"
+                );
+                resources.store.verify_root()?;
+                if let Ok(response) = resources.store.restricted_predecessor_read() {
+                    self.active_reads.fetch_add(1, Ordering::AcqRel);
+                    return Ok((
+                        CheckoutEvidence {
+                            response,
+                            reads: self.active_reads.clone(),
+                            selection: None,
+                        },
+                        true,
+                    ));
+                }
+                // Metadata may already be rebound by the time this task runs.
+                // One fresh strict admission then decides; never infer a head.
+                return self.evidence_response_with_validation_wait(false);
             }
         };
         self.active_reads.fetch_add(1, Ordering::AcqRel);
@@ -1549,11 +1620,25 @@ impl CheckoutRuntime {
                             break;
                         }
                         *runtime.phase.lock().unwrap() = RuntimePhase::Ready(session);
+                        if let Ok(resources) = runtime.resources()
+                            && let Ok(read) = resources.store.evidence_response()
+                            && let Ok(status) = read.status()
+                            && let Ok(status) = read.finish(status)
+                            && status.evidence_format.is_some()
+                            && status.revision.index_revision > 0
+                        {
+                            let _ = resources
+                                .store
+                                .remember_read_only_predecessor(&read, runtime.epoch.clone());
+                        }
                         *runtime.last_error.lock().unwrap() = None;
                         runtime.h_in_flight.store(false, Ordering::Release);
                         break;
                     }
                     result => {
+                        if let Ok(resources) = runtime.resources() {
+                            resources.store.revoke_restricted_predecessor();
+                        }
                         {
                             let mut failure = runtime.last_error.lock().unwrap();
                             if failure.is_none() {

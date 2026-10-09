@@ -1247,6 +1247,9 @@ impl DaemonState {
                             Err(error) => Err(error),
                         }
                     })();
+                // The restricted read association cannot retain a failed EX.
+                // Successful H already replaced it with strict current proof.
+                self.store.revoke_restricted_predecessor();
                 match takeover {
                     Ok(session) if session.is_leader() => {
                         self.replace_serving_session(Some(session));
@@ -1362,6 +1365,7 @@ impl DaemonState {
                     }
                     Ok(Some(processed))
                 })();
+                self.store.revoke_restricted_predecessor();
                 let recorded_completion = if outcome.is_ok() || mandatory_reconcile_incomplete {
                     Ok(false)
                 } else {

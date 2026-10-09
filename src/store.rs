@@ -60,6 +60,50 @@ impl RetentionClock {
 // A single process/root gate serializes maintenance with the entire publication
 // lifetime, including terminal ACK. Independent Store instances share the gate.
 #[derive(Debug, Default)]
+struct OwnerValidation {
+    state: Mutex<OwnerValidationState>,
+    changed: Condvar,
+}
+#[derive(Debug, Default)]
+struct OwnerValidationState {
+    pending: bool,
+    associated: bool,
+    serial: u64,
+}
+
+/// Only metadata revalidation ends this interval. H publication is separate.
+struct OwnerValidationLease(Arc<OwnerValidation>);
+impl Drop for OwnerValidationLease {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.pending = false;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.0.changed.notify_all();
+    }
+}
+
+type RestrictedOwnerSlot = Arc<Mutex<Option<(Arc<topology::LeaderSession>, PreHReadPermit)>>>;
+struct RestrictedAssociationGuard {
+    slot: RestrictedOwnerSlot,
+    incarnation: uuid::Uuid,
+    armed: bool,
+}
+impl Drop for RestrictedAssociationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut slot = self.slot.lock().unwrap();
+            if slot
+                .as_ref()
+                .is_some_and(|(owner, _)| owner.incarnation() == self.incarnation)
+            {
+                slot.take();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct PublicationGate {
     state: Mutex<GateState>,
     changed: Condvar,
@@ -133,7 +177,7 @@ pub enum MaintenanceOutcome {
     Progress,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
     identity: Arc<topology::WorkspaceIdentity>,
@@ -141,6 +185,10 @@ pub struct Store {
     maintenance_busy_attempts: Arc<AtomicU64>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
+    owner_validation: Arc<OwnerValidation>,
+    runtime_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    read_only_predecessor: Arc<Mutex<Option<PreHReadPermit>>>,
+    restricted_predecessor: RestrictedOwnerSlot,
     recovery_disposition: Arc<AtomicU8>,
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
@@ -154,6 +202,7 @@ pub struct Store {
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
+    leader_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -175,6 +224,15 @@ pub struct Store {
     #[cfg(test)]
     test_publish_post_commit_busy_once: Arc<AtomicBool>,
 }
+impl std::fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("workspace_root", &self.workspace_root)
+            .finish_non_exhaustive()
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryDisposition {
@@ -5463,6 +5521,10 @@ impl Store {
             identity: Arc::new(identity),
             maintenance_busy_attempts: Arc::new(AtomicU64::new(0)),
             recovery_required: Arc::new(AtomicBool::new(false)),
+            owner_validation: Arc::new(OwnerValidation::default()),
+            runtime_epoch: Arc::new(Mutex::new(None)),
+            read_only_predecessor: Arc::new(Mutex::new(None)),
+            restricted_predecessor: Arc::new(Mutex::new(None)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
             pending_request_completion: Arc::new(Mutex::new(None)),
@@ -5479,6 +5541,7 @@ impl Store {
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
+            leader_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -6319,6 +6382,16 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
+        self.leader_with_owner(before_write, |guard| guard, |guard| guard, |_| Ok(false))
+    }
+
+    fn leader_with_owner<T>(
+        &self,
+        before_write: impl FnOnce(&Connection) -> Result<()>,
+        wrap: impl FnOnce(topology::LeaderGuard) -> T,
+        guard: impl Fn(&T) -> &topology::LeaderGuard,
+        publish: impl FnOnce(&T) -> Result<bool>,
+    ) -> Result<T> {
         // Leader startup has its own live data_version→COMMIT interval before
         // coordinator preparation. Do not recursively acquire the gate inside
         // the coordinator: it enters publication only AFTER leader_session().
@@ -6331,10 +6404,38 @@ impl Store {
             self.cache()
                 .map_err(|error| self.report_live_read_failure(error))?,
         );
-        let leader = self.roots.leader(&self.identity)?;
-        // The leader incarnation is already durable. From this point every clone
-        // must remain closed unless a complete paired publication commits.
+        // A watcher or external CLI may have published B since activation or
+        // the last selected read of A. Refresh only from a finished strict
+        // read under the still-verifiable old owner, retaining this runtime's
+        // epoch. A lost/ambiguous old owner never supplies a new permit.
+        let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
+        if let Some(epoch) = prior_epoch
+            && let Ok(read) = self.evidence_response()
+        {
+            let _ = self.remember_read_only_predecessor(&read, epoch);
+        }
+        // Start the read-admission interval BEFORE flock acquisition writes a
+        // durable new incarnation. Acquiring the lock can fail; RAII wakes any
+        // waiting reader on that path too. Old verified owner reads still use
+        // their normal strict admission while its lock is unchanged.
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.pending = true;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        drop(state);
+        let _validation = OwnerValidationLease(self.owner_validation.clone());
+        let owner = wrap(self.roots.leader(&self.identity)?);
+        let leader = guard(&owner);
+        // This incarnation is durable, but the old SQLite marker has not yet
+        // been validated or rebound. Never serve unproven evidence here.
         self.recovery_required.store(true, Ordering::Release);
+        let associated = publish(&owner)?;
+        let mut association_guard = RestrictedAssociationGuard {
+            slot: self.restricted_predecessor.clone(),
+            incarnation: leader.incarnation,
+            armed: associated,
+        };
+        self.leader_before_metadata_hook.run();
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
         let mut db = self
@@ -6381,7 +6482,8 @@ impl Store {
         if prior_readable && self.disposition() == RecoveryDisposition::Ready {
             self.recovery_required.store(false, Ordering::Release);
         }
-        Ok(leader)
+        association_guard.armed = false;
+        Ok(owner)
     }
     fn cache(&self) -> Result<IndexConnection> {
         self.connect_index(false)
@@ -6782,6 +6884,53 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
+    /// Wait only for the new owner's metadata validation, never for H/FIFO.
+    /// The caller must already hold an independently validated prior head and
+    /// must retry full strict admission after this signal. Failure also wakes.
+    /// A selected read only waits for restricted EX proof, not owner metadata
+    /// validation or mandatory H. The cap protects an unavailable owner.
+    pub fn wait_for_restricted_owner(&self, timeout: Duration) -> bool {
+        let state = self.owner_validation.state.lock().unwrap();
+        if state.associated {
+            return true;
+        }
+        if !state.pending {
+            return false;
+        }
+        let serial = state.serial;
+        let (state, _) = self
+            .owner_validation
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.pending && !state.associated && state.serial == serial
+            })
+            .unwrap();
+        state.associated
+    }
+
+    pub fn owner_validation_pending(&self) -> bool {
+        self.owner_validation.state.lock().unwrap().pending
+    }
+
+    /// Releasing a checkout cancels admitted waiters; no head is implied.
+    pub fn notify_owner_validation_release(&self) {
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.pending = false;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.owner_validation.changed.notify_all();
+        drop(state);
+        self.restricted_predecessor.lock().unwrap().take();
+    }
+
+    pub fn revoke_restricted_predecessor(&self) {
+        self.restricted_predecessor.lock().unwrap().take();
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.owner_validation.changed.notify_all();
+    }
+
     fn ensure_public_read_ready(&self) -> Result<()> {
         if !self.recovery_required.load(Ordering::Acquire) {
             return Ok(());
@@ -7016,10 +7165,34 @@ impl Store {
         Ok((pin, session))
     }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
-        Ok(Arc::new(topology::LeaderSession::leader(
-            self.leader()?,
-            self.identity.clone(),
-        )))
+        self.leader_with_owner(
+            |_| Ok(()),
+            |guard| {
+                Arc::new(topology::LeaderSession::leader(
+                    guard,
+                    self.identity.clone(),
+                ))
+            },
+            |session| session.leader_guard().expect("wrapped EX owner"),
+            |session| {
+                let Some(permit) = self.read_only_predecessor.lock().unwrap().clone() else {
+                    return Ok(false);
+                };
+                let guard = session.leader_guard()?;
+                if !permit.identity.matches(&self.identity)
+                    || guard.predecessor_incarnation != Some(permit.predecessor)
+                    || permit.epoch.load(Ordering::Acquire) != permit.captured_epoch
+                {
+                    return Ok(false);
+                }
+                *self.restricted_predecessor.lock().unwrap() = Some((session.clone(), permit));
+                let mut state = self.owner_validation.state.lock().unwrap();
+                state.associated = true;
+                state.serial = state.serial.wrapping_add(1);
+                self.owner_validation.changed.notify_all();
+                Ok(true)
+            },
+        )
     }
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
         session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
@@ -7081,6 +7254,7 @@ impl Store {
         self.identity.verify()?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         *self.reconciled_leader.lock().unwrap() = Some(marker);
+        self.revoke_restricted_predecessor();
         Ok(())
     }
     /// The public Store::claim_request entry point must refuse pre-COMMIT
@@ -7220,6 +7394,81 @@ impl Store {
             guard,
             self.identity.clone(),
         )))
+    }
+
+    /// Bind only the activated checkout's epoch, even when its first head is
+    /// cold. A later strict pre-takeover read may then prove a new current head.
+    pub fn bind_runtime_epoch(&self, epoch: Arc<AtomicU64>) {
+        *self.runtime_epoch.lock().unwrap() = Some(epoch);
+    }
+
+    /// A finished strict read can prove a predecessor for read-only rollover.
+    /// Unlike the idle leader permit, this never grants claim or H authority.
+    pub fn remember_read_only_predecessor(
+        &self,
+        response: &EvidenceResponse,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<()> {
+        let ReadFence::Current(_, predecessor) = &response.fence else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            PreHRootIdentity::from_identity(&self.identity).matches(&response.store.identity),
+            "index_not_ready: predecessor belongs to another checkout"
+        );
+        let status = response.status()?;
+        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
+            return Ok(());
+        }
+        response.finish(())?;
+        let permit = PreHReadPermit {
+            identity: PreHRootIdentity::from_identity(&self.identity),
+            pin: status.revision,
+            predecessor: *predecessor,
+            captured_epoch: epoch.load(Ordering::Acquire),
+            epoch,
+        };
+        let mut current = self.read_only_predecessor.lock().unwrap();
+        if let Some(previous) = current.as_ref() {
+            anyhow::ensure!(
+                Arc::ptr_eq(&previous.epoch, &permit.epoch),
+                "index_not_ready: predecessor belongs to another runtime epoch"
+            );
+            if previous.pin.index_generation == permit.pin.index_generation
+                && previous.pin.index_revision > permit.pin.index_revision
+            {
+                return Ok(());
+            }
+        }
+        *current = Some(permit);
+        Ok(())
+    }
+
+    pub fn has_read_only_predecessor_for_epoch(&self, epoch: &Arc<AtomicU64>) -> bool {
+        self.read_only_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|permit| {
+                permit.identity.matches(&self.identity)
+                    && Arc::ptr_eq(&permit.epoch, epoch)
+                    && permit.captured_epoch == epoch.load(Ordering::Acquire)
+            })
+    }
+
+    /// Restricted association is neither a serving owner nor an H proof.
+    pub fn restricted_owner_associated(&self) -> bool {
+        self.restricted_predecessor.lock().unwrap().is_some()
+    }
+
+    pub fn restricted_predecessor_read(&self) -> Result<EvidenceResponse> {
+        let (owner, permit) = self
+            .restricted_predecessor
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| topology::IndexNotReady::new("owner has not proved a predecessor"))?;
+        self.evidence_response_pre_h(&permit, owner)
     }
 
     /// Mint only from a normally admitted, finished complete head before idle release.
@@ -9568,6 +9817,15 @@ impl Store {
                 self.recovery_disposition
                     .store(RecoveryDisposition::Ready as u8, Ordering::Release);
                 self.recovery_required.store(false, Ordering::Release);
+                // A successful same-owner watcher publication can advance A→B
+                // without a browser read in between. Refresh only this Store's
+                // existing runtime epoch from a new strict, finished B read.
+                let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
+                if let Some(epoch) = prior_epoch
+                    && let Ok(read) = self.evidence_response()
+                {
+                    let _ = self.remember_read_only_predecessor(&read, epoch);
+                }
             }
             PublicationTarget::Stage(stage) => {
                 stage.verify_path()?;
@@ -9778,6 +10036,13 @@ impl Store {
         leader: &topology::LeaderGuard,
     ) -> Result<Option<u64>> {
         Ok(self.oldest_due_debt_age(leader)?.map(|age| age.as_secs()))
+    }
+
+    /// Pause after a new lock incarnation is durable but before validated
+    /// predecessor metadata is rebound. Integration tests use this seam only.
+    #[doc(hidden)]
+    pub fn set_leader_before_metadata_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.leader_before_metadata_hook.set(hook);
     }
 
     /// Deterministic rollback after a complete index rebuild but before COMMIT.
@@ -12389,6 +12654,134 @@ mod selected_manifest_query_plan_tests {
             !plan.iter().any(|step| step.starts_with("SCAN r")),
             "changing manifest scanned all revision headers: {plan:?}"
         );
+    }
+
+    #[test]
+    fn restricted_owner_uses_latest_committed_same_owner_head_without_selected_read() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("A.java");
+        fs::write(&source, "class A { int a() { return 1; } }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        let owner = store.leader_session().unwrap();
+        let epoch = Arc::new(AtomicU64::new(1));
+        store.bind_runtime_epoch(epoch.clone());
+        let a = store.evidence_response().unwrap();
+        store.remember_read_only_predecessor(&a, epoch).unwrap();
+        a.finish(()).unwrap();
+        drop(a);
+        fs::write(&source, "class A { int b() { return 2; } }\n").unwrap();
+        let b = IndexJobCoordinator::prepare_with_session(&store, None, owner.clone())
+            .unwrap()
+            .run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(
+            store
+                .read_only_predecessor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pin,
+            b
+        );
+        drop(owner);
+        let at = store.clone();
+        store.set_leader_before_metadata_hook_for_tests(move || {
+            let read = at
+                .restricted_predecessor_read()
+                .expect("latest B must be readable under proved successor EX");
+            assert_eq!(read.status().unwrap().revision, b);
+            assert!(read.require_mutation_ready().is_err());
+            read.finish(()).unwrap();
+        });
+        let new_owner = store.leader_session().unwrap();
+        assert!(store.verify_reconciled_leader_claim(&new_owner).is_err());
+    }
+
+    #[test]
+    fn restricted_owner_refuses_missing_corrupt_and_intervening_predecessors() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+
+        for damaged in [
+            "missing_marker",
+            "wrong_pin",
+            "intervening_owner",
+            "root_replaced",
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(
+                work.path().join("A.java"),
+                "class A { int old() { return 1; } }\n",
+            )
+            .unwrap();
+            let initial = Store::open_for_tests(state.path(), work.path()).unwrap();
+            IndexJobCoordinator::prepare(&initial, None)
+                .unwrap()
+                .run(
+                    &IndexOptions::new(work.path().to_owned()),
+                    &Arc::new(AtomicBool::new(false)),
+                    |_| {},
+                )
+                .unwrap();
+            let incumbent = initial.leader_session().unwrap();
+            drop(initial);
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let evidence = store.evidence_response().unwrap();
+            store
+                .remember_read_only_predecessor(&evidence, Arc::new(AtomicU64::new(1)))
+                .unwrap();
+            drop(evidence);
+            drop(incumbent);
+            match damaged {
+                "missing_marker" => {
+                    store
+                        .cache_write()
+                        .unwrap()
+                        .execute("UPDATE index_metadata SET reconciled_incarnation=NULL", [])
+                        .unwrap();
+                }
+                "wrong_pin" => {
+                    store
+                        .cache_write()
+                        .unwrap()
+                        .execute("UPDATE index_metadata SET index_revision=0", [])
+                        .unwrap();
+                }
+                "intervening_owner" => {
+                    let intermediate = store.leader_session().unwrap();
+                    drop(intermediate);
+                }
+                "root_replaced" => {
+                    fs::rename(work.path(), work.path().with_extension("old")).unwrap();
+                    fs::create_dir(work.path()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let probe = store.clone();
+            store.set_leader_before_metadata_hook_for_tests(move || {
+                assert!(
+                    probe.restricted_predecessor_read().is_err(),
+                    "{damaged}: unproved head was admitted before metadata validation"
+                );
+            });
+            let outcome = store.leader_session();
+            if damaged == "root_replaced" {
+                assert!(outcome.is_err());
+                assert!(!store.restricted_owner_associated());
+            }
+        }
     }
 
     #[test]
