@@ -2133,10 +2133,22 @@ async fn selected_status_serves_committed_head_before_h_and_clears_freshness_aft
     assert_eq!(code, axum::http::StatusCode::OK, "{dependencies}");
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     assert_eq!(dependencies["workspaceRevision"], old_revision);
-    for route in [
-        "dependencies/refresh",
-        "questions/foreign/jev-run",
-        "questions/foreign/acp-answer",
+    for (route, expected_status, expected_code) in [
+        (
+            "dependencies/refresh",
+            axum::http::StatusCode::CONFLICT,
+            "storage_busy",
+        ),
+        (
+            "questions/foreign/jev-run",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "questions/foreign/acp-answer",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+        ),
     ] {
         let (code, headers, error) = selected_json(
             app.clone(),
@@ -2145,15 +2157,8 @@ async fn selected_status_serves_committed_head_before_h_and_clears_freshness_aft
             serde_json::json!({}),
         )
         .await;
-        assert_eq!(
-            code,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "{route}: {error}"
-        );
-        assert_eq!(
-            error["error"]["code"], "index_not_ready",
-            "{route}: {error}"
-        );
+        assert_eq!(code, expected_status, "{route}: {error}");
+        assert_eq!(error["error"]["code"], expected_code, "{route}: {error}");
         assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     }
     resume_tx.send(()).unwrap();
@@ -2237,6 +2242,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     fs::write(b.join("library/source.rs"), "pub fn from_b() {}\n").unwrap();
     let a_id = WorkspaceIdentity::discover(Some(&a), &a).unwrap();
     let b_id = WorkspaceIdentity::discover(Some(&b), &b).unwrap();
+    let a_leader_path = roots.leader_lock(&a_id);
     let runner = temp.path().join("acp-runner");
     fs::write(
         &runner,
@@ -2576,6 +2582,9 @@ async fn provider_routes_use_only_the_selected_checkout() {
             "quote":"function selected_root() { return 1; }"}]}],
         "branches":[],"limitations":[]},"estimatedUsd":0.01});
     fs::write(temp.path().join("acp-response.json"), response.to_string()).unwrap();
+    // ACP spends from its own attempt ledger. A valid exact packet remains
+    // provider-eligible while the native leader marker is no longer H-ready.
+    fs::write(&a_leader_path, "00000000-0000-4000-8000-000000000001").unwrap();
     let (code, _, answer) = selected_json(
         app.clone(),
         "POST",
