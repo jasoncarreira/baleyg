@@ -53,7 +53,12 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         "function alpha_checkout() { return 1; }\n",
     )
     .unwrap();
-    git(&a, &["add", "core.js"]);
+    fs::write(
+        a.join("core.py"),
+        "class AlphaClass:\n    def execute(self):\n        return 1\n",
+    )
+    .unwrap();
+    git(&a, &["add", "core.js", "core.py"]);
     git(&a, &["commit", "-qm", "base"]);
     git(
         &a,
@@ -62,6 +67,11 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     fs::write(
         b.join("core.js"),
         "function beta_checkout() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(
+        b.join("core.py"),
+        "class BetaClass:\n    def execute(self):\n        return 2\n",
     )
     .unwrap();
     for root in [&a, &b] {
@@ -243,6 +253,60 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             status["catchingUp"].as_bool().unwrap().to_string(),
             status_header
         );
+        let files = client
+            .get(format!("{base}/api/checkouts/{key}/files"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(files.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            files.headers()["X-Baleyg-Workspace"],
+            verified_root.to_str().unwrap()
+        );
+        let files: Value = files.json().await.unwrap();
+        assert!(files["items"].to_string().contains("core.js"), "{files}");
+        let methods = client
+            .get(format!("{base}/api/checkouts/{key}/methods"))
+            .query(&[("path", "core.js")])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(methods.status(), reqwest::StatusCode::OK);
+        let methods: Value = methods.json().await.unwrap();
+        assert!(methods.to_string().contains(expected), "{methods}");
+        let class_name = if key == &a_key {
+            "AlphaClass"
+        } else {
+            "BetaClass"
+        };
+        let foreign_class = if key == &a_key {
+            "BetaClass"
+        } else {
+            "AlphaClass"
+        };
+        let classes = client
+            .get(format!("{base}/api/checkouts/{key}/classes"))
+            .query(&[("q", class_name)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(classes.status(), reqwest::StatusCode::OK);
+        let classes: Value = classes.json().await.unwrap();
+        assert!(classes.to_string().contains(class_name), "{classes}");
+        assert!(!classes.to_string().contains(foreign_class), "{classes}");
+        let symbols = client
+            .get(format!("{base}/api/checkouts/{key}/symbols"))
+            .query(&[("q", expected)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(symbols.status(), reqwest::StatusCode::OK);
+        let symbols: Value = symbols.json().await.unwrap();
+        assert!(symbols.to_string().contains(expected), "{symbols}");
         let source = client
             .get(format!("{base}/api/checkouts/{key}/source"))
             .query(&[("path", "core.js")])
@@ -283,6 +347,121 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let view: Value = query.json().await.unwrap();
         assert_eq!(view["query"]["seed"], seed.as_str());
         assert!(view.to_string().contains(expected_name), "{view}");
+        let revision = &view["revision"];
+        let pinned = format!(
+            "indexGeneration={}&indexRevision={}",
+            revision["indexGeneration"].as_str().unwrap(),
+            revision["indexRevision"].as_u64().unwrap()
+        );
+        let record = serde_json::json!({"id":"saved","title":"Mine","query":{"seed":seed},"pins":{},"hidden":[]});
+        let saved = client
+            .put(format!("{base}/api/checkouts/{key}/views/saved?{pinned}"))
+            .bearer_auth(token)
+            .json(&record)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            saved.text().await.unwrap_or_default()
+        );
+        assert!(saved.headers().contains_key("X-Baleyg-Workspace"));
+        let other_view = client
+            .get(format!("{base}/api/checkouts/{other}/views/saved"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        if key == &a_key {
+            assert_eq!(other_view.status(), reqwest::StatusCode::NOT_FOUND);
+        } else {
+            assert_eq!(other_view.status(), reqwest::StatusCode::OK);
+            let other_value: Value = other_view.json().await.unwrap();
+            assert_eq!(other_value["view"]["query"]["seed"], seeds[0]);
+        }
+        let note = serde_json::json!({"id":"note","nodeId":seed,"body":"Only here"});
+        let saved = client
+            .put(format!(
+                "{base}/api/checkouts/{key}/annotations/note?{pinned}"
+            ))
+            .bearer_auth(token)
+            .json(&note)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            saved.text().await.unwrap_or_default()
+        );
+        let other_notes = client
+            .get(format!("{base}/api/checkouts/{other}/annotations"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other_notes.status(), reqwest::StatusCode::OK);
+        let other_notes: Value = other_notes.json().await.unwrap();
+        if key == &a_key {
+            assert_eq!(other_notes, serde_json::json!([]));
+        } else {
+            assert_eq!(other_notes[0]["annotation"]["nodeId"], seeds[0]);
+        }
+        let preview = client.post(format!("{base}/api/checkouts/{key}/questions/preview"))
+            .bearer_auth(token).json(&serde_json::json!({"seed":seed,"question":"What calls?","expectedRevision":revision}))
+            .send().await.unwrap();
+        assert_eq!(
+            preview.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            preview.text().await.unwrap_or_default()
+        );
+        let preview: Value = preview.json().await.unwrap();
+        let packet_id = preview["packet"]["packetId"].as_str().unwrap();
+        let exported = client
+            .get(format!(
+                "{base}/api/checkouts/{key}/questions/{packet_id}/jev-request"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(exported.status(), reqwest::StatusCode::OK);
+        let foreign = client
+            .get(format!(
+                "{base}/api/checkouts/{other}/questions/{packet_id}/jev-request"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        let sequence = client
+            .post(format!("{base}/api/checkouts/{key}/sequence"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"seed":seed,"expectedRevision":view["revision"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.status(),
+            reqwest::StatusCode::OK,
+            "{}",
+            sequence.text().await.unwrap_or_default()
+        );
+        let foreign_symbol = client
+            .get(format!("{base}/api/checkouts/{other}/symbol"))
+            .query(&[("id", seed)])
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign_symbol.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(foreign_symbol.headers().contains_key("X-Baleyg-Workspace"));
         let foreign_query = client
             .post(format!("{base}/api/checkouts/{other}/query"))
             .bearer_auth(token)
@@ -584,7 +763,12 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
     };
     use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    for stage in ["after_handler", "before_read_finish"] {
+    for (stage, route_suffix) in [
+        ("after_handler", "status"),
+        ("before_read_finish", "status"),
+        ("after_handler", "files"),
+        ("before_read_finish", "files"),
+    ] {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("checkout");
         fs::create_dir(&root).unwrap();
@@ -600,7 +784,7 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         let address = "127.0.0.1:7331".parse().unwrap();
         let browser = ProvisionedBrowser::new(registry.clone(), TOKEN.to_owned(), address).unwrap();
         let app = browser.clone().router();
-        let route = format!("/api/checkouts/{}/status", identity.root_key);
+        let route = format!("/api/checkouts/{}/{route_suffix}", identity.root_key);
         let call = |app: axum::Router| {
             let route = route.clone();
             async move {
@@ -825,6 +1009,90 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
 }
 
 #[tokio::test]
+async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+    use baleyg::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("cold");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("core.js"), "function cold() {}\n").unwrap();
+    let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+    let roots =
+        TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+    let mut registry = CheckoutRegistry::with_roots(roots);
+    registry
+        .register(&identity, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    let registry = Arc::new(tokio::sync::Mutex::new(registry));
+    let browser = ProvisionedBrowser::new(
+        registry.clone(),
+        TOKEN.to_owned(),
+        "127.0.0.1:7331".parse().unwrap(),
+    )
+    .unwrap();
+    let app = browser.router();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    let runtime = {
+        let mut registry = registry.lock().await;
+        registry
+            .browser_request_at(&identity, std::time::Instant::now())
+            .unwrap();
+        let runtime = registry.activate(&identity.root_key).unwrap();
+        runtime.set_pre_h_hook_for_tests(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+        }));
+        runtime
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/checkouts/{}/files", identity.root_key))
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response.headers()["X-Baleyg-Workspace"],
+        identity.root.to_str().unwrap()
+    );
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(body["error"]["code"], "index_not_ready");
+    assert!(body.get("revision").is_none());
+    resume_tx.send(()).unwrap();
+    drop(runtime);
+}
+
+#[tokio::test]
 async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
     use axum::{
         body::{Body, to_bytes},
@@ -927,6 +1195,65 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     assert_eq!(prior["catchingUp"], true);
     assert_eq!(prior["revision"], old_revision);
+    let file_path = format!("/api/checkouts/{}/files", identity.root_key);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&file_path)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let prior_files: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(prior_files["revision"], old_revision);
+    assert!(prior_files["items"].to_string().contains("core.js"));
+    let pinned = format!(
+        "{file_path}?indexGeneration={}&indexRevision={}",
+        old_revision["indexGeneration"].as_str().unwrap(),
+        old_revision["indexRevision"].as_u64().unwrap()
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(pinned)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    let mismatch = format!(
+        "{file_path}?indexGeneration={}&indexRevision={}",
+        old_revision["indexGeneration"].as_str().unwrap(),
+        old_revision["indexRevision"].as_u64().unwrap() + 1
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(mismatch)
+                .header("host", "127.0.0.1:7331")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+
     resume_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -935,6 +1262,25 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
                 if code == axum::http::StatusCode::OK && current["catchingUp"] == false {
                     assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
                     assert_ne!(current["revision"], old_revision);
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(&file_path)
+                                .header("host", "127.0.0.1:7331")
+                                .header("authorization", format!("Bearer {TOKEN}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), axum::http::StatusCode::OK);
+                    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "false");
+                    let files: Value = serde_json::from_slice(
+                        &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(files["revision"], current["revision"]);
                     break;
                 }
             }
