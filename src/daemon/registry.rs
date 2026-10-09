@@ -414,10 +414,26 @@ impl CheckoutRegistry {
                 return Err(SelectionError::Unavailable);
             }
         }
-        if config.jev_budget_dir.is_some()
-            && std::env::var("JEV_KEY").map_or(true, |key| key.is_empty())
-        {
-            return Err(SelectionError::Unavailable);
+        if let Some(dir) = &config.jev_budget_dir {
+            let key = std::env::var("JEV_KEY").map_err(|_| SelectionError::Unavailable)?;
+            if key.trim().is_empty()
+                || reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
+            {
+                return Err(SelectionError::Unavailable);
+            }
+            match fs::symlink_metadata(dir) {
+                Ok(m) => {
+                    if !m.is_dir()
+                        || m.file_type().is_symlink()
+                        || m.uid() != unsafe { libc::geteuid() }
+                        || m.mode() & 0o777 != 0o700
+                    {
+                        return Err(SelectionError::Unavailable);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SelectionError::Unavailable),
+            }
         }
         if let (Some(runner), Some(state)) = (&config.acp_runner, &config.acp_state_dir) {
             let workspace = identity
@@ -449,15 +465,18 @@ impl CheckoutRegistry {
             {
                 return Err(SelectionError::Unavailable);
             }
-            if state.exists() {
-                let m = fs::symlink_metadata(state).map_err(|_| SelectionError::Unavailable)?;
-                if !m.is_dir()
-                    || m.file_type().is_symlink()
-                    || m.uid() != unsafe { libc::geteuid() }
-                    || m.mode() & 0o777 != 0o700
-                {
-                    return Err(SelectionError::Unavailable);
+            match fs::symlink_metadata(state) {
+                Ok(m) => {
+                    if !m.is_dir()
+                        || m.file_type().is_symlink()
+                        || m.uid() != unsafe { libc::geteuid() }
+                        || m.mode() & 0o777 != 0o700
+                    {
+                        return Err(SelectionError::Unavailable);
+                    }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SelectionError::Unavailable),
             }
         }
         if let Some(compiler) = &config.trusted_rustc
