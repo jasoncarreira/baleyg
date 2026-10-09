@@ -471,10 +471,15 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function newRoot() {}\n").unwrap();
+    let replacement = identity(&checkout);
     registry.disconnect(1);
     assert!(
         !registry.release(&key).unwrap(),
         "committed queued row cannot release before terminal root-loss result"
+    );
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "browser must not retire an old incarnation with accepted FIFO work"
     );
     tokio::time::timeout(Duration::from_secs(10), async {
         while registry.refresh_pending_work(&key).unwrap() {
@@ -494,6 +499,10 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     assert_eq!((state.as_str(), error.as_str()), ("failed", "root_changed"));
     drop(db);
     assert!(registry.release(&key).unwrap());
+    assert_eq!(
+        registry.browser_identity(&key).unwrap().inode,
+        replacement.inode
+    );
     assert!(!old.has_active_resources());
     assert!(old.evidence_response().is_err());
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -542,7 +551,12 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     fs::rename(&checkout, &moved).unwrap();
     fs::create_dir(&checkout).unwrap();
     fs::write(checkout.join("a.js"), "function replacement() {}\n").unwrap();
+    let replacement = identity(&checkout);
     registry.disconnect(2);
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "paused H keeps old incarnation even after client disconnect"
+    );
     assert!(
         paused.catching_up(),
         "paused H is pending despite an empty old-root queue"
@@ -571,6 +585,10 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     })
     .await
     .expect("paused H leaked old-root or leader descriptors");
+    assert_eq!(
+        registry.browser_identity(&key).unwrap().inode,
+        replacement.inode
+    );
 }
 
 #[tokio::test]
@@ -614,10 +632,31 @@ async fn cold_activation_preserves_recorded_scip_option() {
     registry
         .register(
             &id,
-            CheckoutOptions(serde_json::json!({"maxFileBytes":4096})),
+            CheckoutOptions(serde_json::json!({"maxFileBytes":2097152})),
         )
         .unwrap();
     registry.attach_launch(2, &id).unwrap();
+    let explicit_default = registry.activate(&id.root_key).unwrap();
+    ready(&explicit_default).await;
+    let default_selected = Store::open(topology.clone(), identity(&checkout))
+        .unwrap()
+        .recorded_index_options()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        default_selected.max_file_bytes, 2_097_152,
+        "explicit default is an instruction, not implicit fallback"
+    );
+    assert!(default_selected.scip_path.is_none());
+    registry.disconnect(2);
+    assert!(registry.release(&id.root_key).unwrap());
+    registry
+        .register(
+            &id,
+            CheckoutOptions(serde_json::json!({"maxFileBytes":4096})),
+        )
+        .unwrap();
+    registry.attach_launch(3, &id).unwrap();
     let explicit = registry.activate(&id.root_key).unwrap();
     ready(&explicit).await;
     let selected = Store::open(topology, identity(&checkout))
@@ -676,14 +715,21 @@ async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     let runtime = registry.activate(&id.root_key).unwrap();
     runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(|| panic!("injected queued H failure")));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while runtime.reconciliation_error().is_none() {
+        while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
+    assert!(
+        runtime.retry_waiting_for_tests(),
+        "H has ended; this is the backoff window"
+    );
     registry.disconnect(1);
-    assert!(!registry.release(&id.root_key).unwrap());
+    assert!(
+        !registry.release(&id.root_key).unwrap(),
+        "accepted FIFO work, not h_in_flight, must pin owner during backoff"
+    );
     assert!(runtime.has_active_resources());
     assert_eq!(
         store.request_by_id(&queued.id).unwrap().unwrap().state,
@@ -729,4 +775,215 @@ async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
     assert!(!source.text.contains("priorIdentity"));
     answer.finish(()).unwrap();
     assert!(prior.evidence_response().is_err());
+}
+
+#[tokio::test]
+async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
+    use baleyg::daemon::registry::{BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY};
+    use std::time::Instant;
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    let moved = base.path().join("old");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function oldBrowser() {}
+",
+    )
+    .unwrap();
+    let old_id = identity(&checkout);
+    let key = old_id.root_key.clone();
+    let now = Instant::now();
+    let mut registry = CheckoutRegistry::with_roots_at(roots(base.path()), now);
+    registry
+        .register(&old_id, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    registry.browser_request_at(&old_id, now).unwrap();
+    let old = registry.activate(&key).unwrap();
+    ready(&old).await;
+    let (held, _) = old.evidence_response().unwrap();
+    fs::rename(&checkout, &moved).unwrap();
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function newBrowser() {}
+",
+    )
+    .unwrap();
+    let new_id = identity(&checkout);
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "old browser lease forbids takeover"
+    );
+    let due = now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY;
+    assert!(
+        registry.advance(due).unwrap().released.is_empty(),
+        "held read must fence release"
+    );
+    assert!(
+        registry.browser_identity(&key).is_err(),
+        "held read forbids replacement"
+    );
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if registry.advance(due).unwrap().released.contains(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("old browser runtime did not retire");
+    let discovered = registry
+        .browser_identity(&key)
+        .expect("browser recovers replaced checkout without CLI attach");
+    assert_eq!(
+        (
+            discovered.device,
+            discovered.inode,
+            discovered.record_id.as_str()
+        ),
+        (new_id.device, new_id.inode, new_id.record_id.as_str())
+    );
+    registry.browser_request_at(&discovered, due).unwrap();
+    let current = registry.activate(&key).unwrap();
+    ready(&current).await;
+    let (answer, _) = current.evidence_response().unwrap();
+    let (_, source) = answer.source_at("a.js", None).unwrap().unwrap();
+    assert!(source.text.contains("newBrowser"));
+    answer.finish(()).unwrap();
+    assert!(old.evidence_response().is_err());
+}
+
+#[tokio::test]
+async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    let other = base.path().join("other");
+    fs::create_dir(&checkout).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function oldListing() {}
+",
+    )
+    .unwrap();
+    let id = identity(&checkout);
+    let other_id = identity(&other);
+    let key = id.root_key.clone();
+    let topology = roots(base.path());
+    let index_db = topology.index_db(&id);
+    let request_db = topology.requests_db(&id);
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry.attach_launch(1, &id).unwrap();
+    let released = registry.activate(&key).unwrap();
+    ready(&released).await;
+    registry.attach_launch(2, &other_id).unwrap();
+    let active = registry.activate(&other_id.root_key).unwrap();
+    ready(&active).await;
+    registry.disconnect(1);
+    assert!(registry.release(&key).unwrap());
+    assert_eq!(
+        (file_descriptors(&index_db), file_descriptors(&request_db)),
+        (0, 0)
+    );
+    let listed = registry.browser_checkouts();
+    assert!(listed.iter().any(|row| row["rootKey"] == key));
+    assert_eq!(
+        file_descriptors(&index_db),
+        0,
+        "global listing must not pin released index"
+    );
+    let mut discovered = CheckoutRegistry::with_roots(topology.clone());
+    assert_eq!(discovered.browser_identity(&key).unwrap().inode, id.inode);
+    assert_eq!(
+        file_descriptors(&index_db),
+        0,
+        "discovery must not pin released index"
+    );
+    let independent = Store::open(topology, identity(&checkout)).unwrap();
+    let owner = baleyg::index_coordinator::establish_serving_session(
+        &independent,
+        None,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    assert!(owner.is_leader());
+    let held = independent.evidence_response().unwrap();
+    let _ = registry.browser_checkouts();
+    assert!(
+        file_descriptors(&index_db) > 0,
+        "browser probe must not close a concurrently live SQLite inode"
+    );
+    held.finish(()).unwrap();
+    drop(held);
+    assert!(
+        file_descriptors(&index_db) > 0,
+        "active leader retains its witness between SQLite operations"
+    );
+    drop(owner);
+    drop(independent);
+    let _ = registry.browser_checkouts();
+    assert_eq!(
+        file_descriptors(&index_db),
+        0,
+        "idle EX proof retires the witness after the independent owner exits"
+    );
+    let db = rusqlite::Connection::open(&index_db).unwrap();
+    db.execute(
+        "UPDATE index_metadata SET root_spelling='/bad-root' WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let _ = registry.browser_checkouts();
+    assert_eq!(
+        file_descriptors(&index_db),
+        0,
+        "corrupt listing must retire probe witness"
+    );
+    assert!(active.has_active_resources());
+}
+
+#[tokio::test]
+async fn explicit_null_scip_clears_recorded_input_on_cold_activation() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("a.js"),
+        "function oldScip() {}
+",
+    )
+    .unwrap();
+    let id = identity(&checkout);
+    let topology = roots(base.path());
+    let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
+    let mut options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    options.scip_path = Some(checkout.join("old.scip"));
+    let owner = baleyg::index_coordinator::establish_serving_session(
+        &store,
+        Some(&options),
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    drop(owner);
+    drop(store);
+    let mut registry = CheckoutRegistry::with_roots(topology.clone());
+    registry
+        .register(&id, CheckoutOptions(serde_json::json!({"scip":null})))
+        .unwrap();
+    registry.attach_launch(1, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    ready(&runtime).await;
+    let selected = Store::open(topology, identity(&checkout))
+        .unwrap()
+        .recorded_index_options()
+        .unwrap()
+        .unwrap();
+    assert!(
+        selected.scip_path.is_none(),
+        "explicit null clears prior SCIP selection"
+    );
 }

@@ -237,10 +237,14 @@ impl CheckoutRegistry {
         options.scip_path = config.scip;
         options.manifest_path = config.manifest;
         options.max_file_bytes = config.max_file_bytes;
-        let explicit_options = options.scip_path.is_some()
-            || options.manifest_path.is_some()
-            || options.max_file_bytes
-                != IndexOptions::new(entry.identity.root.clone()).max_file_bytes;
+        // The raw registration preserves option presence. A supplied default
+        // value (or an explicit null for an optional input) is still explicit;
+        // comparing values would silently reuse an earlier checkout's inputs.
+        let explicit_options = entry.registration.as_ref().is_some_and(|registered| {
+            ["scip", "manifest", "maxFileBytes"]
+                .iter()
+                .any(|key| registered.0.get(*key).is_some())
+        });
         let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
             (Some(dir), Some(cap)) => {
                 let key = std::env::var("JEV_KEY")?;
@@ -401,12 +405,23 @@ impl CheckoutRegistry {
             }
             self.register_discovered(&identity);
         }
-        self.entries
-            .get(key)
-            .ok_or(SelectionError::NotCheckout)?
-            .identity
-            .rediscover()
-            .map_err(|_| SelectionError::IdentityChanged)
+        let entry = self.entries.get(key).ok_or(SelectionError::NotCheckout)?;
+        if let Ok(identity) = entry.identity.rediscover() {
+            return Ok(identity);
+        }
+        // A stale pathname key may now name a different checkout. Discovery
+        // itself is read-only; never replace an attached, busy, or ambiguous
+        // incarnation. The ordinary retirement gate owns all old resources.
+        let root = entry.identity.root.clone();
+        let current = WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        if current.root_key != key || entry.identity.matches(&current) {
+            return Err(SelectionError::IdentityChanged);
+        }
+        self.retire_replaced(&current)?;
+        self.register_discovered(&current);
+        Ok(current)
     }
 
     fn register_discovered(&mut self, identity: &WorkspaceIdentity) {
@@ -1390,6 +1405,11 @@ impl CheckoutRuntime {
 
     pub fn reconciliation_error(&self) -> Option<String> {
         self.last_error.lock().unwrap().clone()
+    }
+
+    #[doc(hidden)]
+    pub fn retry_waiting_for_tests(&self) -> bool {
+        self.retry_waiting.load(Ordering::Acquire) && !self.h_in_flight.load(Ordering::Acquire)
     }
 
     pub fn catching_up(&self) -> bool {
