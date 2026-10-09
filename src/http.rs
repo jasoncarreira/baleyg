@@ -6738,12 +6738,15 @@ mod maintenance_telemetry_tests {
 
 /// The socket-only daemon has no HTTP state. This router is constructed only
 /// after a validated explicit serve registration binds a loopback listener.
+type SelectedResponseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ProvisionedBrowser {
     registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
     token: String,
     hosts: Vec<String>,
     origins: Vec<String>,
+    response_hook: Arc<Mutex<Option<SelectedResponseHook>>>,
 }
 
 impl ProvisionedBrowser {
@@ -6764,7 +6767,13 @@ impl ProvisionedBrowser {
             token,
             hosts,
             origins,
+            response_hook: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn set_selected_response_hook_for_tests(&self, hook: SelectedResponseHook) {
+        *self.response_hook.lock().unwrap() = Some(hook);
     }
 
     pub fn router(self) -> Router {
@@ -6966,7 +6975,12 @@ async fn provisioned_core(
     let answer: Result<(Response, bool), ApiError> = match runtime {
         Err(error) => Err(error),
         Ok(runtime) => {
-            let result = provisioned_core_answer(&runtime, &method, &suffix, &uri, body).await;
+            let hook = browser.response_hook.lock().unwrap().clone();
+            let result =
+                provisioned_core_answer(&runtime, &method, &suffix, &uri, body, hook.clone()).await;
+            if let Some(hook) = hook {
+                hook("after_handler");
+            }
             result.and_then(|(response, catching_up)| {
                 identity.verify_readonly().map_err(|_| {
                     ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
@@ -6988,7 +7002,8 @@ async fn provisioned_core(
         }
     };
     if identity.verify_readonly().is_err() {
-        return browser_selection_error(SelectionError::IdentityChanged);
+        response = ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+            .into_response();
     }
     if let Ok(value) = root.parse() {
         response.headers_mut().insert("X-Baleyg-Workspace", value);
@@ -7016,6 +7031,7 @@ async fn provisioned_core_answer(
     suffix: &str,
     uri: &axum::http::Uri,
     body: Bytes,
+    hook: Option<SelectedResponseHook>,
 ) -> Result<(Response, bool), ApiError> {
     use axum::http::Method;
     match (method, suffix) {
@@ -7028,6 +7044,9 @@ async fn provisioned_core_answer(
                 let (response, catching_up) = runtime.evidence_response()?;
                 let mut status = response.status()?;
                 status.catching_up = catching_up;
+                if let Some(hook) = hook {
+                    hook("before_read_finish");
+                }
                 Ok::<_, anyhow::Error>((response.finish(status)?, catching_up))
             })
             .await

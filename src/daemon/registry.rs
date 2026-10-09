@@ -160,21 +160,7 @@ pub struct CheckoutRegistry {
     idle_permits: HashMap<String, PreHReadPermit>,
     idle_epochs: HashMap<String, Arc<AtomicU64>>,
     idle_exit_at: Option<Instant>,
-}
-
-fn indexed_spelling(index: &Path) -> rusqlite::Result<String> {
-    let db =
-        rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let spelling: String = db.query_row(
-        "SELECT root_spelling FROM index_metadata WHERE singleton=1",
-        [],
-        |row| row.get(0),
-    )?;
-    let integrity: String = db.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    Ok(spelling)
+    clock_override: Option<Instant>,
 }
 
 impl Default for CheckoutRegistry {
@@ -196,6 +182,7 @@ impl CheckoutRegistry {
             idle_permits: HashMap::new(),
             idle_epochs: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
+            clock_override: None,
         }
     }
 
@@ -390,7 +377,8 @@ impl CheckoutRegistry {
             if !index.is_file() {
                 return Err(SelectionError::NotCheckout);
             }
-            let spelling = indexed_spelling(&index).map_err(|_| SelectionError::Unavailable)?;
+            let spelling = Store::browser_index_root_existing(&roots, key)
+                .map_err(|_| SelectionError::Unavailable)?;
             let identity = WorkspaceIdentity::discover_unattached(
                 Some(Path::new(&spelling)),
                 Path::new(&spelling),
@@ -441,11 +429,12 @@ impl CheckoutRegistry {
                 .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
             let state = if entry.identity.rediscover().is_err() {
                 "unavailable"
-            } else if index
-                .as_ref()
-                .is_some_and(|index| index.is_file() && indexed_spelling(index).is_err())
-            {
-                "corrupt"
+            } else if index.as_ref().is_some_and(|index| index.is_file()) {
+                roots
+                    .as_ref()
+                    .ok()
+                    .and_then(|roots| Store::browser_index_root_existing(roots, key).err())
+                    .unwrap_or("available")
             } else {
                 "available"
             };
@@ -471,7 +460,7 @@ impl CheckoutRegistry {
                 {
                     continue;
                 }
-                let row = match indexed_spelling(&candidate.path().join("index.db")) {
+                let row = match Store::browser_index_root_existing(&roots, &key) {
                     Ok(spelling)
                         if WorkspaceIdentity::discover_unattached(
                             Some(Path::new(&spelling)),
@@ -485,8 +474,8 @@ impl CheckoutRegistry {
                     Ok(spelling) => {
                         serde_json::json!({"rootKey": key, "workspaceRoot": spelling, "state":"unavailable", "active":false})
                     }
-                    Err(_) => {
-                        serde_json::json!({"rootKey": key, "state":"corrupt", "active":false})
+                    Err(state) => {
+                        serde_json::json!({"rootKey": key, "state":state, "active":false})
                     }
                 };
                 rows.insert(key, row);
@@ -984,9 +973,17 @@ impl CheckoutRegistry {
         Ok(attached)
     }
 
+    /// Deterministic daemon-driver ticks for integration fixtures. Browser
+    /// request timestamps still come from production HTTP's real clock.
+    #[doc(hidden)]
+    pub fn set_clock_override_for_tests(&mut self, now: Instant) {
+        self.clock_override = Some(now);
+    }
+
     /// Advance deterministic lifecycle clocks. Busy resources keep their original
     /// deadlines: once work drains, no extra grace interval is added.
     pub fn advance(&mut self, now: Instant) -> Result<LifecycleTick, SelectionError> {
+        let now = self.clock_override.unwrap_or(now);
         // Expired clients disconnect at their deadline, not at this tick.
         let expired_at = self.expire_browsers(now);
         self.update_exit_deadline(expired_at.unwrap_or(now));
