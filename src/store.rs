@@ -7261,15 +7261,18 @@ impl Store {
         &self,
         session: &topology::LeaderSession,
     ) -> Result<topology::UseGuard> {
-        ensure!(
-            !self.is_recreate_pending(),
-            "index_not_ready: mandatory exceptional H not attested"
-        );
+        if self.is_recreate_pending() {
+            return Err(
+                topology::IndexNotReady::new("mandatory exceptional H not attested").into(),
+            );
+        }
         self.verify_leader_session(session)?;
-        ensure!(
-            *self.reconciled_leader.lock().unwrap() == Some(session.incarnation()),
-            "index_not_ready: mandatory leader reconciliation not committed"
-        );
+        if *self.reconciled_leader.lock().unwrap() != Some(session.incarnation()) {
+            return Err(topology::IndexNotReady::new(
+                "mandatory leader reconciliation not committed",
+            )
+            .into());
+        }
         self.roots.sidecar_mutation_shared(&self.identity)
     }
     pub(crate) fn claim_snapshot_authority(
@@ -7290,20 +7293,22 @@ impl Store {
         session: &topology::LeaderSession,
         db: &Connection,
     ) -> Result<()> {
-        ensure!(
-            !self.is_recreate_pending(),
-            "index_not_ready: mandatory exceptional H not attested"
-        );
+        if self.is_recreate_pending() {
+            return Err(
+                topology::IndexNotReady::new("mandatory exceptional H not attested").into(),
+            );
+        }
         self.verify_leader_session(session)?;
-        ensure!(
-            *self.reconciled_leader.lock().unwrap() == Some(session.incarnation()),
-            "index_not_ready: mandatory leader reconciliation not committed"
-        );
+        if *self.reconciled_leader.lock().unwrap() != Some(session.incarnation()) {
+            return Err(topology::IndexNotReady::new(
+                "mandatory leader reconciliation not committed",
+            )
+            .into());
+        }
         let status = self.decode_control_status_raw(db)?;
-        ensure!(
-            status.revision.index_revision > 0 && status.evidence_format.is_some(),
-            "index_not_ready: no committed current H head"
-        );
+        if status.revision.index_revision == 0 || status.evidence_format.is_none() {
+            return Err(topology::IndexNotReady::new("no committed current H head").into());
+        }
         validate_bounded_control(db, &self.identity.record_id, PairedManifestScope::Full)?;
         validate_paired_rows(db)?;
         let selected = ReadRevision::current(db)?;
@@ -7312,11 +7317,14 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        ensure!(
-            selected.pin == status.revision
-                && marker.as_deref() == Some(session.incarnation().to_string().as_str()),
-            "index_not_ready: current selected H/pin does not match claim owner"
-        );
+        if selected.pin != status.revision
+            || marker.as_deref() != Some(session.incarnation().to_string().as_str())
+        {
+            return Err(topology::IndexNotReady::new(
+                "current selected H/pin does not match claim owner",
+            )
+            .into());
+        }
         self.verify_leader_session(session)?;
         Ok(())
     }
@@ -15691,14 +15699,32 @@ mod sqlite_schema_race_tests {
         std::fs::remove_dir(&original).unwrap();
         std::fs::rename(&moved, &original).unwrap();
 
-        let (_state, _work, store, _graph, _capture, _native, pin, _cancel, _session) = ready();
+        let (_state, work, store, _graph, _capture, _native, pin, _cancel, session) = ready();
         let leader_path = store.roots.leader_lock(&store.identity);
         std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string()).unwrap();
         assert_eq!(store.status().unwrap().revision, pin);
         assert!(store.symbol_at("missing", None).unwrap().is_none());
         assert!(store.symbols_at("never", 10).is_ok());
+        let q1 = store
+            .enqueue_request(&IndexOptions::new(work.path().to_owned()), Some(pin))
+            .unwrap();
+        assert!(
+            store.claim_request(&session).is_err(),
+            "forged leader marker must deny direct native FIFO claim despite readable A"
+        );
+        assert_eq!(
+            store.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert_eq!(
+            store.status().unwrap().revision,
+            pin,
+            "a denied claim must not revoke a coherent published read"
+        );
 
-        let (_state, work, store, _graph, _capture, _native, _pin, _cancel, _session) = ready();
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("flow.js"), "function go() {}\n").unwrap();
         let git = std::process::Command::new("git")
             .arg("-C")
             .arg(work.path())
@@ -15710,8 +15736,34 @@ mod sqlite_schema_race_tests {
             "{}",
             String::from_utf8_lossy(&git.stderr)
         );
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let options = IndexOptions::new(work.path().to_owned());
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let session = store.leader_session().unwrap();
+        let pin = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                session.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(store.status().unwrap().revision, pin);
+        let marker = work.path().join(".git/baleyg/workspace-id");
+        assert!(
+            marker.exists(),
+            "captured Git checkout must have a real workspace-id"
+        );
+        std::fs::write(&marker, uuid::Uuid::new_v4().to_string()).unwrap();
         let foreign = store.status().unwrap_err();
-        assert!(foreign.to_string().contains("root_changed"), "{foreign:#}");
+        assert!(
+            foreign.to_string().contains("workspace_id_changed"),
+            "{foreign:#}"
+        );
     }
 
     #[test]
@@ -15847,7 +15899,7 @@ mod sqlite_schema_race_tests {
         }];
         let leader_path = store.roots.leader_lock(&store.identity);
         store
-            .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
+            .tree_metadata_with_finish_hook(Path::new(&store.workspace_root), &mut entries, || {
                 std::fs::write(&leader_path, uuid::Uuid::new_v4().to_string())?;
                 Ok(())
             })
@@ -15870,7 +15922,7 @@ mod sqlite_schema_race_tests {
         let root = work.path().to_owned();
         let moved = state.path().join("tree-old-root");
         let error = store
-            .tree_metadata_with_finish_hook(work.path(), &mut entries, || {
+            .tree_metadata_with_finish_hook(Path::new(&store.workspace_root), &mut entries, || {
                 std::fs::rename(&root, &moved)?;
                 std::fs::create_dir(&root)?;
                 Ok(())
@@ -16053,14 +16105,13 @@ mod sqlite_schema_race_tests {
         )
         .unwrap();
         drop(db);
-        assert!(
-            store.status().is_err(),
-            "physical selected-row corruption must refuse reads"
-        );
-        assert!(
-            clone.status().is_err(),
-            "all Store clones must refuse corrupt pair"
-        );
+        for selected in [&store, &clone] {
+            let error = selected.status().unwrap_err();
+            assert!(
+                error.to_string().contains("incompatible_index"),
+                "physical selected-row corruption must refuse reads as incompatible_index, not transient/root failure: {error:#}"
+            );
+        }
     }
 
     #[cfg(unix)]
