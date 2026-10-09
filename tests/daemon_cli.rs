@@ -1032,6 +1032,56 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     );
 }
 
+/// Keep a CLI reply bounded even if the daemon accepts a socket but never
+/// answers it. Redirect pipes to short-lived files so a verbose child cannot
+/// fill a pipe and block before the deadline. `Owned` kills and reaps on timeout.
+async fn bounded_cli_capture(
+    mut command: Command,
+    fixture: &Path,
+    timeout: Duration,
+) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    use std::io::Read;
+    let stdout = fixture.join("bounded-cli.out");
+    let stderr = fixture.join("bounded-cli.err");
+    command
+        .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr).unwrap()));
+    let mut child = Owned(command.spawn().unwrap());
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let read_bounded = |path: &Path| {
+                let mut captured = Vec::new();
+                fs::File::open(path)
+                    .unwrap()
+                    .take(1_048_576)
+                    .read_to_end(&mut captured)
+                    .unwrap();
+                captured
+            };
+            return Some((status, read_bounded(&stdout), read_bounded(&stderr)));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn bounded_cli_capture_reaps_stalled_child() {
+    let temp = short_temp();
+    let mut stalled = Command::new("cat");
+    stalled.stdin(Stdio::piped());
+    let started = Instant::now();
+    assert!(
+        bounded_cli_capture(stalled, temp.path(), Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
 /// One real daemon/serve cold H per private HOME; no prior daemon session can
 /// supply a warm head or make an omitted CLI option look explicit.
 #[tokio::test]
@@ -1044,8 +1094,10 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         let temp = short_temp();
         let home = temp.path().join("home");
         fs::create_dir(&home).unwrap();
-        let root = checkout(temp.path(), "serve-cold-options");
+        let root = checkout(temp.path(), "serveColdOptions");
         let source_path = root.join("sample.js");
+        // SCIP [0,9,10] names exactly the one-byte declaration `f`.
+        fs::write(&source_path, "function f() {}\nf();\n").unwrap();
         let source_hash = hex::encode(Sha256::digest(fs::read(&source_path).unwrap()));
         let scip_path = temp.path().join("prior.scip");
         let manifest_path = temp.path().join("prior-manifest.json");
@@ -1055,7 +1107,8 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         let mut occurrence = scip::types::Occurrence::new();
         occurrence.range = vec![0, 9, 10];
         occurrence.symbol_roles = 1;
-        occurrence.symbol = "scip npm fixture 1 sample.js/prior().".into();
+        let scip_label = "scip npm fixture 1 sample.js/f().";
+        occurrence.symbol = scip_label.into();
         document.occurrences.push(occurrence);
         scip.documents.push(document);
         fs::write(&scip_path, scip.write_to_bytes().unwrap()).unwrap();
@@ -1105,14 +1158,24 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         assert_eq!(before["maxFileBytes"], 8192);
         assert_eq!(before["scipPath"], scip_path.to_str().unwrap());
         assert_eq!(before["manifestPath"], manifest_path.to_str().unwrap());
-        fs::write(&source_path, "function newColdHead() { return 2; }\n").unwrap();
+        // A second file forces H while the original SCIP input/hash remains
+        // valid and can still decorate the unchanged `f` declaration.
+        fs::write(
+            root.join("new.js"),
+            "function newColdHead() { return 2; }\n",
+        )
+        .unwrap();
 
         // Spawn the daemon explicitly, rather than allowing serve to auto-start
         // an untracked process. Both Owned guards reap children on every exit.
         let mut daemon_command = cli(&home);
         daemon_command.arg("daemon");
         let mut daemon = detached(daemon_command);
-        let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+        let socket = home.join(if cfg!(target_os = "macos") {
+            "Library/Application Support/dev.odin.baleyg/run/daemon.sock"
+        } else {
+            ".local/share/baleyg/run/daemon.sock"
+        });
         let socket_deadline = Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&socket).is_err() {
             assert!(
@@ -1139,21 +1202,29 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         ready(&client, address, &mut served.0).await;
         let h_deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let status = cli(&home)
-                .arg("status")
-                .arg("--workspace")
-                .arg(&root)
-                .output()
-                .unwrap();
-            if status.status.success() {
-                let reply: Value = serde_json::from_slice(&status.stdout).unwrap();
-                if reply["revision"]["indexRevision"]
-                    .as_i64()
-                    .is_some_and(|rev| rev > prior_revision)
-                {
-                    break;
+            assert!(
+                Instant::now() < h_deadline,
+                "cold H did not publish a revision after {prior_revision}"
+            );
+            let mut command = cli(&home);
+            command.arg("status").arg("--workspace").arg(&root);
+            let remaining = h_deadline.saturating_duration_since(Instant::now());
+            let status =
+                bounded_cli_capture(command, &home, remaining.min(Duration::from_secs(2))).await;
+            let diagnostic = match status {
+                Some((exit, stdout, _stderr)) if exit.success() => {
+                    let reply: Value = serde_json::from_slice(&stdout).unwrap();
+                    if reply["revision"]["indexRevision"]
+                        .as_i64()
+                        .is_some_and(|rev| rev > prior_revision)
+                    {
+                        break;
+                    }
+                    format!("status has not passed revision {prior_revision}: {reply}")
                 }
-            }
+                Some((_, _, stderr)) => String::from_utf8_lossy(&stderr).into_owned(),
+                None => "status subprocess exceeded its two-second deadline".to_owned(),
+            };
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
                 "daemon exited during H"
@@ -1164,8 +1235,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             );
             assert!(
                 Instant::now() < h_deadline,
-                "cold H did not publish revision after {prior_revision}: {}",
-                String::from_utf8_lossy(&status.stderr)
+                "cold H did not publish revision after {prior_revision}: {diagnostic}"
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -1188,6 +1258,36 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             assert_eq!(after["maxFileBytes"], 8192);
             assert_eq!(after["scipPath"], scip_path.to_str().unwrap());
             assert_eq!(after["manifestPath"], manifest_path.to_str().unwrap());
+        }
+        // The unchanged `f` source and matching manifest must let H apply the
+        // recorded SCIP presentation, not merely keep a path string in storage.
+        let mut export = cli(&home);
+        export.arg("export").arg("--workspace").arg(&root);
+        let (exit, stdout, stderr) = bounded_cli_capture(export, &home, Duration::from_secs(5))
+            .await
+            .expect("export subprocess timed out after H");
+        assert!(
+            exit.success(),
+            "export failed: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let graph: Value = serde_json::from_slice(&stdout).unwrap();
+        let symbol = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "f")
+            .expect("unchanged declaration was not indexed");
+        if explicit_default {
+            assert!(
+                symbol["displayLabel"].is_null(),
+                "explicit default unexpectedly reused prior SCIP: {symbol}"
+            );
+        } else {
+            assert_eq!(
+                symbol["displayLabel"], scip_label,
+                "implicit serve did not apply recorded SCIP to H publication"
+            );
         }
     }
 }
