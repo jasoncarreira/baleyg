@@ -17,6 +17,103 @@ fn short_temp() -> TempDir {
     Builder::new().prefix("bg107-").tempdir_in("/tmp").unwrap()
 }
 
+/// Explicit platform parameter lets the Linux fixture rule run on macOS too.
+fn fixture_roots_for(home: &Path, host: &str) -> baleyg::store::topology::TopologyRoots {
+    let (cache, data) = match host {
+        "macos" => (
+            home.join("Library/Caches/dev.odin.baleyg"),
+            home.join("Library/Application Support/dev.odin.baleyg"),
+        ),
+        "linux" => (home.join(".cache/baleyg"), home.join(".local/share/baleyg")),
+        other => panic!("unsupported fixture host: {other}"),
+    };
+    baleyg::store::topology::TopologyRoots::isolated_for_tests(cache, data)
+}
+fn fixture_roots(home: &Path) -> baleyg::store::topology::TopologyRoots {
+    fixture_roots_for(home, std::env::consts::OS)
+}
+fn fixture_socket_paths(home: &Path) -> baleyg::daemon::SocketPaths {
+    baleyg::daemon::SocketPaths::new(&fixture_roots(home).data)
+}
+
+#[test]
+fn fixture_home_roots_match_linux_and_macos_layouts() {
+    let temp = short_temp();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let linux = fixture_roots_for(&home, "linux");
+    assert_eq!(linux.cache, home.join(".cache/baleyg"));
+    assert_eq!(linux.data, home.join(".local/share/baleyg"));
+    assert_ne!(
+        linux.data,
+        home.join("Library/Application Support/dev.odin.baleyg")
+    );
+    let mac = fixture_roots_for(&home, "macos");
+    assert_eq!(mac.cache, home.join("Library/Caches/dev.odin.baleyg"));
+    assert_eq!(
+        mac.data,
+        home.join("Library/Application Support/dev.odin.baleyg")
+    );
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(fixture_roots(&home).data, linux.data);
+        assert_eq!(
+            fixture_socket_paths(&home).socket,
+            linux.data.join("run/daemon.sock")
+        );
+        assert!(!mac.data.exists(), "wrong macOS fixture root was created");
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(fixture_roots(&home).data, mac.data);
+}
+
+fn bounded_fixture_stderr(path: &Path) -> String {
+    use std::io::Read;
+    let Ok(file) = fs::File::open(path) else {
+        return "<stderr unavailable>".to_owned();
+    };
+    let mut bytes = Vec::new();
+    let _ = file.take(8192).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn fixture_daemon_diagnostic(home: &Path, expected: &Path) -> String {
+    use std::os::unix::fs::FileTypeExt;
+    let candidates = [
+        fixture_socket_paths(home).socket,
+        baleyg::daemon::SocketPaths::new(&fixture_roots_for(home, "macos").data).socket,
+        baleyg::daemon::SocketPaths::new(&fixture_roots_for(home, "linux").data).socket,
+    ];
+    let observed: Vec<_> = candidates
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()))
+        .collect();
+    let mut stderr = Vec::new();
+    if let Ok(entries) = fs::read_dir(home) {
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("daemon-cli-child-")
+            {
+                continue;
+            }
+            stderr.push(format!(
+                "{}: {}",
+                entry.path().display(),
+                bounded_fixture_stderr(&entry.path())
+            ));
+            if stderr.len() == 8 {
+                break;
+            }
+        }
+    }
+    format!(
+        "expected socket={}; actual socket candidates={observed:?}; bounded daemon stderr={stderr:?}",
+        expected.display()
+    )
+}
+
 fn cli(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     command
@@ -35,10 +132,23 @@ impl Drop for Owned {
     }
 }
 fn detached(mut command: Command) -> Owned {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_LOG: AtomicU64 = AtomicU64::new(1);
+    let home = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("HOME"))
+        .and_then(|(_, value)| value)
+        .map(std::path::PathBuf::from)
+        .expect("fixture child has a private HOME");
+    let log = home.join(format!(
+        "daemon-cli-child-{}-{}.stderr",
+        std::process::id(),
+        NEXT_LOG.fetch_add(1, Ordering::Relaxed)
+    ));
     Owned(
         command
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(fs::File::create(log).unwrap()))
             .spawn()
             .unwrap(),
     )
@@ -107,14 +217,13 @@ async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child)
 
 #[test]
 fn serve_request_preserves_explicit_default_file_cap_presence() {
-    use baleyg::daemon::{SocketOwner, SocketPaths, protocol};
+    use baleyg::daemon::{SocketOwner, protocol};
     use std::sync::mpsc;
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let root = checkout(temp.path(), "request-options");
-    let data = home.join("Library/Application Support/dev.odin.baleyg");
-    let owner = SocketOwner::acquire(&SocketPaths::new(&data))
+    let owner = SocketOwner::acquire(&fixture_socket_paths(&home))
         .unwrap()
         .unwrap();
     let listener = owner.listener().try_clone().unwrap();
@@ -149,13 +258,47 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
         if explicit {
             command.arg("--max-file-bytes").arg("2097152");
         }
-        let output = command.output().unwrap();
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("Baleyg:"),
-            "serve did not receive fake acknowledgement: {}",
-            String::from_utf8_lossy(&output.stderr)
+        // A wrong fake socket must fail within this fixture deadline, not wait
+        // for the real daemon's 30-minute idle exit after an accidental start.
+        let stderr_path = home.join(format!("fake-serve-{explicit}.stderr"));
+        let mut child = Owned(
+            command
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+                .spawn()
+                .unwrap(),
         );
-        options.push(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child.0.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                panic!(
+                    "fake serve acknowledgement timed out: {}; {}",
+                    bounded_fixture_stderr(&stderr_path),
+                    fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stderr = bounded_fixture_stderr(&stderr_path);
+        assert!(
+            stderr.contains("Baleyg:"),
+            "serve did not receive fake acknowledgement: {stderr}; {}",
+            fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
+        );
+        options.push(
+            rx.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "fake responder did not receive serve request: {error}; {stderr}; {}",
+                        fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
+                    )
+                }),
+        );
     }
     responder.join().unwrap();
     assert!(
@@ -192,19 +335,21 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
             .arg("daemon")
             .env("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
         let mut owner = detached(command);
-        let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+        let socket = fixture_socket_paths(&home).socket;
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             assert!(
                 owner.0.try_wait().unwrap().is_none(),
-                "daemon exited after {fault}"
+                "daemon exited after {fault}: {}",
+                fixture_daemon_diagnostic(&home, &socket)
             );
             if UnixStream::connect(&socket).is_ok() {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon did not accept after {fault}"
+                "daemon did not accept after {fault}: {}",
+                fixture_daemon_diagnostic(&home, &socket)
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -238,14 +383,19 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     let mut daemon_command = cli(&home);
     daemon_command.arg("daemon");
     let mut daemon = detached(daemon_command);
-    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let socket = fixture_socket_paths(&home).socket;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
-            "daemon exited before socket bind"
+            "daemon exited before socket bind: {}",
+            fixture_daemon_diagnostic(&home, &socket)
         );
-        assert!(Instant::now() < deadline, "daemon socket was not created");
+        assert!(
+            Instant::now() < deadline,
+            "daemon socket was not created: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     // Keep the port reserved until explicit serve. A connect check after
@@ -584,7 +734,6 @@ fn finite_cli_index_status_symbols_export_fallback_without_daemon() {
 
 #[tokio::test]
 async fn long_home_socket_names_are_private_distinct_connectable_and_recover_after_crash() {
-    use baleyg::daemon::SocketPaths;
     use std::os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         net::UnixStream,
@@ -595,10 +744,9 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         .into_iter()
         .map(|label| temp.path().join(label).join(&long))
         .collect();
-    let data = |home: &Path| home.join("Library/Application Support/dev.odin.baleyg");
     let paths: Vec<_> = homes
         .iter()
-        .map(|home| SocketPaths::new(&data(home)))
+        .map(|home| fixture_socket_paths(home))
         .collect();
     assert_ne!(
         paths[0].socket, paths[1].socket,
@@ -624,11 +772,13 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
             }
             assert!(
                 owner.0.try_wait().unwrap().is_none(),
-                "long-HOME daemon exited before accepting socket clients"
+                "long-HOME daemon exited before accepting socket clients: {}",
+                fixture_daemon_diagnostic(home, &paths.socket)
             );
             assert!(
                 Instant::now() < deadline,
-                "long-HOME daemon did not bind socket"
+                "long-HOME daemon did not bind socket: {}",
+                fixture_daemon_diagnostic(home, &paths.socket)
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
@@ -682,7 +832,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
 
 #[tokio::test]
 async fn daemon_scheduler_follows_held_checkout_leader_then_claims_same_cli_request() {
-    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use baleyg::store::topology::WorkspaceIdentity;
     use std::os::{fd::AsRawFd, unix::net::UnixStream};
 
     let temp = short_temp();
@@ -707,24 +857,26 @@ async fn daemon_scheduler_follows_held_checkout_leader_then_claims_same_cli_requ
         .as_u64()
         .unwrap();
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
-    let topology = TopologyRoots::isolated_for_tests(
-        home.join("Library/Caches/dev.odin.baleyg"),
-        home.join("Library/Application Support/dev.odin.baleyg"),
-    );
+    let topology = fixture_roots(&home);
     let leader = topology.leader(&identity).unwrap();
     let held_incarnation = leader.incarnation.to_string();
     let leader_file = fs::File::open(topology.leader_lock(&identity)).unwrap();
     let mut daemon_command = cli(&home);
     daemon_command.arg("daemon");
     let mut daemon = detached(daemon_command);
-    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let socket = fixture_socket_paths(&home).socket;
     let deadline = Instant::now() + Duration::from_secs(10);
     while UnixStream::connect(&socket).is_err() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
-            "daemon died before socket readiness"
+            "daemon died before socket readiness: {}",
+            fixture_daemon_diagnostic(&home, &socket)
         );
-        assert!(Instant::now() < deadline, "daemon socket not ready");
+        assert!(
+            Instant::now() < deadline,
+            "daemon socket not ready: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // This command must reach the daemon socket, not the no-daemon fallback.
@@ -915,14 +1067,19 @@ async fn daemon_served_export_survives_multi_frame_cli_reply() {
     let mut command = cli(&home);
     command.arg("daemon");
     let mut daemon = detached(command);
-    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let socket = fixture_socket_paths(&home).socket;
     let deadline = Instant::now() + Duration::from_secs(10);
     while UnixStream::connect(&socket).is_err() {
         assert!(
             daemon.0.try_wait().unwrap().is_none(),
-            "daemon exited before socket readiness"
+            "daemon exited before socket readiness: {}",
+            fixture_daemon_diagnostic(&home, &socket)
         );
-        assert!(Instant::now() < deadline, "daemon socket not ready");
+        assert!(
+            Instant::now() < deadline,
+            "daemon socket not ready: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let indexed = cli(&home)
@@ -968,14 +1125,22 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     let root = checkout(temp.path(), "signal-window");
     let token = temp.path().join("token");
     let address = free_address();
-    let socket = home.join("Library/Application Support/dev.odin.baleyg/run/daemon.sock");
+    let socket = fixture_socket_paths(&home).socket;
     let mut daemon_command = cli(&home);
     daemon_command.arg("daemon");
     let mut daemon = detached(daemon_command);
     let deadline = Instant::now() + Duration::from_secs(10);
     while UnixStream::connect(&socket).is_err() {
-        assert!(daemon.0.try_wait().unwrap().is_none(), "daemon exited");
-        assert!(Instant::now() < deadline, "daemon socket not ready");
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "daemon socket not ready: {}",
+            fixture_daemon_diagnostic(&home, &socket)
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let original_pid = daemon.0.id();
@@ -1134,11 +1299,7 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
             "prior index failed: {}",
             String::from_utf8_lossy(&indexed.stderr)
         );
-        let indexes = home.join(if cfg!(target_os = "macos") {
-            "Library/Caches/dev.odin.baleyg/indexes"
-        } else {
-            ".cache/baleyg/indexes"
-        });
+        let indexes = fixture_roots(&home).cache.join("indexes");
         let index_db = fs::read_dir(indexes)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1171,20 +1332,18 @@ async fn cold_serve_h_preserves_implicit_scip_and_honors_explicit_default_cap() 
         let mut daemon_command = cli(&home);
         daemon_command.arg("daemon");
         let mut daemon = detached(daemon_command);
-        let socket = home.join(if cfg!(target_os = "macos") {
-            "Library/Application Support/dev.odin.baleyg/run/daemon.sock"
-        } else {
-            ".local/share/baleyg/run/daemon.sock"
-        });
+        let socket = fixture_socket_paths(&home).socket;
         let socket_deadline = Instant::now() + Duration::from_secs(10);
         while UnixStream::connect(&socket).is_err() {
             assert!(
                 daemon.0.try_wait().unwrap().is_none(),
-                "private daemon exited before serve"
+                "private daemon exited before serve: {}",
+                fixture_daemon_diagnostic(&home, &socket)
             );
             assert!(
                 Instant::now() < socket_deadline,
-                "private daemon socket did not bind"
+                "private daemon socket did not bind: {}",
+                fixture_daemon_diagnostic(&home, &socket)
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
