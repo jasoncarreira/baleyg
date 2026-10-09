@@ -985,6 +985,49 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(foreign_cancel.status(), reqwest::StatusCode::NOT_FOUND);
     }
+    // A cancel response is not a proof that native H and the FIFO have settled.
+    // Observe the actual selected runtime state before native DELETE; this does
+    // not retry a failed mutation or turn storage_busy into success.
+    for (key, root) in [(&a_key, &a), (&b_key, &b)] {
+        let expected_workspace = root.canonicalize().unwrap();
+        let mut last_observation = String::new();
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let status = client
+                    .get(format!("{base}/api/checkouts/{key}/status"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                let status_code = status.status();
+                let workspace = status.headers().get("X-Baleyg-Workspace")
+                    .and_then(|value| value.to_str().ok()).unwrap_or("missing").to_owned();
+                let catching_up = status.headers().get("X-Baleyg-Catching-Up")
+                    .and_then(|value| value.to_str().ok()).unwrap_or("missing").to_owned();
+                let status_body = status.text().await.unwrap_or_default();
+                let current = client
+                    .get(format!("{base}/api/checkouts/{key}/jobs/current"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                let current_code = current.status();
+                let current_body = current.text().await.unwrap_or_default();
+                let settled = status_code == reqwest::StatusCode::OK
+                    && workspace == expected_workspace.to_str().unwrap()
+                    && catching_up == "false"
+                    && current_code == reqwest::StatusCode::OK
+                    && current_body.trim() == "null";
+                if settled { break; }
+                last_observation = format!(
+                    "{key}: status={status_code}, workspace={workspace}, catchingUp={catching_up}, statusBody={status_body}, current={current_code} {current_body}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("selected H/FIFO did not settle before DELETE: {last_observation}"));
+    }
     for suffix in ["views/saved", "annotations/note"] {
         let deleted = client
             .delete(format!("{base}/api/checkouts/{a_key}/{suffix}"))
