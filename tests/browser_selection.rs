@@ -360,13 +360,30 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         let private = root.join("private");
         fs::create_dir(&private).unwrap();
         fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
-        let forbidden_dir = client
-            .get(format!("{base}/api/checkouts/{key}/tree"))
-            .query(&[("path", "private")])
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
+        let forbidden_dir = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let response = client
+                    .get(format!("{base}/api/checkouts/{key}/tree"))
+                    .query(&[("path", "private")])
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    break response;
+                }
+                let headers = response.headers().clone();
+                let error: Value = response.json().await.unwrap();
+                assert_eq!(
+                    headers["X-Baleyg-Workspace"],
+                    verified_root.to_str().unwrap()
+                );
+                assert_eq!(error["error"]["code"], "index_not_ready", "{error}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("selected tree did not leave transient H admission");
         assert_eq!(forbidden_dir.status(), reqwest::StatusCode::FORBIDDEN);
         assert_eq!(
             forbidden_dir.json::<Value>().await.unwrap()["error"]["code"],
@@ -604,6 +621,74 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(exported.status(), reqwest::StatusCode::OK);
+        if key == &a_key {
+            assert_eq!(
+                preview["packet"]["context"]["calls"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            let jev_status_url = format!("{base}/api/checkouts/{a_key}/jev/status");
+            let before: Value = client
+                .get(&jev_status_url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(before["enabled"], true);
+            let refused = client
+                .post(format!(
+                    "{base}/api/checkouts/{a_key}/questions/{packet_id}/jev-run"
+                ))
+                .bearer_auth(token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                refused.headers()["X-Baleyg-Workspace"],
+                a.canonicalize().unwrap().to_str().unwrap()
+            );
+            assert_eq!(refused.headers()["cache-control"], "no-store");
+            let refusal: Value = refused.json().await.unwrap();
+            assert_eq!(refusal["error"]["code"], "jev_no_candidates", "{refusal}");
+            let after: Value = client
+                .get(&jev_status_url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                after["budget"], before["budget"],
+                "pre-network refusal must not reserve"
+            );
+            let foreign = client
+                .post(format!(
+                    "{base}/api/checkouts/{b_key}/questions/{packet_id}/jev-run"
+                ))
+                .bearer_auth(token)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+            assert_eq!(
+                foreign.headers()["X-Baleyg-Workspace"],
+                b.canonicalize().unwrap().to_str().unwrap()
+            );
+            assert_eq!(
+                foreign.json::<Value>().await.unwrap()["error"]["code"],
+                "not_found"
+            );
+        }
         let imported = client
             .post(format!(
                 "{base}/api/checkouts/{key}/questions/{packet_id}/jev-response"
@@ -2014,6 +2099,24 @@ async fn provider_routes_use_only_the_selected_checkout() {
         .unwrap();
         fs::create_dir(root.join("library")).unwrap();
     }
+    let external_library = temp.path().join("dependency-library");
+    fs::create_dir_all(external_library.join("std/src")).unwrap();
+    fs::create_dir(a.join("src")).unwrap();
+    fs::create_dir(temp.path().join("empty-cargo")).unwrap();
+    fs::write(
+        a.join("Cargo.toml"),
+        "[package]\nname = 'selected_a'\nversion = '0.1.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    fs::write(a.join("src/lib.rs"), "pub fn workspace_only() {}\n").unwrap();
+    fs::write(
+        external_library.join("std/Cargo.toml"),
+        "[package]\nname = 'std'\nversion = '0.0.0'\n",
+    )
+    .unwrap();
+    let library_text =
+        "// café\npub struct LibraryType;\nimpl LibraryType { pub fn method(&self) {} }\n";
+    fs::write(external_library.join("std/src/lib.rs"), library_text).unwrap();
     fs::write(a.join("library/source.rs"), "pub fn from_a() {}\n").unwrap();
     fs::write(b.join("library/source.rs"), "pub fn from_b() {}\n").unwrap();
     let a_id = WorkspaceIdentity::discover(Some(&a), &a).unwrap();
@@ -2038,7 +2141,9 @@ async fn provider_routes_use_only_the_selected_checkout() {
             },
             "acpRunner": if root == &a { Some(runner.clone()) } else { None },
             "acpStateDir": if root == &a { Some(temp.path().join("acp-state")) } else { None },
-            "acpMaxAttempts": if root == &a { Some(2) } else { None }
+            "acpMaxAttempts": if root == &a { Some(2) } else { None },
+            "rustLibrary": if root == &a { Some(external_library.clone()) } else { None },
+            "cargoHome": temp.path().join("empty-cargo")
         }))).unwrap();
     }
     let app = ProvisionedBrowser::new(
@@ -2177,6 +2282,147 @@ async fn provider_routes_use_only_the_selected_checkout() {
         .await;
         assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
     }
+    let (code, headers, initial_refresh) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{a_prefix}/dependencies/refresh"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{initial_refresh}");
+    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    let a_catalog = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (code, _, status) = selected_json(
+                app.clone(),
+                "GET",
+                &format!("{a_prefix}/dependencies"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+            if status["state"] == "ready" && status["catalogId"].is_string() {
+                break status;
+            }
+            if status["state"] == "failed" {
+                panic!("A dependency catalog failed: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("selected A catalog did not become ready");
+    let catalog_id = a_catalog["catalogId"].as_str().unwrap();
+    assert!(
+        a_catalog["symbolCount"].as_u64().unwrap() >= 1,
+        "{a_catalog}"
+    );
+    let symbol_url =
+        format!("{a_prefix}/dependencies/symbols?catalogId={catalog_id}&q=LibraryType");
+    let (code, headers, symbols) =
+        selected_json(app.clone(), "GET", &symbol_url, Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{symbols}");
+    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(symbols["catalogId"], catalog_id);
+    let library_symbol = symbols["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "LibraryType")
+        .expect("selected A library symbol");
+    let source_ref = library_symbol["sourceRef"].as_str().unwrap();
+    let source_url =
+        format!("{a_prefix}/dependencies/source?catalogId={catalog_id}&sourceRef={source_ref}");
+    let (code, headers, source) = selected_json(app.clone(), "GET", &source_url, Value::Null).await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{source}");
+    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(source["rootLabel"], "std");
+    assert_eq!(source["file"]["text"], library_text);
+    assert_eq!(source["id"], source_ref);
+    for route in [
+        format!("{b_prefix}/dependencies/symbols?catalogId={catalog_id}&q=LibraryType"),
+        format!("{b_prefix}/dependencies/source?catalogId={catalog_id}&sourceRef={source_ref}"),
+    ] {
+        let (code, headers, error) = selected_json(app.clone(), "GET", &route, Value::Null).await;
+        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{error}");
+        assert_eq!(error["error"]["code"], "stale_catalog");
+        assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+    }
+    let (code, headers, b_refresh) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{b_prefix}/dependencies/refresh"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{b_refresh}");
+    assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+    let b_catalog_before = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (code, _, status) = selected_json(
+                app.clone(),
+                "GET",
+                &format!("{b_prefix}/dependencies"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+            if status["state"] != "loading" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("selected B catalog did not settle");
+    let (code, headers, refresh) = selected_json(
+        app.clone(),
+        "POST",
+        &format!("{a_prefix}/dependencies/refresh"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{refresh}");
+    assert_eq!(refresh["state"], "loading");
+    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (code, _, status) = selected_json(
+                app.clone(),
+                "GET",
+                &format!("{a_prefix}/dependencies"),
+                Value::Null,
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK, "{status}");
+            if status["state"] == "ready" {
+                break;
+            }
+            if status["state"] == "failed" {
+                panic!("selected A refresh failed: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("selected A refresh did not finish");
+    let (code, headers, b_catalog_after) = selected_json(
+        app.clone(),
+        "GET",
+        &format!("{b_prefix}/dependencies"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{b_catalog_after}");
+    assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+    assert_eq!(
+        b_catalog_after, b_catalog_before,
+        "A refresh must not touch B catalog"
+    );
     let (code, _, symbols) = selected_json(
         app.clone(),
         "GET",
@@ -2224,16 +2470,6 @@ async fn provider_routes_use_only_the_selected_checkout() {
     assert_eq!(code, axum::http::StatusCode::OK, "{answer}");
     assert_eq!(answer["packetId"], packet);
     assert_eq!(answer["source"], "liveAcp");
-    let (code, headers, refresh) = selected_json(
-        app.clone(),
-        "POST",
-        &format!("{b_prefix}/dependencies/refresh"),
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{refresh}");
-    assert_eq!(refresh["state"], "loading");
-    assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
     for (host, authorization, origin, expected) in [
