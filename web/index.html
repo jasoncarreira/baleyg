@@ -30,7 +30,16 @@
   <main>
     <div class="connection-area"><form class="bar" id="connect-form"><label for="token">Daemon token</label><input autocomplete="off" id="token" placeholder="Paste from the token file" required="" spellcheck="false" type="password"/><button>Connect</button><label><input id="remember-token" type="checkbox"/> Remember token on this browser</label><label for="token-file">Load token file instead</label><input id="token-file" type="file"/><span class="muted">Remembering stores this credential in this browser for this address. Use only on a trusted device. Disconnect forgets it.</span></form></div>
     <p id="error" role="alert" hidden></p>
-    <p id="notice" role="status" aria-live="polite">Connect to inspect this workspace. Indexing starts only when you request it.</p>
+    <p id="notice" role="status" aria-live="polite">Connect to inspect a checkout. Indexing starts only when you request it.</p>
+    <section id="checkout-picker" class="checkout-picker" aria-label="Checkout selection" hidden>
+      <label for="checkout-select">Checkout</label>
+      <select id="checkout-select" data-testid="checkout-select" disabled><option value="">Choose a checkout</option></select>
+      <button id="checkout-retry" type="button" hidden>Retry checkout list</button>
+      <span id="checkout-state" role="status" aria-live="polite">Loading checkouts…</span>
+      <span id="checkout-root" class="checkout-root" data-testid="checkout-root">No checkout selected</span>
+      <span id="catching-up" class="warning" role="status" aria-live="polite" hidden>Catching up — evidence may be stale</span>
+      <span id="daemon-state" class="detail" role="status"></span>
+    </section>
     <div id="workspace" hidden>
       <section class="workspace-toolbar" aria-labelledby="status-title">
         <div class="bar workspace-actions"><h2 id="status-title">Workspace</h2><button id="refresh" type="button">Refresh status &amp; view</button><button id="index" type="button">Index workspace</button><button id="cancel" type="button" hidden>Stop waiting</button>

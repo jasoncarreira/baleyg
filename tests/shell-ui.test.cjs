@@ -1,5 +1,7 @@
 "use strict";
 const test = require("node:test");
+const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPED = `/api/checkouts/${ROOT}`;
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -22,7 +24,15 @@ function harness(withApp = false) {
   const run = code => vm.runInContext(code,context);
   if(withApp)run(fs.readFileSync("web/sequence.js","utf8"));
   run(fs.readFileSync("web/shell.js","utf8"));
-  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if(withApp){run(fs.readFileSync("web/app.js","utf8"));run(`token="synthetic";selectedRootKey="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";checkouts=[{rootKey:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",workspaceRoot:"/repo",state:"available"}];status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/repo"};`);}
+  if (withApp) {
+    let handler = context.fetch;
+    Object.defineProperty(context,"fetch",{configurable:true,get:()=>request,set(fn){handler=fn;}});
+    const request=(url,...args)=>{
+      assert.ok(url.startsWith(`${SCOPED}/`),`Unexpected unscoped/wrong-root route: ${url}`);
+      return handler("/api" + url.slice(SCOPED.length),...args);
+    };
+  }
   return {get,document,context,run,requests,shell:context.window.BaleygShell};
 }
 const all = node => [node,...node.children.flatMap(all)];

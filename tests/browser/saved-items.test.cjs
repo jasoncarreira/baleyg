@@ -1,7 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
+const { existsSync, chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { basename, join, resolve, sep } = require("node:path");
 const { spawn } = require("node:child_process");
@@ -18,7 +18,19 @@ assert.ok(chromiumPath.startsWith(`${resolve(browserRoot)}${sep}`), "Chromium mu
 const ROOT = resolve(__dirname, "../..");
 const SOURCE_P = "fn seed(value: i32) -> i32 { old_step(value) }\nfn old_step(value: i32) -> i32 { value + 1 }\nfn other() -> i32 { 0 }\n";
 const SOURCE_Q = "fn seed(value: i64) -> i64 { new_step(value) }\nfn new_step(value: i64) -> i64 { value + 2 }\nfn other() -> i32 { 0 }\n";
-let binary, watchFixtureBinary, suiteBinaryDir;
+// The production listener requires an explicit root key for every scoped API call.
+const scoped = (key, suffix) => `/api/checkouts/${encodeURIComponent(key)}/${suffix}`;
+const browserPath = (page, suffix) => scoped(page.checkoutRootKey, suffix);
+function assertSelectedBrowserRequests(requests, rootKey) {
+  const prefix = scoped(rootKey, "");
+  for (const request of requests) {
+    const path = new URL(request.url).pathname;
+    if (!path.startsWith("/api/")) continue;
+    assert.ok(path === "/api/checkouts" || path === "/api/daemon/status" || path.startsWith(prefix),
+      `browser request bypassed explicit checkout selection: ${request.method} ${path}`);
+  }
+}
+let binary, suiteBinaryDir;
 
 const delay = ms => new Promise(resolveDelay => setTimeout(resolveDelay, ms));
 function run(command, args, {cwd = ROOT, env = process.env, timeout = 180000} = {}) {
@@ -56,19 +68,6 @@ test.before(async () => {
   binary = join(suiteBinaryDir, basename(built));
   copyFileSync(built, binary);
   assert.ok(existsSync(binary), `fixed suite binary is unavailable at ${binary}`);
-
-  // Use the dedicated legacy HTTP fixture rather than production's singleton CLI.
-  // Parse Cargo's artifact messages: the hash-suffixed test executable is not
-  // stable in target/debug/deps, and another verification lane may replace it.
-  const compiled = await run("cargo", ["test", "--locked", "--test", "watch", "--no-run", "--message-format=json"], {timeout:900000});
-  const artifacts = compiled.stdout.split("\n").filter(Boolean).map(line => JSON.parse(line))
-    .filter(message => message.reason === "compiler-artifact" && message.target?.name === "watch" && message.executable);
-  assert.equal(artifacts.length, 1, `expected one watch test executable, found ${artifacts.length}`);
-  const executable = artifacts[0].executable;
-  assert.ok(resolve(executable) === executable && existsSync(executable), `watch fixture executable is unavailable at ${executable}`);
-  watchFixtureBinary = join(suiteBinaryDir, basename(executable));
-  copyFileSync(executable, watchFixtureBinary);
-  assert.ok(existsSync(watchFixtureBinary), `fixed watch fixture executable is unavailable at ${watchFixtureBinary}`);
 }, {timeout:960000});
 test.after(() => { if (suiteBinaryDir) rmSync(suiteBinaryDir, {recursive:true, force:true}); });
 
@@ -102,36 +101,58 @@ function findNamed(root, name, found = []) {
   }
   return found;
 }
-async function startDaemon(paths) {
-  const child = spawn(watchFixtureBinary, ["--exact", "legacy_http_fixture_entry", "--nocapture"],
-    {cwd:ROOT, env:{...paths.env,
-      BALEYG_LEGACY_HTTP_FIXTURE:"1",
-      BALEYG_LEGACY_WORKSPACE:paths.workspace,
-      BALEYG_LEGACY_BIND:"127.0.0.1:0",
-      BALEYG_LEGACY_TOKEN_FILE:paths.tokenFile,
-      BALEYG_LEGACY_CARGO_HOME:paths.cargoHome,
-      BALEYG_LEGACY_MAX_FILE_BYTES:"2097152",
-    }, stdio:["ignore","ignore","pipe"]});
-  let stderr = "", base, rejected;
-  const address = new Promise((resolveAddress, rejectAddress) => {
-    rejected = rejectAddress;
-    child.stderr.on("data", chunk => {
-      stderr = (stderr + chunk).slice(-16384);
-      const match = stderr.match(/Baleyg: (http:\/\/127\.0\.0\.1:\d+)\//);
-      if (match && !base) { base = match[1]; resolveAddress(base); }
+async function startDaemon(paths, expectedRevision) {
+  const child = spawn(binary, ["serve", "--workspace", paths.workspace, "--bind", "127.0.0.1:0", "--token-file", paths.tokenFile],
+    {cwd:ROOT, env:paths.env, stdio:["ignore","ignore","pipe"]});
+  try {
+    let stderr = "", base, rejected;
+    const address = new Promise((resolveAddress, rejectAddress) => {
+      rejected = rejectAddress;
+      child.stderr.on("data", chunk => {
+        stderr = (stderr + chunk).slice(-16384);
+        const match = stderr.match(/Baleyg: (http:\/\/127\.0\.0\.1:\d+)\//);
+        if (match && !base) { base = match[1]; resolveAddress(base); }
+      });
+      child.once("error", rejectAddress);
+      child.once("exit", (code, signal) => { if (!base) rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): ${stderr.replaceAll(paths.token,"[redacted]")}`)); });
     });
-    child.once("error", rejectAddress);
-    child.once("exit", (code, signal) => { if (!base) rejectAddress(new Error(`daemon exited before readiness (${code ?? signal}): ${stderr.replaceAll(paths.token,"[redacted]")}`)); });
-  });
-  const timer = setTimeout(() => rejected(new Error(`daemon address timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`)),10000);
-  try { await address; } finally { clearTimeout(timer); }
-  const deadline = Date.now()+10000;
-  while (true) {
-    try { const health=await fetch(`${base}/healthz`,{signal:AbortSignal.timeout(1000)}); if(health.ok) break; } catch {}
-    if(Date.now()>deadline) throw new Error(`daemon health timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`);
-    await delay(20);
-  }
-  return {child, base, stderr:() => stderr};
+    const timer = setTimeout(() => rejected(new Error(`daemon address timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`)),10000);
+    try { await address; } finally { clearTimeout(timer); }
+    const deadline = Date.now()+10000;
+    while (true) {
+      try { const health=await fetch(`${base}/healthz`,{signal:AbortSignal.timeout(1000)}); if(health.ok) break; } catch {}
+      if(Date.now()>deadline) throw new Error(`daemon health timed out: ${stderr.replaceAll(paths.token,"[redacted]")}`);
+      await delay(20);
+    }
+    const selected = {child, base, stderr:() => stderr};
+    const discoveryDeadline = Date.now()+25000;
+    let lastBusyRow = null;
+    while (Date.now() < discoveryDeadline) {
+      const listing = await api(base,paths.token,"GET","/api/checkouts");
+      assert.equal(listing.status,200,JSON.stringify(listing.data));
+      const rows = listing.data.checkouts.filter(row => row.workspaceRoot === realpathSync(paths.workspace));
+      assert.equal(rows.length,1,`expected exactly one matching workspace: ${JSON.stringify(listing.data)}`);
+      const row = rows[0];
+      assert.ok(typeof row.rootKey === "string" && /^[a-f0-9]{64}$/.test(row.rootKey),`invalid checkout key: ${JSON.stringify(row)}`);
+      if (row.state === "storage_busy") {
+        lastBusyRow = row;
+        await delay(50);
+        continue;
+      }
+      assert.equal(row.state,"available",`checkout is not selectable: ${JSON.stringify(row)}`);
+      lastBusyRow = null;
+      selected.rootKey = row.rootKey;
+      const status = await api(base,paths.token,"GET",scoped(selected.rootKey,"status"));
+      if (status.status === 200) {
+        if (status.data.revision?.indexRevision === expectedRevision) return selected;
+        assert.ok(status.data.revision?.indexRevision < expectedRevision, `unexpected startup revision: ${JSON.stringify(status.data.revision)}`);
+        await delay(50); continue;
+      }
+      assert.equal(status.status,503,JSON.stringify(status.data));
+      await delay(50);
+    }
+    throw new Error(`selected checkout did not become ready within 25s${lastBusyRow ? `: persistent ${JSON.stringify(lastBusyRow)}` : ""}: ${stderr.replaceAll(paths.token,"[redacted]")}`);
+  } catch (error) { child.kill("SIGTERM"); throw error; }
 }
 async function stopDaemon(server) {
   if (!server?.child || server.child.exitCode !== null) return;
@@ -153,26 +174,31 @@ function assertPinnedUrl(raw, pin) {
   assert.equal(url.searchParams.get("indexGeneration"),pin.indexGeneration);
   assert.equal(url.searchParams.get("indexRevision"),String(pin.indexRevision));
 }
-async function indexThroughApi(base, token, expected) {
-  const accepted=await api(base,token,"POST","/api/index",{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
+async function indexThroughApi(server, token, expected) {
+  const accepted=await api(server.base,token,"POST",scoped(server.rootKey,"index"),{expectedRevision:expected});assert.equal(accepted.status,202,JSON.stringify(accepted.data));
   const deadline=Date.now()+20000;
   while(Date.now()<deadline){
-    const job=await api(base,token,"GET",`/api/jobs/${encodeURIComponent(accepted.data.id)}`);
+    const job=await api(server.base,token,"GET",scoped(server.rootKey,`jobs/${encodeURIComponent(accepted.data.id)}`));
     assert.equal(job.status,200,JSON.stringify(job.data));
     if(job.data.finishedAt!==null){assert.equal(job.data.state,"done",JSON.stringify(job.data));return job.data.revision;}
     await delay(25);
   }
   throw new Error("index job did not complete within 20 seconds");
 }
-async function seedId(base, token, name) {
-  const symbols=await api(base,token,"GET",`/api/symbols?q=${encodeURIComponent(name)}`);assert.equal(symbols.status,200,JSON.stringify(symbols.data));
+async function seedId(server, token, name) {
+  const symbols=await api(server.base,token,"GET",scoped(server.rootKey,`symbols?q=${encodeURIComponent(name)}`));assert.equal(symbols.status,200,JSON.stringify(symbols.data));
   const item=symbols.data.items.find(value=>value.name===name);assert.ok(item,`missing ${name} symbol`);return item.id;
 }
-async function connect(page, base, token) {
+async function connect(page, server, token) {
+  const {base,rootKey} = server;
+  page.checkoutRootKey = rootKey;
   await page.goto(`${base}/`,{waitUntil:"domcontentloaded"});
   await page.locator("#token").fill(token);
   await page.locator("#connect-form button").click();
+  await page.locator("#checkout-select").waitFor({state:"visible",timeout:15000});
+  await page.locator("#checkout-select").selectOption(rootKey);
   await page.locator("#workspace").waitFor({state:"visible",timeout:15000});
+  await page.waitForFunction(() => document.querySelector("#status")?.textContent?.includes("Revision"),null,{timeout:15000});
 }
 async function openTools(page) {
   await page.locator("#view-tools").click();
@@ -181,10 +207,10 @@ async function openTools(page) {
 }
 async function selectSymbol(page, name) {
   await page.locator("#search").fill(name);
-  const symbols=page.waitForResponse(response=>new URL(response.url()).pathname==="/api/symbols"&&response.status()===200);
+  const symbols=page.waitForResponse(response=>new URL(response.url()).pathname===browserPath(page,"symbols")&&response.status()===200);
   await page.locator("#search-form").evaluate(form=>form.requestSubmit()); await symbols;
   const pick=page.locator("#symbols button.symbol").filter({hasText:name}).first();await pick.waitFor({state:"visible"});
-  const query=page.waitForResponse(response=>new URL(response.url()).pathname==="/api/query"&&response.status()===200);
+  const query=page.waitForResponse(response=>new URL(response.url()).pathname===browserPath(page,"query")&&response.status()===200);
   await pick.click();await query;
 }
 const row = (page, kind, id) => page.locator(`li[data-saved-kind="${kind}"][data-saved-id="${id}"]`);
@@ -219,30 +245,31 @@ function insertLegacy(dbPath, kind, id, seed) {
 
 for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale replay, orphan, and legacy safety`, {timeout:180000}, async t => {
   const paths=fixture();let server,browser,context,page;const pageErrors=[];
-  t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true});});
+  t.after(async()=>{try{await context?.close();}catch{}try{await browser?.close();}catch{}await stopDaemon(server);rmSync(paths.temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
   const indexed=await run(binary,["index","--workspace",paths.workspace],{env:paths.env,timeout:30000});
   const initialPin=JSON.parse(indexed.stdout).status.revision;
-  server=await startDaemon(paths);
-  const servingStatus=await api(server.base,paths.token,"GET","/api/status");
+  server=await startDaemon(paths,initialPin.indexRevision+1);
+  const servingStatus=await api(server.base,paths.token,"GET",scoped(server.rootKey,"status"));
   assert.equal(servingStatus.status,200,JSON.stringify(servingStatus.data));
+  const originalRootKey=server.rootKey;
   const P=servingStatus.data.revision;
   assert.equal(P.indexGeneration,initialPin.indexGeneration);
   assert.equal(P.indexRevision,initialPin.indexRevision+1);
   let wrongToken; do { wrongToken = randomBytes(32).toString("hex"); } while (wrongToken === paths.token);
-  const denied = await fetch(`${server.base}/api/views`, {signal:AbortSignal.timeout(8000),
+  const denied = await fetch(`${server.base}${scoped(server.rootKey,"views")}`, {signal:AbortSignal.timeout(8000),
     headers:{Origin:server.base,Authorization:`Bearer ${wrongToken}`}});
   assert.equal(denied.status,401,"a wrong runtime bearer must not read saved items");
   assert.deepEqual(findNamed(paths.temp,"workspace.db"),[],"denied saved reads must not create workspace.db");
   browser=await chromium.launch({headless:true});context=await browser.newContext();page=await context.newPage();
   page.on("pageerror",error=>pageErrors.push(error));
   const requests=[];page.on("request",request=>requests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
-  await connect(page,server.base,paths.token);
-  const initialLists=requests.filter(request=>["/api/views","/api/annotations"].includes(new URL(request.url).pathname));
+  await connect(page,server,paths.token);
+  const initialLists=requests.filter(request=>[browserPath(page,"views"),browserPath(page,"annotations")].includes(new URL(request.url).pathname));
   assert.equal(initialLists.length,2);for(const request of initialLists)assertPinnedUrl(request.url,P);
   assert.deepEqual(findNamed(paths.temp,"workspace.db"),[],"saved reads must not create workspace.db");
-  await openTools(page);await selectSymbol(page,"seed");const seed=await seedId(server.base,paths.token,"seed");
+  await openTools(page);await selectSymbol(page,"seed");const seed=await seedId(server,paths.token,"seed");
 
-  const putPath=kind==="view"?"/api/views/":"/api/annotations/";
+  const putPath=browserPath(page,kind==="view"?"views/":"annotations/");
   if(kind==="view") await page.locator("#view-title").fill("Saved view");
   else {await page.locator("#note-title").fill("Saved note");await page.locator("#note").fill("First body");}
   const putRequestPromise=page.waitForRequest(request=>request.method()==="PUT"&&new URL(request.url()).pathname.startsWith(putPath));
@@ -256,12 +283,12 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   assert.equal(putState.attachment.availability,"ready");assert.equal(putState.attachment.result.status,"attached");assert.equal(putState.attachment.result.targetId,seed);
   const savedRow=row(page,kind,id);await savedRow.waitFor({state:"visible"});assert.equal(await savedRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
 
-  let baseline=requests.filter(request=>new URL(request.url).pathname==="/api/query").length;
-  const loadRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname==="/api/query"&&new URL(request.url()).searchParams.has("indexGeneration"));
+  let baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
+  const loadRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"));
   await savedRow.getByRole("button",{name:"Load",exact:true}).click();const loadRequest=await loadRequestPromise,loadResponse=await loadRequest.response();
   assert.ok(loadResponse);assert.equal(loadResponse.status(),200);assertPinnedUrl(loadRequest.url(),P);assert.equal(loadRequest.postDataJSON().seed,seed);
   assert.deepEqual((await loadResponse.json()).revision,P);await delay(250);
-  assert.equal(requests.filter(request=>new URL(request.url).pathname==="/api/query").length,baseline+1);
+  assert.equal(requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length,baseline+1);
 
   await savedRow.getByRole("button",{name:kind==="view"?"Edit title":"Edit",exact:true}).click();
   await selectSymbol(page,"other");
@@ -271,33 +298,33 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   await page.locator(kind==="view"?"#save-view":"#save-note").click();const editRequest=await editRequestPromise,editBody=editRequest.postDataJSON();
   const editResponse=await editRequest.response();assert.ok(editResponse);assert.equal(editResponse.status(),200);
   assertPinnedUrl(editRequest.url(),P);assert.equal(kind==="view"?editBody.query.seed:editBody.nodeId,seed);assert.equal(Object.hasOwn(editBody,"anchor"),false);
-  await page.reload({waitUntil:"domcontentloaded"});await connect(page,server.base,paths.token);await openTools(page);if(kind==="note")await selectSymbol(page,"seed");
+  await page.reload({waitUntil:"domcontentloaded"});await connect(page,server,paths.token);await openTools(page);if(kind==="note")await selectSymbol(page,"seed");
   await row(page,kind,id).waitFor({state:"visible"});assert.match(await row(page,kind,id).textContent(),kind==="view"?/Edited view/:/Edited note[\s\S]*Edited body/);
 
   const dbs=findNamed(paths.temp,"workspace.db");assert.equal(dbs.length,1,JSON.stringify(dbs));const dbPath=dbs[0];
   const anchorBefore=rawJsonProperty(readPayload(dbPath,kind,id),"anchor");assert.ok(anchorBefore?.startsWith("{"),anchorBefore);
   const staleRow=row(page,kind,id);assert.equal(await staleRow.getByRole("button",{name:"Load",exact:true}).isEnabled(),true);
-  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server.base,paths.token,P);assert.equal(Q.indexGeneration,P.indexGeneration);assert.equal(Q.indexRevision,P.indexRevision+1);
-  assert.equal(await seedId(server.base,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
-  baseline=requests.filter(request=>new URL(request.url).pathname==="/api/query").length;
-  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname==="/api/query"&&new URL(request.url()).searchParams.has("indexGeneration"));
-  const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname==="/api/query"&&new URL(response.url()).searchParams.has("indexGeneration"));
+  writeFileSync(paths.source,SOURCE_Q);const Q=await indexThroughApi(server,paths.token,P);assert.equal(Q.indexGeneration,P.indexGeneration);assert.equal(Q.indexRevision,P.indexRevision+1);
+  assert.equal(await seedId(server,paths.token,"seed"),seed,"header edit must retain the original ordinal declaration ID");
+  baseline=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;
+  const staleRequestPromise=page.waitForRequest(request=>request.method()==="POST"&&new URL(request.url()).pathname===browserPath(page,"query")&&new URL(request.url()).searchParams.has("indexGeneration"));
+  const staleResponsePromise=page.waitForResponse(response=>response.request().method()==="POST"&&new URL(response.url()).pathname===browserPath(page,"query")&&new URL(response.url()).searchParams.has("indexGeneration"));
   await staleRow.getByRole("button",{name:"Load",exact:true}).click();const staleRequest=await staleRequestPromise,staleResponse=await staleResponsePromise;
   assertPinnedUrl(staleRequest.url(),P);assert.equal(staleRequest.postDataJSON().seed,seed);assert.equal(staleResponse.status(),200);
-  const staleData=await staleResponse.json();assert.deepEqual(staleData.revision,P);assert.notDeepEqual(staleData.revision,Q);
+  const staleData=await staleResponse.json();assert.deepEqual(staleData.revision,P,`pinned replay ${new URL(staleRequest.url()).pathname}${new URL(staleRequest.url()).search} must return saved revision P=${JSON.stringify(P)}, not Q=${JSON.stringify(Q)}`);assert.notDeepEqual(staleData.revision,Q);
   assert.ok(staleData.calls.some(call=>call.calleeText==="old_step"),JSON.stringify(staleData));
   assert.doesNotMatch(JSON.stringify(staleData),/new_step/);await delay(800);
-  assert.equal(requests.filter(request=>new URL(request.url).pathname==="/api/query").length,baseline+1,"stale replay must not retry");
+  assert.equal(requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length,baseline+1,"stale replay must not retry");
   assert.doesNotMatch(await page.locator("#calls").textContent(),/new_step/);
 
-  await page.reload({waitUntil:"domcontentloaded"});await connect(page,server.base,paths.token);await openTools(page);
-  const queryCountAfterReconnect=requests.filter(request=>new URL(request.url).pathname==="/api/query").length;assert.equal(queryCountAfterReconnect,baseline+1);
+  await page.reload({waitUntil:"domcontentloaded"});await connect(page,server,paths.token);await openTools(page);
+  const queryCountAfterReconnect=requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;assert.equal(queryCountAfterReconnect,baseline+1);
   const orphanRow=row(page,kind,id);await orphanRow.waitFor({state:"visible"});assert.match(await orphanRow.textContent(),/header changed/i);
   const disabledLoad=orphanRow.getByRole("button",{name:"Load",exact:true});assert.equal(await disabledLoad.isDisabled(),true);
   const box=await disabledLoad.boundingBox();assert.ok(box);await page.mouse.click(box.x+box.width/2,box.y+box.height/2);await delay(250);
-  assert.equal(requests.filter(request=>new URL(request.url).pathname==="/api/query").length,queryCountAfterReconnect);
-  const stateRoute=kind==="view"?`/api/views/${id}${pinSuffix(Q)}`:`/api/annotations${pinSuffix(Q)}`;
-  const direct=await api(server.base,paths.token,"GET",stateRoute);assert.equal(direct.status,200,JSON.stringify(direct.data));
+  assert.equal(requests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length,queryCountAfterReconnect);
+  const stateRoute=kind==="view"?`views/${id}${pinSuffix(Q)}`:`annotations${pinSuffix(Q)}`;
+  const direct=await api(server.base,paths.token,"GET",scoped(server.rootKey,stateRoute));assert.equal(direct.status,200,JSON.stringify(direct.data));
   const directState=kind==="view"?direct.data:direct.data.find(item=>item.annotation.id===id);assert.ok(directState);
   assert.equal(directState.indexGeneration,Q.indexGeneration);assert.equal(directState.indexRevision,Q.indexRevision);assert.equal(directState.attachment.result.status,"orphaned");
   assert.equal(directState.attachment.result.reason,"headerMismatch");assert.equal(directState.attachment.result.targetId,null);
@@ -313,15 +340,16 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
 
   await context.close();context=null;await stopDaemon(server);server=null;
   const legacyId=`legacy-${kind}`;insertLegacy(dbPath,kind,legacyId,seed);
-  server=await startDaemon(paths);
-  const reopenedStatus=await api(server.base,paths.token,"GET","/api/status");
+  server=await startDaemon(paths,Q.indexRevision);
+  const reopenedStatus=await api(server.base,paths.token,"GET",scoped(server.rootKey,"status"));
   assert.equal(reopenedStatus.status,200,JSON.stringify(reopenedStatus.data));
   const R=reopenedStatus.data.revision;
+  assert.equal(server.rootKey,originalRootKey,"reopened checkout must retain identity");
   assert.equal(R.indexGeneration,Q.indexGeneration);
-  assert.equal(R.indexRevision,Q.indexRevision+1);
+  assert.equal(R.indexRevision,Q.indexRevision,"serve restart must retain the latest indexed revision");
   context=await browser.newContext();page=await context.newPage();page.on("pageerror",error=>pageErrors.push(error));
   const legacyRequests=[];page.on("request",request=>legacyRequests.push({url:request.url(),method:request.method(),body:request.postDataJSON?.()}));
-  await connect(page,server.base,paths.token);await openTools(page);
+  await connect(page,server,paths.token);await openTools(page);
   const persistedOrphan=row(page,kind,id);await persistedOrphan.waitFor({state:"visible"});
   assert.match(await persistedOrphan.textContent(),kind==="view"?/Orphan edited view/:/Orphan edited note[\s\S]*Orphan edited body/);
   const legacyRow=row(page,kind,legacyId);await legacyRow.waitFor({state:"visible"});
@@ -335,10 +363,12 @@ for (const kind of ["view","note"]) test(`real browser ${kind} save, edit, stale
   // The list is replaced after a later loadSaved(); wait for the re-rendered row carrying the edited title, never the pre-PUT row.
   const legacyRowAfter=row(page,kind,legacyId).filter({hasText:kind==="view"?"Legacy view edited":"Legacy note"});await legacyRowAfter.waitFor({state:"visible"});
   const legacyLoadAfter=legacyRowAfter.getByRole("button",{name:"Load",exact:true});await legacyLoadAfter.waitFor({state:"visible"});const legacyBox=await legacyLoadAfter.boundingBox();assert.ok(legacyBox);
-  const legacyQueryBaseline=legacyRequests.filter(request=>new URL(request.url).pathname==="/api/query").length;await page.mouse.click(legacyBox.x+legacyBox.width/2,legacyBox.y+legacyBox.height/2);await delay(250);
-  assert.equal(legacyRequests.filter(request=>new URL(request.url).pathname==="/api/query").length,legacyQueryBaseline);
+  const legacyQueryBaseline=legacyRequests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length;await page.mouse.click(legacyBox.x+legacyBox.width/2,legacyBox.y+legacyBox.height/2);await delay(250);
+  assert.equal(legacyRequests.filter(request=>new URL(request.url).pathname===browserPath(page,"query")).length,legacyQueryBaseline);
   const deleteResponse=page.waitForResponse(response=>response.request().method()==="DELETE"&&new URL(response.url()).pathname===`${putPath}${legacyId}`);
   await row(page,kind,legacyId).getByRole("button",{name:"Delete",exact:true}).click();assert.equal((await deleteResponse).status(),204);
   assert.equal(rawJsonProperty(readPayload(dbPath,kind,id),"anchor"),anchorBefore,"legacy deletion must not change the anchored item");
+  assertSelectedBrowserRequests(requests,originalRootKey);
+  assertSelectedBrowserRequests(legacyRequests,server.rootKey);
   assert.deepEqual(pageErrors.map(error=>error.message),[]);
 });

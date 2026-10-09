@@ -7,9 +7,11 @@ const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/sequence.js"), "utf8") + "\n" + fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
 const KEY = "baleyg.daemonToken.v1";
+const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPED = `/api/checkouts/${ROOT}`;
 const response = data => ({ok:true, status:200, json:async () => data});
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function harness({saved, blocked = false} = {}) {
+function harness({saved, blocked = false, routes} = {}) {
   const elements = new Map(), requests = [], writes = [], stored = new Map(saved === undefined ? [] : [[KEY, saved]]);
   function node(tagName) {
     const classes = new Set();
@@ -31,6 +33,11 @@ function harness({saved, blocked = false} = {}) {
     document:{getElementById:get, createElement:node, createElementNS:(_,tag) => node(tag), createDocumentFragment:node, createTextNode:text => ({textContent:text}), body:node()},
     fetch:async (url, options) => {
       requests.push({url,options});
+      if (routes) return routes(url, options);
+      if (url === "/api/checkouts") return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+      if (url === "/api/daemon/status") return response({activeCheckouts:0});
+      assert.ok(url.startsWith(`${SCOPED}/`), `Unexpected unscoped route: ${url}`);
+      url = "/api" + url.slice(SCOPED.length);
       if (url === "/api/status") return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},workspaceRoot:"/synthetic",stats:{}});
       if (url.startsWith("/api/tree?")) return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});
       if (["/api/views","/api/annotations"].includes(url)) return response([]);
@@ -38,17 +45,22 @@ function harness({saved, blocked = false} = {}) {
       throw new Error(`Unexpected request: ${url}`);
     }});
   vm.runInContext(source, context);
-  async function connect(value = "synthetic-new", remember = false) {
+  async function connect(value = "synthetic-new", remember = false, select = true) {
     get("token").value = value; get("remember-token").checked = remember;
     get("connect-form").listeners.submit({preventDefault() {}});
     await flush();
+    if (select && !get("checkout-select").disabled) {
+      get("checkout-select").value = ROOT;
+      await get("checkout-select").listeners.change({target:get("checkout-select")});
+      await flush();
+    }
   }
   async function file(text, size = Buffer.byteLength(text)) {
     get("token-file").value = "synthetic-selection";
     get("token-file").files = [{size, text:async () => text}];
     await get("token-file").listeners.change();
   }
-  return {get, context, requests, writes, stored, connect, file};
+  return {get, context, run:code=>vm.runInContext(code,context), requests, writes, stored, connect, file};
 }
 
 test("saved token is loaded with opt-in checked but makes no startup request", () => {
@@ -87,7 +99,8 @@ for (const status of [401,403,500]) test(`failed ${status} connect ${status === 
   await h.connect("synthetic-new", true);
   assert.equal(h.stored.get(KEY), status === 500 ? "synthetic-old" : undefined);
   assert.equal(h.writes.length, 0); assert.equal(h.get("workspace").hidden, true);
-  assert.equal(h.get("error").hidden, false);
+  if (status === 500) assert.match(h.get("checkout-state").textContent, /unavailable/i);
+  else assert.equal(h.get("error").hidden, false);
 });
 test("network failure retains existing saved token and never saves the rejected replacement", async () => {
   const h = harness({saved:"synthetic-old"}); h.context.fetch = async () => { throw new Error("Synthetic offline"); };
@@ -172,3 +185,288 @@ test("pending file read cannot restore credentials after Disconnect", async () =
   h.get("logout").listeners.click(); finish("synthetic-old"); await pending;
   assert.equal(h.get("token").value, ""); assert.equal(h.stored.has(KEY), false);
 });
+
+// The same revision and relative path cannot prove checkout identity. Only the
+// exact selected root URL and generation fence can do that.
+test("explicit A to B switch keeps exact B URLs and rejects late A 401 with equal revision and path", async () => {
+  const A = ROOT, B = "b".repeat(64), pair = {indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const rows = [A,B].map((rootKey,i) => ({rootKey,workspaceRoot:i ? "/checkout/B" : "/checkout/A",state:"available",active:false}));
+  let holdA = false, releaseA;
+  const h = harness({routes:async (url, options) => {
+    if (url === "/api/checkouts") return response({checkouts:rows});
+    if (url === "/api/daemon/status") return response({activeCheckouts:0});
+    const match = /^\/api\/checkouts\/([ab]{64})\/([^?]+)(?:\?.*)?$/.exec(url);
+    assert.ok(match, `A request leaked to a global/default route: ${url}`);
+    const [,root,suffix] = match, label = root === A ? "A" : "B";
+    if (suffix === "status") return response({revision:pair,workspaceRoot:`/checkout/${label}`,stats:{files:1},diagnostics:[`diagnostic-${label}`]});
+    if (suffix === "tree") {
+      if (root === A && holdA) return new Promise(resolve => {releaseA = resolve;});
+      return response({revision:pair,path:"",root:`/checkout/${label}`,items:[{kind:"file",name:"same.rs",path:"same.rs",methodCount:1}],nextOffset:null});
+    }
+    if (suffix === "source") return response({revision:pair,file:{path:"same.rs",text:`source-${label}`}});
+    if (suffix === "jev/status" || suffix === "acp/status") return response({enabled:root===B});
+    if (suffix === "views" || suffix === "annotations") return response([]);
+    if (suffix === "jobs/current") return response(null);
+    if (suffix === "dependencies") return response({state:"disabled",workspaceRevision:pair,catalogId:null,packages:[],warnings:[]});
+    if (["query","index","views/item","annotations/item"].includes(suffix)) return response({});
+    throw new Error(`Unexpected ${url} ${options.method}`);
+  }});
+  await h.connect("synthetic",false,false);
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.deepEqual(h.requests.map(r => r.url),["/api/checkouts","/api/daemon/status"]);
+  h.get("checkout-select").value=A;
+  await h.get("checkout-select").listeners.change({target:h.get("checkout-select")});
+  await flush(); await flush();
+  assert.equal(h.get("checkout-root").textContent,"/checkout/A");
+  holdA=true;const old=h.run("loadTreeRoot()");
+  assert.ok(releaseA,"A tree request must remain deferred");
+  const switchAt=h.requests.length;
+  h.get("checkout-select").value=B;
+  await h.get("checkout-select").listeners.change({target:h.get("checkout-select")});
+  await flush(); await flush();
+  await h.run("showSource({path:'same.rs',range:{startLine:1,endLine:1}},status.revision)");
+  for (const [route,method] of [["/api/query","POST"],["/api/views/item","PUT"],["/api/annotations/item","DELETE"]]) {
+    await h.run(`api('${route}','${method}',{})`);
+  }
+  const afterB=h.requests.slice(switchAt);
+  assert.ok(afterB.length>4);
+  assert.ok(afterB.every(({url}) => url.startsWith(`/api/checkouts/${B}/`)), JSON.stringify(afterB.map(r=>r.url)));
+  assert.ok(afterB.some(({url,options}) => url === `/api/checkouts/${B}/source?path=same.rs&indexGeneration=${pair.indexGeneration}&indexRevision=1` && options.method === "GET"));
+  assert.ok(afterB.some(({url,options}) => url === `/api/checkouts/${B}/query` && options.method === "POST"));
+  assert.ok(afterB.some(({url,options}) => url === `/api/checkouts/${B}/views/item` && options.method === "PUT"));
+  assert.ok(afterB.some(({url,options}) => url === `/api/checkouts/${B}/annotations/item` && options.method === "DELETE"));
+  releaseA({ok:false,status:401,json:async()=>({error:{message:"late-A-auth"}})});
+  await old;
+  assert.equal(h.run("selectedRootKey"),B);
+  assert.equal(h.get("checkout-root").textContent,"/checkout/B");
+  assert.match(h.get("diagnostics").textContent,/diagnostic-B/);
+  assert.doesNotMatch(h.get("diagnostics").textContent,/diagnostic-A/);
+  const sourceText = function walk(node) { return [node.textContent,...(node.children || []).flatMap(walk)].join(" "); };
+  assert.match(sourceText(h.get("source")),/source-B/);
+  assert.match(h.get("acp-status").textContent,/enabled|available/i);
+  assert.equal(h.get("connect-form").hidden,true);
+  assert.equal(h.get("error").hidden,true);
+});
+
+test("one available checkout never auto-selects; list retry recovers without scoped traffic", async () => {
+  let fail=true;
+  const h=harness({routes:(url,opts)=>{
+    if(url==="/api/checkouts") return fail ? {ok:false,status:503,json:async()=>({error:{message:"list temporarily unavailable"}})}
+      : response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    throw new Error(`Scoped call before explicit selection: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.equal(h.get("checkout-select").disabled,true);
+  assert.equal(h.get("checkout-retry").hidden,false);
+  fail=false;h.get("checkout-retry").listeners.click();await flush();
+  assert.equal(h.get("checkout-select").disabled,false);
+  assert.equal(h.get("workspace").hidden,true);
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.ok(h.requests.every(({url,options})=>["/api/checkouts","/api/daemon/status"].includes(url) && options.method==="GET"));
+});
+
+test("unavailable or corrupt checkout rows cannot be selected", async () => {
+  const bad="c".repeat(64), h=harness({routes:(url)=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"unavailable",active:false},{rootKey:bad,state:"corrupt",active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    throw new Error(`Unavailable selection made a scoped call: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);
+  assert.equal(h.get("checkout-select").disabled,true);
+  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});
+  await flush();
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.equal(h.get("workspace").hidden,true);
+  assert.match(h.get("checkout-state").textContent,/available checkout/i);
+});
+
+test("cold checkout keeps its explicit selection and never invents evidence", async () => {
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/status`)return {ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"Cold checkout"}})};
+    throw new Error(`Cold checkout leaked request: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);
+  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await flush();
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.run("status"),null);
+  assert.match(h.get("checkout-state").textContent,/Index not ready/i);
+  assert.equal(h.get("checkout-root").textContent.includes("/synthetic"),false,"unverified display path is not evidence");
+  assert.deepEqual(h.requests.map(r=>r.url),["/api/checkouts","/api/daemon/status",`${SCOPED}/status`]);
+});
+
+test("catching-up prior head remains paired and clears on a refreshed status", async () => {
+  const pair={indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  let catchingUp=true;
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    assert.ok(url.startsWith(`${SCOPED}/`),`Wrong root: ${url}`);
+    if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:pair,catchingUp,stats:{}});
+    if(url.startsWith(`${SCOPED}/tree?`))return response({revision:pair,path:"",root:"/synthetic",items:[],nextOffset:null});
+    if(url===`${SCOPED}/views`||url===`${SCOPED}/annotations`)return response([]);
+    if(url===`${SCOPED}/jev/status`||url===`${SCOPED}/acp/status`)return response({enabled:false});
+    if(url===`${SCOPED}/jobs/current`)return response(null);
+    if(url===`${SCOPED}/dependencies`)return response({state:"disabled",workspaceRevision:pair,catalogId:null,packages:[],warnings:[]});
+    throw new Error(`Unexpected: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);
+  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await flush();
+  assert.equal(h.get("catching-up").hidden,false);
+  assert.match(fs.readFileSync(path.join(__dirname,"../web/index.html"),"utf8"),/Catching up — evidence may be stale/);
+  assert.equal(h.run("status.revision.indexRevision"),1);
+  catchingUp=false;await h.run("refreshStatus()");
+  assert.equal(h.get("catching-up").hidden,true);
+  assert.equal(h.run("status.revision.indexRevision"),1);
+  assert.equal(h.get("checkout-root").textContent,"/synthetic");
+});
+
+test("state change in refreshed checkout list clears a selected root", async () => {
+  let state="available";
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state,active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
+    throw new Error(`Unexpected: ${url}`);
+  }});
+  await h.connect("synthetic",false,false);
+  h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await flush();
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  state="unavailable";await h.run("loadCheckouts()");await flush();
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.equal(h.get("workspace").hidden,true);
+  assert.match(h.get("checkout-state").textContent,/available checkouts|available checkout|choose/i);
+});
+
+test("a warm head is erased on typed cold status and a later ready head loads cleanly", async () => {
+  const P={indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1};
+  const Q={...P,indexRevision:2};
+  let phase="warm";
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    assert.ok(url.startsWith(`${SCOPED}/`),`Unselected request: ${url}`);
+    if(url===`${SCOPED}/status`)return phase==="cold"
+      ? {ok:false,status:503,json:async()=>({error:{code:"index_not_ready",message:"No admitted head"}})}
+      : phase==="unavailable" ? {ok:false,status:503,json:async()=>({error:{code:"checkout_capacity",message:"Retry later"}})}
+      : response({workspaceRoot:"/synthetic",revision:phase==="warm"?P:Q,stats:{},diagnostics:[`diagnostic-${phase}`]});
+    if(url.startsWith(`${SCOPED}/tree?`))return response({revision:phase==="warm"?P:Q,path:"",root:"/synthetic",items:[],nextOffset:null});
+    if(url===`${SCOPED}/views`)return response([{id:`view-${phase}`,title:`view-${phase}`,query:{seed:"seed"}}]);
+    if(url===`${SCOPED}/annotations`)return response([{id:`note-${phase}`,nodeId:"seed",body:`note-${phase}`}]);
+    if(url===`${SCOPED}/jev/status`)return response({enabled:true,budget:{remainingCents:100,capCents:100,reservedCents:0,attempts:0}});
+    if(url===`${SCOPED}/acp/status`)return response({enabled:true,status:{remainingAttempts:1}});
+    if(url===`${SCOPED}/jobs/current`)return response(null);
+    if(url===`${SCOPED}/dependencies`)return response({state:"disabled",workspaceRevision:phase==="warm"?P:Q,catalogId:null,packages:[],warnings:[]});
+    if(url.startsWith(`${SCOPED}/source?`))return response({revision:P,file:{path:"same.rs",text:"old-P-source"}});
+    throw new Error(`Unexpected request: ${url}`);
+  }});
+  await h.connect("synthetic",true);
+  await h.run("showSource({path:'same.rs',range:{startLine:1,endLine:1}},status.revision)");
+  h.run("seed='seed'; packet={packetId:'old-P'}; job={id:'old-P',state:'queued'};");
+  assert.equal(h.run("status.revision.indexRevision"),1);
+  assert.equal(h.run("sourceCache.size"),1);
+  assert.match(h.get("source-path").textContent,/same.rs/);
+  assert.match(h.get("jev-status").textContent,/enabled/);
+  assert.equal(h.run("views.length"),1);
+  assert.equal(h.run("annotations.length"),1);
+  phase="unavailable";
+  await assert.rejects(h.run("refreshStatus()"),error=>error.code==="checkout_capacity");
+  assert.equal(h.run("status.revision.indexRevision"),1,"an unrelated 503 must not claim a cold head");
+  assert.equal(h.run("sourceCache.size"),1);
+
+  phase="cold";
+  await assert.rejects(h.run("refreshStatus()"),error=>error.code==="index_not_ready");
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  assert.equal(h.run("token"),"synthetic");
+  assert.equal(h.get("checkout-select").value,ROOT);
+  assert.equal(h.run("status"),null);
+  for(const value of ["result","seed","packet","focused","selectedMethod","job","jevStatus","acpStatus"])
+    assert.equal(h.run(value),null,`${value} retained P`);
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.equal(h.run("views.length"),0);
+  assert.equal(h.run("annotations.length"),0);
+  assert.equal(h.get("source").children.length,0);
+  assert.equal(h.get("views").children.length,0);
+  assert.equal(h.get("annotations").children.length,0);
+  assert.equal(h.get("save-view").disabled,true);
+  assert.equal(h.get("save-note").disabled,true);
+  assert.equal(h.get("run-jev").disabled,true);
+  assert.equal(h.get("explain-acp").disabled,true);
+  assert.equal(h.get("catching-up").hidden,true);
+  assert.match(h.get("checkout-state").textContent,/Index not ready.*Retry/i);
+  assert.doesNotMatch(h.get("diagnostics").textContent,/diagnostic-warm/);
+  assert.doesNotMatch(h.get("source-path").textContent,/same.rs/);
+
+  phase="ready";
+  await h.run("refreshStatus()"); await h.run("loadSaved()");
+  assert.equal(h.run("status.revision.indexRevision"),2);
+  assert.match(h.get("diagnostics").textContent,/diagnostic-ready/);
+  assert.equal(h.run("views[0].view.id"),"view-ready");
+  assert.equal(h.run("annotations[0].annotation.id"),"note-ready");
+  assert.equal(h.run("sourceCache.size"),0);
+  assert.equal(h.get("checkout-root").textContent,"/synthetic");
+});
+
+for(const states of [["available","available"],["available","unavailable"]])
+  test(`duplicate checkout root key ${states.join("/")} rejects list before selection`,async()=>{
+    let duplicate=true;
+    const h=harness({routes:url=>{
+      if(url==="/api/checkouts")return response({checkouts:duplicate
+        ? states.map((state,i)=>({rootKey:ROOT,workspaceRoot:`/synthetic-${i}`,state,active:false}))
+        : [{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+      if(url==="/api/daemon/status")return response({activeCheckouts:0});
+      throw new Error(`Duplicate checkout sent a scoped request: ${url}`);
+    }});
+    await h.connect("synthetic",false,false);
+    assert.equal(h.run("selectedRootKey"),null);
+    assert.equal(h.run("checkouts.length"),0);
+    assert.equal(h.get("checkout-select").disabled,true);
+    assert.equal(h.get("checkout-select").children.length,1);
+    assert.equal(h.get("checkout-retry").hidden,false);
+    assert.match(h.get("checkout-state").textContent,/Duplicate checkout root key/i);
+    h.get("checkout-select").value=ROOT;
+    h.get("checkout-select").listeners.change({target:h.get("checkout-select")});
+    await assert.rejects(h.run("api('/api/status')"),/Choose an available checkout/);
+    assert.equal(h.get("workspace").hidden,true);
+    assert.ok(h.requests.every(({url})=>["/api/checkouts","/api/daemon/status"].includes(url)));
+    duplicate=false;h.get("checkout-retry").listeners.click();await flush();
+    assert.equal(h.get("checkout-select").disabled,false);
+    assert.equal(h.run("selectedRootKey"),null,"fresh valid list must not auto-select");
+    assert.ok(h.requests.every(({url})=>["/api/checkouts","/api/daemon/status"].includes(url)));
+  });
+
+test("a refreshed ambiguous selected key clears the old root before another scoped call",async()=>{
+  let duplicate=false;
+  const h=harness({routes:url=>{
+    if(url==="/api/checkouts")return response({checkouts:duplicate
+      ? [{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"},{rootKey:ROOT,workspaceRoot:"/other",state:"unavailable"}]
+      : [{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available"}]});
+    if(url==="/api/daemon/status")return response({activeCheckouts:0});
+    if(!duplicate && url===`${SCOPED}/status`)return response({workspaceRoot:"/synthetic",revision:null,stats:{}});
+    throw new Error(`Ambiguous checkout sent a scoped request: ${url}`);
+  }});
+  await h.connect("synthetic",false);
+  assert.equal(h.run("selectedRootKey"),ROOT);
+  duplicate=true;const before=h.requests.length;
+  assert.equal(await h.run("loadCheckouts()"),false);
+  assert.equal(h.run("selectedRootKey"),null);
+  assert.equal(h.run("status"),null);
+  assert.equal(h.get("workspace").hidden,true);
+  assert.equal(h.get("checkout-select").disabled,true);
+  assert.deepEqual(h.requests.slice(before).map(request=>request.url),["/api/checkouts"]);
+  await assert.rejects(h.run("api('/api/status')"),/Choose an available checkout/);
+  assert.deepEqual(h.requests.slice(before).map(request=>request.url),["/api/checkouts"]);
+});
+
+for (const otherState of ["available","unavailable"])
+  test(`selected URL builder rejects an ambiguous ${otherState} root before fetch`,async()=>{
+    const h=harness();
+    h.run(`token='synthetic'; selectedRootKey='${ROOT}'; checkouts=[
+      {rootKey:'${ROOT}',workspaceRoot:'/first',state:'available'},
+      {rootKey:'${ROOT}',workspaceRoot:'/second',state:'${otherState}'}];`);
+    await assert.rejects(h.run("api('/api/status')"),/Choose an available checkout/);
+    assert.equal(h.requests.length,0);
+  });
