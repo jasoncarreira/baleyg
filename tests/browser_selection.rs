@@ -1024,9 +1024,19 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .send()
             .await
             .unwrap();
-        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+        let selected_workspace = deleted.headers()["X-Baleyg-Workspace"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let status = deleted.status();
+        let body = deleted.text().await.unwrap_or_default();
         assert_eq!(
-            deleted.headers()["X-Baleyg-Workspace"],
+            status,
+            reqwest::StatusCode::NO_CONTENT,
+            "selected B DELETE {suffix} failed: {body}"
+        );
+        assert_eq!(
+            selected_workspace,
             b.canonicalize().unwrap().to_str().unwrap()
         );
     }
