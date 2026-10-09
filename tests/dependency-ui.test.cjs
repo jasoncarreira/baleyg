@@ -12,6 +12,8 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return {promise, resolve, reject};
 }
+const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPED = `/api/checkouts/${ROOT}`;
 function harness() {
   const elements = new Map(), blobs = [], downloads = [], timers = new Map();
   let nextTimer = 0;
@@ -34,7 +36,23 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  // The app receives the production scoped URL; legacy suffixes below remain the
+  // fixture handlers' semantic route names, never an unscoped network fallback.
+  let handler = context.fetch;
+  const networkUrls = [];
+  Object.defineProperty(context, "fetch", {configurable:true, get:() => request, set(fn) {handler = fn;}});
+  const request = (url, ...args) => {
+    networkUrls.push(url);
+    if (url === "/api/checkouts" || url === "/api/daemon/status") {
+      assert.equal(args[0]?.method, "GET");
+      return handler(url, ...args);
+    }
+    assert.ok(url.startsWith(`${SCOPED}/`), `Unexpected unscoped or wrong-root request: ${url}`);
+    const result = handler("/api" + url.slice(SCOPED.length), ...args);
+    if (!url.startsWith(`${SCOPED}/status`)) return result;
+    return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
+  };
   const preserveNewFocus = () => {
     run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
@@ -46,7 +64,7 @@ function harness() {
     assert.equal(get("focus-state").textContent, "new valid focus");
     assert.equal(get("error").hidden, true);
   };
-  return {context, run, get, blobs, downloads, timers, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
 }
 
 
@@ -69,13 +87,13 @@ async function select(h) {await ready(h);h.context.fetch=async()=>response(symbo
 
 test("automatic workspace status refresh requests only catalog metadata; optional failures do not block",async()=>{
  const h=harness(), requests=[];
- h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url==="/api/dependencies")return response(catalog());throw Error(url);};
+ h.context.fetch=async url=>{requests.push(url);if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url==="/api/dependencies")return response(catalog());if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error(url);};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
- assert.deepEqual(requests,["/api/status","/api/dependencies"]);
+ assert.deepEqual(requests,["/api/status","/api/tree?path=&offset=0&limit=200","/api/dependencies"]);
  assert.match(text(h.get("dependency-packages")),/thing 1.2.3.*source: present.*index: partial.*thing_alias/s);
  assert.match(text(h.get("dependency-warnings")),/<b>not semantic<\/b>/);
  assert.equal(descendants(h.get("dependency-warnings")).some(n=>n.tagName==="b"),false);
- h.context.fetch=async url=>{if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});throw Error("old daemon");};
+ h.context.fetch=async url=>{if(url==="/api/status")return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},stats:{}});if(url.startsWith("/api/tree?"))return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},path:"",root:"/synthetic",items:[],nextOffset:null});throw Error("old daemon");};
  await h.run("refreshStatus()"); await new Promise(setImmediate);
  assert.match(h.get("dependency-state").textContent,/unavailable/); assert.equal(h.get("error").hidden,true);
 });
@@ -180,15 +198,20 @@ test("UI keeps catalog visible and manual roots collapsed; flags do not claim se
 test("connect and completed workspace index automatically refresh metadata, never source",async()=>{
  const h=harness(),requests=[]; let revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1};
  h.context.fetch=async(url,opts)=>{requests.push([url,opts.method]);
+ if(url==="/api/checkouts")return response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]});
+ if(url==="/api/daemon/status")return response({activeCheckouts:0});
  if(url==="/api/status")return response({revision,stats:{}});
  if(url==="/api/dependencies")return response({...catalog(),workspaceRevision:revision});
  if(url.startsWith("/api/tree?"))return response({revision,path:"",root:"/workspace",items:[],nextOffset:null});
  if(url==="/api/views"||url==="/api/annotations")return response([]);
  if(url==="/api/jev/status"||url==="/api/acp/status")return response({enabled:false});
+ if(url==="/api/jobs/current")return response(null);
  if(url==="/api/index")return response({id:"job",state:"running"});
  if(url==="/api/jobs/job"){revision={indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2};return response({id:"job",state:"done"});}
  throw Error(url);};
  h.get("token").value="synthetic";h.get("connect-form").listeners.submit({preventDefault(){}});await new Promise(setImmediate);
+ assert.equal(h.get("workspace").hidden,true,"authentication must not auto-select a checkout");
+ h.get("checkout-select").value=ROOT;h.get("checkout-select").listeners.change({target:h.get("checkout-select")});await new Promise(setImmediate);
  assert.equal(h.get("workspace").hidden,false);assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,1);
  await h.get("index").listeners.click();const poll=[...h.timers.values()].find(t=>t.delay===700);assert.ok(poll);await poll.callback();await new Promise(setImmediate);
  assert.equal(requests.filter(([url])=>url==="/api/dependencies").length,2);assert.equal(h.run("dependencyCatalog.workspaceRevision.indexRevision"),2);
@@ -270,6 +293,7 @@ test("late external-source catalog response cannot paint after same-number new-g
 test("queued indexing can stop local waiting without cancelling the durable request",async()=>{
  const h=harness(),requests=[];
  h.context.fetch=async(url,options)=>{requests.push([url,options.method]);
+  if(url==="/api/jobs/current")return response(null);
   if(url==="/api/index")return response({id:"accepted",state:"queued",submittedAt:"1",startedAt:null,finishedAt:null});
   throw Error(`unexpected ${url}`);};
  await h.get("index").listeners.click();
