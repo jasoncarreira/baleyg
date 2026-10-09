@@ -59,51 +59,6 @@ impl RetentionClock {
 
 // A single process/root gate serializes maintenance with the entire publication
 // lifetime, including terminal ACK. Independent Store instances share the gate.
-#[derive(Debug, Default)]
-struct OwnerValidation {
-    state: Mutex<OwnerValidationState>,
-    changed: Condvar,
-}
-#[derive(Debug, Default)]
-struct OwnerValidationState {
-    pending: bool,
-    associated: bool,
-    serial: u64,
-}
-
-/// Only metadata revalidation ends this interval. H publication is separate.
-struct OwnerValidationLease(Arc<OwnerValidation>);
-impl Drop for OwnerValidationLease {
-    fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        state.pending = false;
-        state.associated = false;
-        state.serial = state.serial.wrapping_add(1);
-        self.0.changed.notify_all();
-    }
-}
-
-type RestrictedOwnerSlot = Arc<Mutex<Option<(Weak<topology::LeaderSession>, PreHReadPermit)>>>;
-struct RestrictedAssociationGuard {
-    slot: RestrictedOwnerSlot,
-    incarnation: uuid::Uuid,
-    armed: bool,
-}
-impl Drop for RestrictedAssociationGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let mut slot = self.slot.lock().unwrap();
-            if slot.as_ref().is_some_and(|(owner, _)| {
-                owner
-                    .upgrade()
-                    .is_some_and(|owner| owner.incarnation() == self.incarnation)
-            }) {
-                slot.take();
-            }
-        }
-    }
-}
-
 // If metadata admission fails after EX is acquired, the H caller never
 // receives the session. Settle old-root FIFO while that EX still exists, or
 // retain it for the scheduler's retry instead of abandoning accepted work.
@@ -119,13 +74,29 @@ impl RootLossOwnerLease<'_> {
 }
 impl Drop for RootLossOwnerLease<'_> {
     fn drop(&mut self) {
-        if self.armed
-            && self.store.root_path_replaced().is_ok_and(|lost| lost)
-            && self.store.fail_changed_root_requests(&self.owner).is_err()
-            // No old FIFO obligation means the EX need not outlive this failed
-            // admission. An ambiguous queue probe must retain it for retry.
-            && !matches!(self.store.old_root_unfinished_request(), Ok(None))
+        if !self.armed {
+            return;
+        }
+        // A failed root probe is not evidence of the same root. Keep exact EX
+        // through any ambiguous proof, even if a queue probe reports empty.
+        let root_proof = self.store.root_path_replaced();
+        if root_proof.as_ref().is_ok_and(|lost| !*lost) {
+            return;
+        }
+        // Queue settlement acquires another SH; downgrade this existing fd
+        // first, including when the root path or lock pathname is uncertain.
+        if let Ok(guard) = self.owner.leader_guard()
+            && guard.held_exclusive_use_mode()
+            && guard.downgrade_use_to_shared().is_err()
         {
+            *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
+            return;
+        }
+        if !matches!(root_proof, Ok(true))
+            || self.store.fail_changed_root_requests(&self.owner).is_err()
+        {
+            // SELECT can miss an uncommitted Q1 held under BEGIN IMMEDIATE.
+            // Only successful serialized settlement proves that EX may go.
             *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
         }
     }
@@ -213,10 +184,6 @@ pub struct Store {
     maintenance_busy_attempts: Arc<AtomicU64>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
-    owner_validation: Arc<OwnerValidation>,
-    runtime_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
-    read_only_predecessor: Arc<Mutex<Option<PreHReadPermit>>>,
-    restricted_predecessor: RestrictedOwnerSlot,
     orphan_root_loss_owner: Arc<Mutex<Option<Arc<topology::LeaderSession>>>>,
     recovery_disposition: Arc<AtomicU8>,
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
@@ -633,87 +600,12 @@ pub struct EvidenceResponse {
     db: IndexConnection,
     fence: ReadFence,
 }
-/// The idle permit's checkout witness contains no retained directory handle.
-#[derive(Clone)]
-struct PreHRootIdentity {
-    root: std::path::PathBuf,
-    record_id: String,
-    device: u64,
-    inode: u64,
-}
-impl PreHRootIdentity {
-    fn from_identity(identity: &topology::WorkspaceIdentity) -> Self {
-        Self {
-            root: identity.root.clone(),
-            record_id: identity.record_id.clone(),
-            device: identity.device,
-            inode: identity.inode,
-        }
-    }
-    fn matches(&self, identity: &topology::WorkspaceIdentity) -> bool {
-        self.root == identity.root
-            && self.record_id == identity.record_id
-            && (self.device, self.inode) == (identity.device, identity.inode)
-    }
-}
-
-/// The transitional fence does not grant the Store's reconciled-leader claim authority.
-#[derive(Clone)]
-pub struct PreHReadPermit {
-    identity: PreHRootIdentity,
-    pin: IndexPin,
-    predecessor: uuid::Uuid,
-    epoch: Arc<AtomicU64>,
-    captured_epoch: u64,
-}
-enum ReadFence {
-    Current(topology::FollowerGuard, uuid::Uuid),
-    PreH {
-        session: Arc<topology::LeaderSession>,
-        permit: PreHReadPermit,
-    },
-}
+/// A validated committed SQLite snapshot is readable while its captured
+/// checkout pathname remains the same root. Leadership is writer-only.
+struct ReadFence;
 impl ReadFence {
-    fn verify(&self, store: &Store, db: Option<&Connection>) -> Result<()> {
-        store.identity.verify()?;
-        match self {
-            Self::Current(follower, marker) => follower.verify(*marker),
-            Self::PreH { session, permit } => {
-                if store.disposition() != RecoveryDisposition::Ready {
-                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
-                }
-                if permit.epoch.load(Ordering::Acquire) != permit.captured_epoch {
-                    return Err(topology::IndexNotReady::new("checkout epoch changed").into());
-                }
-                if !permit.identity.matches(&store.identity)
-                    || session.incarnation() == permit.predecessor
-                {
-                    return Err(
-                        topology::IndexNotReady::new("pre-H root or leader mismatch").into(),
-                    );
-                }
-                session.leader_guard()?.verify().map_err(|error| {
-                    anyhow::anyhow!("store_unavailable: pre-H leader lock unavailable: {error:#}")
-                })?;
-                session.verify()?;
-                if let Some(db) = db {
-                    store.verify_pre_h_snapshot(db, permit).map_err(|error| {
-                        if store.disposition() != RecoveryDisposition::Ready {
-                            anyhow::anyhow!(
-                                "store_unavailable: pre-H index recovery pending: {error:#}"
-                            )
-                        } else {
-                            error
-                        }
-                    })?;
-                }
-                store.identity.verify()?;
-                if store.disposition() != RecoveryDisposition::Ready {
-                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
-                }
-                Ok(())
-            }
-        }
+    fn verify(&self, store: &Store, _db: Option<&Connection>) -> Result<()> {
+        store.identity.verify()
     }
 }
 type TreeOverlays = Vec<(usize, String, usize)>;
@@ -724,15 +616,10 @@ impl EvidenceResponse {
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.store
-            .read_status_for(&self.db, matches!(self.fence, ReadFence::PreH { .. }))
+        self.store.read_status_for(&self.db, true)
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
-        self.store.read_revision_for(
-            &self.db,
-            Some(pin),
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )?;
+        self.store.read_revision_for(&self.db, Some(pin), true)?;
         Ok(())
     }
     pub fn source_at(
@@ -740,11 +627,7 @@ impl EvidenceResponse {
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let selected = self.store.read_revision_for(
-            &self.db,
-            expected,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )?;
+        let selected = self.store.read_revision_for(&self.db, expected, true)?;
         let source = self
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
@@ -767,24 +650,16 @@ impl EvidenceResponse {
         expected: Option<&IndexPin>,
     ) -> Result<Option<ViewResult>> {
         query.validate()?;
-        self.store.query_view_in_for(
-            &self.db,
-            query,
-            expected,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store
+            .query_view_in_for(&self.db, query, expected, true)
     }
     pub fn tree_metadata(
         &self,
         root: &Path,
         items: &mut [crate::file_tree::Entry],
     ) -> Result<(IndexPin, String)> {
-        let (revision, workspace_root, overlays) = self.store.tree_metadata_in(
-            &self.db,
-            root,
-            items,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )?;
+        let (revision, workspace_root, overlays) =
+            self.store.tree_metadata_in(&self.db, root, items, true)?;
         for (index, path, count) in overlays {
             items[index].indexed_path = Some(path);
             items[index].method_count = Some(count);
@@ -797,25 +672,14 @@ impl EvidenceResponse {
         offset: usize,
         limit: usize,
     ) -> Result<serde_json::Value> {
-        self.store.files_in(
-            &self.db,
-            expected,
-            offset,
-            limit,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.files_in(&self.db, expected, offset, limit, true)
     }
     pub fn methods_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
-        self.store.methods_in(
-            &self.db,
-            path,
-            expected,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.methods_in(&self.db, path, expected, true)
     }
     pub fn sequence_at(
         &self,
@@ -823,13 +687,8 @@ impl EvidenceResponse {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.store.sequence_in(
-            &self.db,
-            seed,
-            expected,
-            show_all,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store
+            .sequence_in(&self.db, seed, expected, show_all, true)
     }
     pub fn classes_at(
         &self,
@@ -839,64 +698,33 @@ impl EvidenceResponse {
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
-        self.store.classes_in(
-            &self.db,
-            path,
-            query,
-            expected,
-            (offset, limit),
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store
+            .classes_in(&self.db, path, query, expected, (offset, limit), true)
     }
     pub fn navigation_at(
         &self,
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
-        self.store.navigation_in(
-            &self.db,
-            request,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.navigation_in(&self.db, request, true)
     }
     pub fn class_diagram_at(
         &self,
         request: &crate::class_diagram::ClassDiagramRequest,
     ) -> Result<crate::class_diagram::ClassDiagram> {
-        self.store.class_diagram_in(
-            &self.db,
-            request,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.class_diagram_in(&self.db, request, true)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
-        self.store.symbols_in(
-            &self.db,
-            query,
-            limit,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.symbols_in(&self.db, query, limit, true)
     }
     pub fn symbol_at(
         &self,
         id: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        self.store.symbol_in(
-            &self.db,
-            id,
-            expected_revision,
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        self.store.symbol_in(&self.db, id, expected_revision, true)
     }
     fn saved_pin(&self, expected: Option<IndexPin>) -> Result<IndexPin> {
-        Ok(self
-            .store
-            .read_revision_for(
-                &self.db,
-                expected,
-                matches!(self.fence, ReadFence::PreH { .. }),
-            )?
-            .pin)
+        Ok(self.store.read_revision_for(&self.db, expected, true)?.pin)
     }
     pub fn saved_views_at(&self, expected: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
         let pin = self.saved_pin(expected)?;
@@ -904,15 +732,7 @@ impl EvidenceResponse {
             .records()
             .view_records()?
             .into_iter()
-            .map(|v| {
-                Store::resolve_view(
-                    &self.db,
-                    &self.store,
-                    v,
-                    Some(pin),
-                    matches!(self.fence, ReadFence::PreH { .. }),
-                )
-            })
+            .map(|v| Store::resolve_view(&self.db, &self.store, v, Some(pin), true))
             .collect()
     }
     pub fn saved_view_at(
@@ -924,15 +744,7 @@ impl EvidenceResponse {
         self.store
             .records()
             .view_record(id)?
-            .map(|v| {
-                Store::resolve_view(
-                    &self.db,
-                    &self.store,
-                    v,
-                    Some(pin),
-                    matches!(self.fence, ReadFence::PreH { .. }),
-                )
-            })
+            .map(|v| Store::resolve_view(&self.db, &self.store, v, Some(pin), true))
             .transpose()
     }
     pub fn saved_annotations_at(&self, expected: Option<IndexPin>) -> Result<Vec<AnnotationState>> {
@@ -941,29 +753,17 @@ impl EvidenceResponse {
             .records()
             .annotation_records()?
             .into_iter()
-            .map(|a| {
-                Store::resolve_annotation(
-                    &self.db,
-                    &self.store,
-                    a,
-                    Some(pin),
-                    matches!(self.fence, ReadFence::PreH { .. }),
-                )
-            })
+            .map(|a| Store::resolve_annotation(&self.db, &self.store, a, Some(pin), true))
             .collect()
     }
-    /// A predecessor permit is read-only. Mutations require a current strict
-    /// read, with the root and publication fence checked before sidecar work.
-    pub fn require_mutation_ready(&self) -> Result<()> {
-        if matches!(self.fence, ReadFence::PreH { .. }) {
-            return Err(topology::IndexNotReady::new("pre-H mutation is not ready").into());
-        }
-        self.store.ensure_public_read_ready()?;
-        self.finish(())
+    /// Read eligibility never grants sidecar write authority. The separate
+    /// cross-process SH gate is held through the caller's durable mutation.
+    pub fn require_mutation_ready(&self) -> Result<topology::UseGuard> {
+        self.store.mutation_gate_for_snapshot(Some(self))
     }
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
-        self.require_mutation_ready()?;
+        let mutation_guard = self.require_mutation_ready()?;
         self.saved_pin(Some(pin))?;
         ensure!(
             self.status()?.revision == pin,
@@ -976,18 +776,15 @@ impl EvidenceResponse {
                     &self.db,
                     &self.store,
                     &view.query.seed,
-                    matches!(self.fence, ReadFence::PreH { .. }),
+                    true,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        Store::resolve_view(
-            &self.db,
-            &self.store,
-            record,
-            Some(pin),
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        let state = Store::resolve_view(&self.db, &self.store, record, Some(pin), true)?;
+        mutation_guard.verify()?;
+        self.finish(())?;
+        Ok(state)
     }
     pub fn save_annotation_at(
         &self,
@@ -995,7 +792,7 @@ impl EvidenceResponse {
         request: &AnnotationRequest,
     ) -> Result<AnnotationState> {
         request.validate()?;
-        self.require_mutation_ready()?;
+        let mutation_guard = self.require_mutation_ready()?;
         self.saved_pin(Some(pin))?;
         ensure!(
             self.status()?.revision == pin,
@@ -1015,52 +812,50 @@ impl EvidenceResponse {
                     &self.db,
                     &self.store,
                     &request.node_id,
-                    matches!(self.fence, ReadFence::PreH { .. }),
+                    true,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        Store::resolve_annotation(
-            &self.db,
-            &self.store,
-            record,
-            Some(pin),
-            matches!(self.fence, ReadFence::PreH { .. }),
-        )
+        let state = Store::resolve_annotation(&self.db, &self.store, record, Some(pin), true)?;
+        mutation_guard.verify()?;
+        self.finish(())?;
+        Ok(state)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
-        self.require_mutation_ready()?;
-        self.store.delete_view(id)
+        let mutation_guard = self.require_mutation_ready()?;
+        let result = self.store.records().delete_view(id)?;
+        mutation_guard.verify()?;
+        self.finish(())?;
+        Ok(result)
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
-        self.require_mutation_ready()?;
-        self.store.delete_annotation(id)
+        let mutation_guard = self.require_mutation_ready()?;
+        let result = self.store.records().delete_annotation(id)?;
+        mutation_guard.verify()?;
+        self.finish(())?;
+        Ok(result)
     }
-    /// Ordinary reads release the snapshot before slow response assembly.
-    /// A transitional exact-pin fence retains its predecessor snapshot; T03
-    /// releases it after materialization so H may commit before finish.
+    /// Validate a pinned basis inside the admitted SQLite snapshot, then close
+    /// it before slow serialization. A later B cannot invalidate coherent A.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
         let Self { store, db, fence } = self;
-        let pre_h_snapshot_valid =
-            !matches!(fence, ReadFence::PreH { .. }) || fence.verify(&store, Some(&db)).is_ok();
-        let snapshot = if matches!(fence, ReadFence::PreH { .. })
-            && matches!(policy, EvidenceFencePolicy::ExactPin(_))
-        {
-            Some(db)
-        } else {
-            drop(db);
-            None
+        let snapshot_valid = match policy {
+            EvidenceFencePolicy::T03 => true,
+            EvidenceFencePolicy::ExactPin(pin) => {
+                store.read_revision_for(&db, Some(pin), true).is_ok()
+            }
         };
+        drop(db);
         EvidenceFence {
             store,
             fence,
-            snapshot,
-            pre_h_snapshot_valid,
-            policy,
+            snapshot_valid,
         }
     }
 }
-/// Unpinned responses need T03 only; cached packets also require their exact pin.
+/// Unpinned responses require root T03; cached packets authenticate a pin
+/// inside their admitted immutable snapshot before slow materialization.
 #[derive(Clone, Copy)]
 pub enum EvidenceFencePolicy {
     T03,
@@ -1069,30 +864,15 @@ pub enum EvidenceFencePolicy {
 pub struct EvidenceFence {
     store: Store,
     fence: ReadFence,
-    snapshot: Option<IndexConnection>,
-    pre_h_snapshot_valid: bool,
-    policy: EvidenceFencePolicy,
+    snapshot_valid: bool,
 }
 impl EvidenceFence {
     pub fn finish<T>(&self, value: T) -> Result<T> {
-        self.fence.verify(&self.store, self.snapshot.as_deref())?;
-        if !self.pre_h_snapshot_valid {
-            return Err(topology::IndexNotReady::new(
-                "pre-H snapshot changed during materialization",
-            )
-            .into());
-        }
-        if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
-            if let Some(db) = &self.snapshot {
-                self.store.read_revision_for(db, Some(pin), true)?;
-            } else {
-                self.store.with_evidence(|db| {
-                    self.store.read_revision(db, Some(pin))?;
-                    Ok(())
-                })?;
-            }
-            self.fence.verify(&self.store, self.snapshot.as_deref())?;
-        }
+        self.fence.verify(&self.store, None)?;
+        ensure!(
+            self.snapshot_valid,
+            "revision conflict: invalid admitted exact pin"
+        );
         Ok(value)
     }
 }
@@ -5550,10 +5330,6 @@ impl Store {
             identity: Arc::new(identity),
             maintenance_busy_attempts: Arc::new(AtomicU64::new(0)),
             recovery_required: Arc::new(AtomicBool::new(false)),
-            owner_validation: Arc::new(OwnerValidation::default()),
-            runtime_epoch: Arc::new(Mutex::new(None)),
-            read_only_predecessor: Arc::new(Mutex::new(None)),
-            restricted_predecessor: Arc::new(Mutex::new(None)),
             orphan_root_loss_owner: Arc::new(Mutex::new(None)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
@@ -6080,7 +5856,7 @@ impl Store {
     pub(crate) fn recreate_index_exclusive(
         &self,
         options: &crate::indexer::IndexOptions,
-        leader: &mut topology::LeaderGuard,
+        leader: &topology::LeaderGuard,
         cancel: &CancelFlag,
     ) -> Result<IndexPin> {
         self.recreate_index_exclusive_with_hook(options, leader, cancel, |_| Ok(()))
@@ -6088,7 +5864,7 @@ impl Store {
     fn recreate_index_exclusive_with_hook(
         &self,
         options: &crate::indexer::IndexOptions,
-        leader: &mut topology::LeaderGuard,
+        leader: &topology::LeaderGuard,
         cancel: &CancelFlag,
         mut at: impl FnMut(ActivationStage) -> Result<()>,
     ) -> Result<IndexPin> {
@@ -6412,13 +6188,7 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
-        self.leader_with_owner(
-            before_write,
-            |guard| guard,
-            |guard| guard,
-            |_| None,
-            |_| Ok(false),
-        )
+        self.leader_with_owner(before_write, |guard| guard, |guard| guard, |_| None)
     }
 
     fn leader_with_owner<T>(
@@ -6427,7 +6197,6 @@ impl Store {
         wrap: impl FnOnce(topology::LeaderGuard) -> T,
         guard: impl Fn(&T) -> &topology::LeaderGuard,
         root_loss_owner: impl Fn(&T) -> Option<Arc<topology::LeaderSession>>,
-        publish: impl FnOnce(&T) -> Result<bool>,
     ) -> Result<T> {
         // Leader startup has its own live data_version→COMMIT interval before
         // coordinator preparation. Do not recursively acquire the gate inside
@@ -6441,26 +6210,6 @@ impl Store {
             self.cache()
                 .map_err(|error| self.report_live_read_failure(error))?,
         );
-        // A watcher or external CLI may have published B since activation or
-        // the last selected read of A. Refresh only from a finished strict
-        // read under the still-verifiable old owner, retaining this runtime's
-        // epoch. A lost/ambiguous old owner never supplies a new permit.
-        let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
-        if let Some(epoch) = prior_epoch
-            && let Ok(read) = self.evidence_response()
-        {
-            let _ = self.remember_read_only_predecessor(&read, epoch);
-        }
-        // Start the read-admission interval BEFORE flock acquisition writes a
-        // durable new incarnation. Acquiring the lock can fail; RAII wakes any
-        // waiting reader on that path too. Old verified owner reads still use
-        // their normal strict admission while its lock is unchanged.
-        let mut state = self.owner_validation.state.lock().unwrap();
-        state.pending = true;
-        state.associated = false;
-        state.serial = state.serial.wrapping_add(1);
-        drop(state);
-        let _validation = OwnerValidationLease(self.owner_validation.clone());
         let owner = wrap(self.roots.leader(&self.identity)?);
         let mut root_loss_lease = root_loss_owner(&owner).map(|session| RootLossOwnerLease {
             store: self,
@@ -6468,15 +6217,8 @@ impl Store {
             armed: true,
         });
         let leader = guard(&owner);
-        // This incarnation is durable, but the old SQLite marker has not yet
-        // been validated or rebound. Never serve unproven evidence here.
+        // A new owner is not claim-ready until its mandatory H commits.
         self.recovery_required.store(true, Ordering::Release);
-        let associated = publish(&owner)?;
-        let mut association_guard = RestrictedAssociationGuard {
-            slot: self.restricted_predecessor.clone(),
-            incarnation: leader.incarnation,
-            armed: associated,
-        };
         self.leader_before_metadata_hook.run();
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
@@ -6524,7 +6266,6 @@ impl Store {
         if prior_readable && self.disposition() == RecoveryDisposition::Ready {
             self.recovery_required.store(false, Ordering::Release);
         }
-        association_guard.armed = false;
         if let Some(lease) = &mut root_loss_lease {
             lease.armed = false;
         }
@@ -6929,53 +6670,6 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
-    /// Wait only for the new owner's metadata validation, never for H/FIFO.
-    /// The caller must already hold an independently validated prior head and
-    /// must retry full strict admission after this signal. Failure also wakes.
-    /// A selected read only waits for restricted EX proof, not owner metadata
-    /// validation or mandatory H. The cap protects an unavailable owner.
-    pub fn wait_for_restricted_owner(&self, timeout: Duration) -> bool {
-        let state = self.owner_validation.state.lock().unwrap();
-        if state.associated {
-            return true;
-        }
-        if !state.pending {
-            return false;
-        }
-        let serial = state.serial;
-        let (state, _) = self
-            .owner_validation
-            .changed
-            .wait_timeout_while(state, timeout, |state| {
-                state.pending && !state.associated && state.serial == serial
-            })
-            .unwrap();
-        state.associated
-    }
-
-    pub fn owner_validation_pending(&self) -> bool {
-        self.owner_validation.state.lock().unwrap().pending
-    }
-
-    /// Releasing a checkout cancels admitted waiters; no head is implied.
-    pub fn notify_owner_validation_release(&self) {
-        let mut state = self.owner_validation.state.lock().unwrap();
-        state.pending = false;
-        state.associated = false;
-        state.serial = state.serial.wrapping_add(1);
-        self.owner_validation.changed.notify_all();
-        drop(state);
-        self.restricted_predecessor.lock().unwrap().take();
-    }
-
-    pub fn revoke_restricted_predecessor(&self) {
-        self.restricted_predecessor.lock().unwrap().take();
-        let mut state = self.owner_validation.state.lock().unwrap();
-        state.associated = false;
-        state.serial = state.serial.wrapping_add(1);
-        self.owner_validation.changed.notify_all();
-    }
-
     fn ensure_public_read_ready(&self) -> Result<()> {
         if !self.recovery_required.load(Ordering::Acquire) {
             return Ok(());
@@ -6998,6 +6692,52 @@ impl Store {
             }
         }
     }
+    fn mutation_gate_for_snapshot(
+        &self,
+        admitted: Option<&EvidenceResponse>,
+    ) -> Result<topology::UseGuard> {
+        let gate = self.roots.sidecar_mutation_shared(&self.identity)?;
+        let current = self.cache()?;
+        storage_result(current.execute_batch("BEGIN DEFERRED"))?;
+        self.verify_metadata_root(&current)?;
+        let control = self.decode_control_status_raw(&current)?;
+        if control.evidence_format.is_none() {
+            // Raw durable-record staging remains available for the genuine
+            // validated empty v8 bootstrap, never for an incomplete head.
+            let schema: u32 =
+                storage_result(current.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+            ensure!(
+                admitted.is_none()
+                    && schema == DATABASE_SCHEMA_VERSION
+                    && control.revision.index_revision == 0,
+                "index_not_ready: no complete published head for selected mutation"
+            );
+            validate_v8_bootstrap(&current)?;
+            self.identity.verify()?;
+            gate.verify()?;
+            return Ok(gate);
+        }
+        let status = self.read_status_for(&current, true)?;
+        self.ensure_public_read_ready()?;
+        let (strict, marker) = self.admit_evidence_control(&current)?;
+        ensure!(
+            strict.revision == status.revision,
+            "revision conflict: current mutation basis changed"
+        );
+        let follower = self.roots.follower(self.identity.clone())?;
+        self.verify_follower_marker(&follower, marker)?;
+        if let Some(admitted) = admitted {
+            ensure!(
+                admitted.status()?.revision == status.revision,
+                "revision conflict: mutation requires current head"
+            );
+            admitted.finish(())?;
+        }
+        self.verify_follower_marker(&follower, marker)?;
+        gate.verify()?;
+        Ok(gate)
+    }
+
     fn read_public_control_status(&self, db: &Connection) -> Result<IndexStatus> {
         self.verify_metadata_root(db)
             .map_err(|error| self.report_live_read_failure(error))?;
@@ -7007,10 +6747,10 @@ impl Store {
     }
 
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        self.read_status_for(db, false)
+        self.read_status_for(db, true)
     }
-    fn read_status_for(&self, db: &Connection, pre_h: bool) -> Result<IndexStatus> {
-        let status = if pre_h {
+    fn read_status_for(&self, db: &Connection, committed_read: bool) -> Result<IndexStatus> {
+        let status = if committed_read {
             self.verify_metadata_root(db)
                 .map_err(|error| self.report_live_read_failure(error))?;
             self.decode_control_status_raw(db)
@@ -7155,6 +6895,51 @@ impl Store {
             RecoveryDisposition::RecreatePending | RecoveryDisposition::RootReplaced
         ) && self.recovery_required.load(Ordering::Acquire)
     }
+    /// Recreate under the SAME H-owned leader EX; never relinquish and re-elect
+    /// between an empty queue probe and this exceptional publication.
+    pub(crate) fn recreate_pending_with_owner(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+        options: &crate::indexer::IndexOptions,
+        cancel: &CancelFlag,
+    ) -> Result<(IndexPin, Arc<topology::LeaderSession>)> {
+        let mut lease = self.root_loss_owner_lease(owner);
+        ensure!(
+            self.is_recreate_pending(),
+            "recovery_required: exceptional recreation not classified"
+        );
+        self.verify_leader_session(owner)?;
+        let guard = owner.leader_guard()?;
+        guard.reacquire_sidecar_mutation_gate(&self.roots.sidecar_mutation_lock(&self.identity))?;
+        if let Err(error) =
+            guard.try_upgrade_use_to_exclusive(&self.roots.index_use_lock(&self.identity))
+        {
+            if guard.uncertain_use_transition() {
+                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+            }
+            return Err(error);
+        }
+        #[cfg(test)]
+        self.test_exclusive_recovery_hook.run();
+        let result = self.recreate_index_exclusive(options, guard, cancel);
+        // Even on root loss and other errors, queue settlement opens another
+        // index-use SH: restore this held fd first while retaining leader EX.
+        if guard.held_exclusive_use_mode() {
+            if let Err(error) = guard.downgrade_use_to_shared() {
+                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+                return Err(error);
+            }
+        }
+        let pin = result?;
+        self.verify_leader_session(owner)?;
+        ensure!(
+            self.status()?.revision == pin,
+            "index_not_ready: exceptional recovery pair not admitted"
+        );
+        self.attest_post_acquisition_reconciliation(owner, pin)?;
+        lease.disarm();
+        Ok((pin, owner.clone()))
+    }
     pub(crate) fn recreate_pending_leader_session(
         &self,
         options: &crate::indexer::IndexOptions,
@@ -7165,49 +6950,60 @@ impl Store {
             "recovery_required: exceptional recreation not classified"
         );
         if self.disposition() == RecoveryDisposition::RootReplaced {
-            // The old index is still fenced by the verified leader under SH. Resolve
-            // foreign-root queue rows durably BEFORE attempting index replacement.
-            // Dropping this entire scope releases every local SH and SQLite handle.
-            {
-                let leader = Arc::new(topology::LeaderSession::leader(
-                    self.roots.leader(&self.identity)?,
-                    self.identity.clone(),
-                ));
-                self.verify_leader_session(&leader)?;
-                let index_path = self.roots.index_db(&self.identity);
-                ensure!(
-                    !index_path_present(&index_path.with_file_name("index.db-journal"))?,
-                    "recovery_required: root replacement has hot journal"
-                );
-                let db = open_index(&index_path, false)?;
-                let mismatch = self.recovery_baseline(&db);
-                drop(db);
-                ensure!(
-                    matches!(mismatch, Err(ref error)
-                    if error.to_string() == "root_changed: index root identity mismatch"),
-                    "root_changed: replacement authority changed"
-                );
-                self.fail_changed_root_requests(&leader)?;
-            }
+            // Retain the old EX until every accepted old-root row is terminal.
+            let leader = Arc::new(topology::LeaderSession::leader(
+                self.roots.leader(&self.identity)?,
+                self.identity.clone(),
+            ));
+            let mut lease = self.root_loss_owner_lease(&leader);
+            self.verify_leader_session(&leader)?;
+            let index_path = self.roots.index_db(&self.identity);
+            ensure!(
+                !index_path_present(&index_path.with_file_name("index.db-journal"))?,
+                "recovery_required: root replacement has hot journal"
+            );
+            let db = open_index(&index_path, false)?;
+            let mismatch = self.recovery_baseline(&db);
+            drop(db);
+            ensure!(
+                matches!(mismatch, Err(ref error)
+                if error.to_string() == "root_changed: index root identity mismatch"),
+                "root_changed: replacement authority changed"
+            );
+            self.fail_changed_root_requests(&leader)?;
+            lease.disarm();
         }
+        let sidecar_gate = self.roots.sidecar_mutation_exclusive(&self.identity)?;
         let exclusive = self.roots.index_use_exclusive_existing(&self.identity)?;
-        let mut leader = self
-            .roots
-            .leader_under_exclusive(&self.identity, exclusive)?;
-        #[cfg(test)]
-        self.test_exclusive_recovery_hook.run();
-        let pin = self.recreate_index_exclusive(options, &mut leader, cancel)?;
-        let session = Arc::new(topology::LeaderSession::leader(
-            leader,
+        let guard =
+            self.roots
+                .leader_under_exclusive_with_gate(&self.identity, exclusive, sidecar_gate)?;
+        let owner = Arc::new(topology::LeaderSession::leader(
+            guard,
             self.identity.clone(),
         ));
-        self.verify_leader_session(&session)?;
+        // Install the lease immediately: root loss or ambiguous Q1 during the
+        // EX-only exceptional interval must not drop the owner on error.
+        let mut lease = self.root_loss_owner_lease(&owner);
+        #[cfg(test)]
+        self.test_exclusive_recovery_hook.run();
+        let guard = owner.leader_guard()?;
+        let result = self.recreate_index_exclusive(options, guard, cancel);
+        if guard.held_exclusive_use_mode() {
+            if let Err(error) = guard.downgrade_use_to_shared() {
+                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+                return Err(error);
+            }
+        }
+        let pin = result?;
+        self.verify_leader_session(&owner)?;
         ensure!(
             self.status()?.revision == pin,
             "index_not_ready: exceptional recovery pair not admitted"
         );
-        self.attest_post_acquisition_reconciliation(&session, pin)?;
-        Ok((pin, session))
+        self.attest_post_acquisition_reconciliation(&owner, pin)?;
+        lease.disarm();
+        Ok((pin, owner))
     }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
         self.leader_with_owner(
@@ -7220,25 +7016,6 @@ impl Store {
             },
             |session| session.leader_guard().expect("wrapped EX owner"),
             |session| Some(session.clone()),
-            |session| {
-                let Some(permit) = self.read_only_predecessor.lock().unwrap().clone() else {
-                    return Ok(false);
-                };
-                let guard = session.leader_guard()?;
-                if !permit.identity.matches(&self.identity)
-                    || guard.predecessor_incarnation != Some(permit.predecessor)
-                    || permit.epoch.load(Ordering::Acquire) != permit.captured_epoch
-                {
-                    return Ok(false);
-                }
-                *self.restricted_predecessor.lock().unwrap() =
-                    Some((Arc::downgrade(session), permit));
-                let mut state = self.owner_validation.state.lock().unwrap();
-                state.associated = true;
-                state.serial = state.serial.wrapping_add(1);
-                self.owner_validation.changed.notify_all();
-                Ok(true)
-            },
         )
     }
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
@@ -7300,8 +7077,8 @@ impl Store {
         );
         self.identity.verify()?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
+        leader.release_sidecar_mutation_gate()?;
         *self.reconciled_leader.lock().unwrap() = Some(marker);
-        self.revoke_restricted_predecessor();
         Ok(())
     }
     /// The public Store::claim_request entry point must refuse pre-COMMIT
@@ -7419,120 +7196,6 @@ impl Store {
         self.identity.verify()?;
         follower.verify(marker)
     }
-    /// Reacquire without rewriting the predecessor metadata: mandatory H owns
-    /// the next marker publication. The permit never supplies claim authority.
-    pub fn leader_for_idle_reattach(
-        &self,
-        permit: &PreHReadPermit,
-    ) -> Result<Arc<topology::LeaderSession>> {
-        self.ensure_not_recreate_pending()?;
-        self.identity.verify()?;
-        if !permit.identity.matches(&self.identity)
-            || self.disposition() != RecoveryDisposition::Ready
-        {
-            return Err(topology::IndexNotReady::new("pre-H checkout unavailable").into());
-        }
-        let guard = self.roots.leader(&self.identity)?;
-        if guard.predecessor_incarnation != Some(permit.predecessor) {
-            return Err(topology::IndexNotReady::new("intervening leader").into());
-        }
-        self.recovery_required.store(true, Ordering::Release);
-        Ok(Arc::new(topology::LeaderSession::leader(
-            guard,
-            self.identity.clone(),
-        )))
-    }
-
-    /// Bind only the activated checkout's epoch, even when its first head is
-    /// cold. A later strict pre-takeover read may then prove a new current head.
-    pub fn bind_runtime_epoch(&self, epoch: Arc<AtomicU64>) {
-        *self.runtime_epoch.lock().unwrap() = Some(epoch);
-    }
-
-    /// A finished strict read can prove a predecessor for read-only rollover.
-    /// Unlike the idle leader permit, this never grants claim or H authority.
-    pub fn remember_read_only_predecessor(
-        &self,
-        response: &EvidenceResponse,
-        epoch: Arc<AtomicU64>,
-    ) -> Result<()> {
-        let ReadFence::Current(_, predecessor) = &response.fence else {
-            return Ok(());
-        };
-        anyhow::ensure!(
-            PreHRootIdentity::from_identity(&self.identity).matches(&response.store.identity),
-            "index_not_ready: predecessor belongs to another checkout"
-        );
-        let status = response.status()?;
-        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
-            return Ok(());
-        }
-        response.finish(())?;
-        let permit = PreHReadPermit {
-            identity: PreHRootIdentity::from_identity(&self.identity),
-            pin: status.revision,
-            predecessor: *predecessor,
-            captured_epoch: epoch.load(Ordering::Acquire),
-            epoch,
-        };
-        let mut current = self.read_only_predecessor.lock().unwrap();
-        if let Some(previous) = current.as_ref() {
-            anyhow::ensure!(
-                Arc::ptr_eq(&previous.epoch, &permit.epoch),
-                "index_not_ready: predecessor belongs to another runtime epoch"
-            );
-            if previous.pin.index_generation == permit.pin.index_generation
-                && previous.pin.index_revision > permit.pin.index_revision
-            {
-                return Ok(());
-            }
-        }
-        *current = Some(permit);
-        Ok(())
-    }
-
-    pub fn has_read_only_predecessor_for_epoch(&self, epoch: &Arc<AtomicU64>) -> bool {
-        self.read_only_predecessor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|permit| {
-                permit.identity.matches(&self.identity)
-                    && Arc::ptr_eq(&permit.epoch, epoch)
-                    && permit.captured_epoch == epoch.load(Ordering::Acquire)
-            })
-    }
-
-    /// Restricted association is neither a serving owner nor an H proof.
-    /// Fixture only: emulate a restricted H owner surviving Store replacement
-    /// while testing exceptional index recreation and EX retirement.
-    #[doc(hidden)]
-    pub fn associate_restricted_owner_for_tests(
-        &self,
-        owner: &Arc<topology::LeaderSession>,
-        permit: PreHReadPermit,
-    ) {
-        *self.restricted_predecessor.lock().unwrap() = Some((Arc::downgrade(owner), permit));
-    }
-
-    pub fn restricted_owner_associated(&self) -> bool {
-        self.restricted_predecessor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|(owner, _)| owner.strong_count() > 0)
-    }
-
-    /// Root-loss-only authority: borrow the live H worker's exact old EX to
-    /// terminally fail accepted work. A weak slot cannot pin that owner itself.
-    pub fn restricted_owner_for_root_loss(&self) -> Option<Arc<topology::LeaderSession>> {
-        self.restricted_predecessor
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|(owner, _)| owner.upgrade())
-    }
-
     /// Retain an acquired EX until the caller either hands it to a verified
     /// serving owner or disposes old-root work on an error.
     pub(crate) fn root_loss_owner_lease(
@@ -7554,141 +7217,24 @@ impl Store {
         self.orphan_root_loss_owner.lock().unwrap().take();
     }
 
-    pub fn restricted_predecessor_read(&self) -> Result<EvidenceResponse> {
-        let (owner, permit) = self
-            .restricted_predecessor
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| topology::IndexNotReady::new("owner has not proved a predecessor"))?;
-        let owner = owner
-            .upgrade()
-            .ok_or_else(|| topology::IndexNotReady::new("restricted EX owner was released"))?;
-        self.evidence_response_pre_h(&permit, owner)
-    }
-
-    /// Mint only from a normally admitted, finished complete head before idle release.
-    pub fn pre_h_read_permit(
-        &self,
-        response: &EvidenceResponse,
-        session: &topology::LeaderSession,
-        epoch: Arc<AtomicU64>,
-    ) -> Result<PreHReadPermit> {
-        self.verify_reconciled_leader_claim(session)?;
-        let ReadFence::Current(_, predecessor) = &response.fence else {
-            return Err(topology::IndexNotReady::new("cannot mint from transitional read").into());
-        };
-        if response.store.identity.root != self.identity.root
-            || response.store.identity.device != self.identity.device
-            || response.store.identity.inode != self.identity.inode
-        {
-            return Err(topology::IndexNotReady::new("different checkout").into());
-        }
-        if *predecessor != session.incarnation() {
-            return Err(topology::IndexNotReady::new("not the reconciled checkout leader").into());
-        }
-        let captured_epoch = epoch.load(Ordering::Acquire);
-        let status = response.status()?;
-        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
-            return Err(topology::IndexNotReady::new("complete head required").into());
-        }
-        response.finish(())?;
-        if epoch.load(Ordering::Acquire) != captured_epoch {
-            return Err(topology::IndexNotReady::new("checkout epoch changed").into());
-        }
-        Ok(PreHReadPermit {
-            identity: PreHRootIdentity::from_identity(&self.identity),
-            pin: status.revision,
-            predecessor: *predecessor,
-            epoch,
-            captured_epoch,
-        })
-    }
-
-    fn verify_pre_h_snapshot(&self, db: &Connection, permit: &PreHReadPermit) -> Result<()> {
-        self.verify_metadata_root(db)
-            .map_err(|error| self.report_live_read_failure(error))
-            .map_err(|error| {
-                if self.disposition() != RecoveryDisposition::Ready {
-                    anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
-                } else {
-                    error
-                }
-            })?;
-        let schema: u32 =
-            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
-        if schema != DATABASE_SCHEMA_VERSION {
-            return Err(topology::IndexNotReady::new("pre-H schema changed").into());
-        }
-        let status = self.read_status_for(db, true)?;
-        let marker: Option<String> = db
-            .query_row(
-                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| self.report_live_read_failure(selected_integrity(error.into())))?;
-        if status.revision != permit.pin
-            || status.evidence_format.is_none()
-            || marker.as_deref() != Some(permit.predecessor.to_string().as_str())
-        {
-            return Err(topology::IndexNotReady::new("pre-H predecessor changed").into());
-        }
-        Ok(())
-    }
-
-    /// Explicit transitional admission. Ordinary evidence_response stays strict.
-    pub fn evidence_response_pre_h(
-        &self,
-        permit: &PreHReadPermit,
-        session: Arc<topology::LeaderSession>,
-    ) -> Result<EvidenceResponse> {
-        self.ensure_not_recreate_pending()?;
-        if self.disposition() != RecoveryDisposition::Ready {
-            return Err(topology::IndexNotReady::new("recovery pending").into());
-        }
-        let guard = session.leader_guard()?;
-        if guard.predecessor_incarnation != Some(permit.predecessor) {
-            return Err(topology::IndexNotReady::new("intervening leader").into());
-        }
-        let fence = ReadFence::PreH {
-            session,
-            permit: permit.clone(),
-        };
-        fence.verify(self, None)?;
-        let db = self.cache().map_err(|error| {
-            let error = self.report_live_read_failure(error);
-            if self.disposition() != RecoveryDisposition::Ready {
-                anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
-            } else {
-                error
-            }
-        })?;
-        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-        fence.verify(self, Some(&db))?;
-        if self.disposition() != RecoveryDisposition::Ready {
-            return Err(topology::IndexNotReady::new("recovery pending").into());
-        }
-        Ok(EvidenceResponse {
-            store: self.clone(),
-            db,
-            fence,
-        })
-    }
-
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.ensure_not_recreate_pending()?;
         let db = self
             .cache()
             .map_err(|error| self.report_live_read_failure(error))?;
         storage_result(db.execute_batch("BEGIN DEFERRED"))?;
-        let (_, marker) = self.admit_evidence_control(&db)?;
-        let follower = self.roots.follower(self.identity.clone())?;
-        self.verify_follower_marker(&follower, marker)?;
+        // Read eligibility is the complete committed pair in this SQLite
+        // snapshot, not the current holder of the leader flock. H still gates
+        // publication and FIFO claims, never a coherent prior-head read.
+        let status = self.read_status_for(&db, true)?;
+        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
+            return Err(topology::IndexNotReady::new("no complete published head").into());
+        }
+        self.identity.verify()?;
         Ok(EvidenceResponse {
             store: self.clone(),
             db,
-            fence: ReadFence::Current(follower, marker),
+            fence: ReadFence,
         })
     }
     fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -9913,15 +9459,6 @@ impl Store {
                 self.recovery_disposition
                     .store(RecoveryDisposition::Ready as u8, Ordering::Release);
                 self.recovery_required.store(false, Ordering::Release);
-                // A successful same-owner watcher publication can advance A→B
-                // without a browser read in between. Refresh only this Store's
-                // existing runtime epoch from a new strict, finished B read.
-                let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
-                if let Some(epoch) = prior_epoch
-                    && let Ok(read) = self.evidence_response()
-                {
-                    let _ = self.remember_read_only_predecessor(&read, epoch);
-                }
             }
             PublicationTarget::Stage(stage) => {
                 stage.verify_path()?;
@@ -9935,15 +9472,15 @@ impl Store {
     /// consumers. Only typed UUID/integer pin components enter these SQL literals;
     /// the caller never supplies SQL or a raw revision key.
     fn read_revision(&self, db: &Connection, expected: Option<IndexPin>) -> Result<ReadRevision> {
-        self.read_revision_for(db, expected, false)
+        self.read_revision_for(db, expected, true)
     }
     fn read_revision_for(
         &self,
         db: &Connection,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<ReadRevision> {
-        let head = self.read_status_for(db, pre_h)?.revision;
+        let head = self.read_status_for(db, committed_read)?.revision;
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation
@@ -11404,9 +10941,10 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::navigation::NavigationRequest,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<crate::navigation::NavigationResult> {
-        let selected = self.read_revision_for(tx, Some(request.expected_revision()), pre_h)?;
+        let selected =
+            self.read_revision_for(tx, Some(request.expected_revision()), committed_read)?;
         let revision = selected.pin;
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
@@ -11495,7 +11033,7 @@ impl Store {
         query: &str,
         expected: Option<IndexPin>,
         pagination: (usize, usize),
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<crate::class_diagram::ClassPage> {
         use crate::class_diagram::ClassPage;
         let (offset, limit) = pagination;
@@ -11519,7 +11057,7 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
+        let selected_revision = self.read_revision_for(tx, expected, committed_read)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -11621,10 +11159,11 @@ impl Store {
         &self,
         tx: &Connection,
         request: &crate::class_diagram::ClassDiagramRequest,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<crate::class_diagram::ClassDiagram> {
         use crate::class_diagram::{self, InvalidRequest};
-        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_h)?;
+        let selected =
+            self.read_revision_for(tx, Some(request.expected_revision), committed_read)?;
         let revision = selected.pin;
         let (warnings, truncated) = class_metadata(tx, &selected)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -11672,9 +11211,9 @@ impl Store {
         tx: &Connection,
         query: &str,
         limit: usize,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<(IndexPin, Vec<Symbol>)> {
-        let selected = self.read_revision_for(tx, None, pre_h)?;
+        let selected = self.read_revision_for(tx, None, committed_read)?;
         let revision = selected.pin;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
@@ -11714,9 +11253,9 @@ impl Store {
         tx: &Connection,
         id: &str,
         expected_revision: Option<IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        let selected = self.read_revision_for(tx, expected_revision, pre_h)?;
+        let selected = self.read_revision_for(tx, expected_revision, committed_read)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
                 .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
@@ -11893,9 +11432,9 @@ impl Store {
         tx: &Connection,
         root: &Path,
         items: &mut [crate::file_tree::Entry],
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<(IndexPin, String, TreeOverlays)> {
-        let revision = self.read_status_for(tx, pre_h)?.revision;
+        let revision = self.read_status_for(tx, committed_read)?.revision;
         let workspace = Path::new(&self.workspace_root);
         let mut valid_stmt = tx.prepare(
                 "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
@@ -11952,9 +11491,9 @@ impl Store {
         expected: Option<IndexPin>,
         offset: usize,
         limit: usize,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<serde_json::Value> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, committed_read)?;
         let revision = selected.pin;
         let mut stmt = tx.prepare(
             "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
@@ -11995,9 +11534,9 @@ impl Store {
         tx: &Connection,
         path: &str,
         expected: Option<IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<Option<serde_json::Value>> {
-        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let selected = self.read_revision_for(tx, expected, committed_read)?;
         let revision = selected.pin;
         let projection_id: Option<String> = tx
             .query_row(
@@ -12044,9 +11583,9 @@ impl Store {
         seed: &str,
         expected: IndexPin,
         show_all: bool,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        let selected_revision = self.read_revision_for(tx, Some(expected), pre_h)?;
+        let selected_revision = self.read_revision_for(tx, Some(expected), committed_read)?;
         let revision = selected_revision.pin;
         let selected: Option<(String, String)> = tx
             .query_row(
@@ -12248,9 +11787,9 @@ impl Store {
         tx: &Connection,
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_h)?;
+        let selected = self.read_revision_for(tx, expected_pin.copied(), committed_read)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
             .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
@@ -12329,17 +11868,19 @@ impl Store {
 
     pub fn put_view(&self, view: &SavedView) -> Result<()> {
         view.validate()?;
+        let gate = self.mutation_gate_for_snapshot(None)?;
         self.records().put_view(view)?;
-        Ok(())
+        gate.verify()?;
+        self.identity.verify()
     }
 
     fn selected_anchor_in(
         db: &Connection,
         store: &Self,
         target: &str,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<DurableAnchor> {
-        let revision = store.read_revision_for(db, None, pre_h)?;
+        let revision = store.read_revision_for(db, None, committed_read)?;
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
@@ -12430,9 +11971,9 @@ impl Store {
         store: &Self,
         view: SavedViewRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<SavedViewState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, committed_read)?;
         let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
             .chain(view.pins.keys())
             .chain(view.hidden.iter())
@@ -12542,6 +12083,7 @@ impl Store {
     pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
         view.validate()?;
         let response = self.evidence_response()?;
+        let _mutation_gate = response.require_mutation_ready()?;
         Self::saved_pin(&response, Some(pin))?;
         ensure!(
             response.status()?.revision == pin,
@@ -12563,22 +12105,28 @@ impl Store {
         self.finish_saved(&response, state)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
-        self.records().delete_view(id)
+        let gate = self.mutation_gate_for_snapshot(None)?;
+        let deleted = self.records().delete_view(id)?;
+        gate.verify()?;
+        self.identity.verify()?;
+        Ok(deleted)
     }
 
     pub fn put_annotation(&self, annotation: &Annotation) -> Result<()> {
         annotation.validate()?;
+        let gate = self.mutation_gate_for_snapshot(None)?;
         self.records().put_annotation(annotation)?;
-        Ok(())
+        gate.verify()?;
+        self.identity.verify()
     }
     fn resolve_annotation(
         db: &Connection,
         store: &Self,
         annotation: AnnotationRecord,
         pin: Option<IndexPin>,
-        pre_h: bool,
+        committed_read: bool,
     ) -> Result<AnnotationState> {
-        let selected = store.read_revision_for(db, pin, pre_h)?;
+        let selected = store.read_revision_for(db, pin, committed_read)?;
         let attachment =
             Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
         let orphaned = attachment
@@ -12638,6 +12186,7 @@ impl Store {
     ) -> Result<AnnotationState> {
         request.validate()?;
         let response = self.evidence_response()?;
+        let _mutation_gate = response.require_mutation_ready()?;
         Self::saved_pin(&response, Some(pin))?;
         ensure!(
             response.status()?.revision == pin,
@@ -12666,7 +12215,11 @@ impl Store {
         self.finish_saved(&response, state)
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
-        self.records().delete_annotation(id)
+        let gate = self.mutation_gate_for_snapshot(None)?;
+        let deleted = self.records().delete_annotation(id)?;
+        gate.verify()?;
+        self.identity.verify()?;
+        Ok(deleted)
     }
 }
 
@@ -12750,151 +12303,6 @@ mod selected_manifest_query_plan_tests {
             !plan.iter().any(|step| step.starts_with("SCAN r")),
             "changing manifest scanned all revision headers: {plan:?}"
         );
-    }
-
-    #[test]
-    fn restricted_owner_uses_latest_committed_same_owner_head_without_selected_read() {
-        use crate::index_coordinator::IndexJobCoordinator;
-        use crate::indexer::IndexOptions;
-        use std::{fs, sync::atomic::AtomicBool};
-        let state = tempfile::tempdir().unwrap();
-        let work = tempfile::tempdir().unwrap();
-        let source = work.path().join("A.java");
-        fs::write(&source, "class A { int a() { return 1; } }\n").unwrap();
-        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
-        let options = IndexOptions::new(work.path().to_owned());
-        IndexJobCoordinator::prepare(&store, None)
-            .unwrap()
-            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
-            .unwrap();
-        let owner = store.leader_session().unwrap();
-        let epoch = Arc::new(AtomicU64::new(1));
-        store.bind_runtime_epoch(epoch.clone());
-        let a = store.evidence_response().unwrap();
-        store.remember_read_only_predecessor(&a, epoch).unwrap();
-        a.finish(()).unwrap();
-        drop(a);
-        fs::write(&source, "class A { int b() { return 2; } }\n").unwrap();
-        let b = IndexJobCoordinator::prepare_with_session(&store, None, owner.clone())
-            .unwrap()
-            .run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})
-            .unwrap();
-        assert_eq!(
-            store
-                .read_only_predecessor
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .pin,
-            b
-        );
-        drop(owner);
-        let at = store.clone();
-        store.set_leader_before_metadata_hook_for_tests(move || {
-            let read = at
-                .restricted_predecessor_read()
-                .expect("latest B must be readable under proved successor EX");
-            assert_eq!(read.status().unwrap().revision, b);
-            assert!(read.require_mutation_ready().is_err());
-            read.finish(()).unwrap();
-        });
-        let new_owner = store.leader_session().unwrap();
-        assert!(store.verify_reconciled_leader_claim(&new_owner).is_err());
-    }
-
-    #[test]
-    fn restricted_owner_refuses_missing_corrupt_and_intervening_predecessors() {
-        use crate::index_coordinator::IndexJobCoordinator;
-        use crate::indexer::IndexOptions;
-        use std::{fs, sync::atomic::AtomicBool};
-
-        for damaged in [
-            "missing_marker",
-            "wrong_pin",
-            "intervening_owner",
-            "root_replaced",
-        ] {
-            let state = tempfile::tempdir().unwrap();
-            let work = tempfile::tempdir().unwrap();
-            fs::write(
-                work.path().join("A.java"),
-                "class A { int old() { return 1; } }\n",
-            )
-            .unwrap();
-            let initial = Store::open_for_tests(state.path(), work.path()).unwrap();
-            IndexJobCoordinator::prepare(&initial, None)
-                .unwrap()
-                .run(
-                    &IndexOptions::new(work.path().to_owned()),
-                    &Arc::new(AtomicBool::new(false)),
-                    |_| {},
-                )
-                .unwrap();
-            let incumbent = initial.leader_session().unwrap();
-            drop(initial);
-            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
-            let evidence = store.evidence_response().unwrap();
-            store
-                .remember_read_only_predecessor(&evidence, Arc::new(AtomicU64::new(1)))
-                .unwrap();
-            drop(evidence);
-            drop(incumbent);
-            match damaged {
-                "missing_marker" => {
-                    store
-                        .cache_write()
-                        .unwrap()
-                        .execute("UPDATE index_metadata SET reconciled_incarnation=NULL", [])
-                        .unwrap();
-                }
-                "wrong_pin" => {
-                    store
-                        .cache_write()
-                        .unwrap()
-                        .execute("UPDATE index_metadata SET index_revision=0", [])
-                        .unwrap();
-                }
-                "intervening_owner" => {
-                    let intermediate = store.leader_session().unwrap();
-                    assert!(store.restricted_owner_associated());
-                    drop(intermediate);
-                    assert!(
-                        !store.restricted_owner_associated(),
-                        "abandoned EX remained held"
-                    );
-                }
-                "root_replaced" => {
-                    fs::rename(work.path(), work.path().with_extension("old")).unwrap();
-                    fs::create_dir(work.path()).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            let probe = store.clone();
-            let hook_seen = Arc::new(AtomicBool::new(false));
-            let seen = hook_seen.clone();
-            store.set_leader_before_metadata_hook_for_tests(move || {
-                seen.store(true, Ordering::Release);
-                assert!(
-                    probe.restricted_predecessor_read().is_err(),
-                    "{damaged}: unproved head was admitted before metadata validation"
-                );
-            });
-            let outcome = store.leader_session();
-            if damaged == "root_replaced" {
-                assert!(outcome.is_err());
-                assert!(!store.restricted_owner_associated());
-            } else {
-                assert!(
-                    outcome.is_ok(),
-                    "{damaged}: second EX acquisition: {outcome:?}"
-                );
-                assert!(
-                    hook_seen.load(Ordering::Acquire),
-                    "{damaged}: metadata hook never ran"
-                );
-            }
-        }
     }
 
     #[test]
@@ -13889,6 +13297,308 @@ mod rebaseline_fault_tests {
                 .contains("revision conflict")
         );
         drop(session);
+    }
+
+    #[test]
+    fn exceptional_owner_survives_uncommitted_invisible_q1_after_failed_serialized_settlement() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let writer = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, writer.root_id(), &cancel, |_| {}).unwrap();
+        let first = writer.leader_session().unwrap();
+        let original = writer
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                first.leader_guard().unwrap(),
+                writer.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        drop(first);
+        let index = writer.roots.index_db(&writer.identity);
+        let queue = writer.roots.requests_db(&writer.identity);
+        let db = Connection::open(&index).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+        drop(db);
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        let (inserted_tx, inserted_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let moved = state.path().join("invisible-q1-root");
+        std::thread::scope(|scope| {
+            let writer_ref = &writer;
+            let writer_options = &options;
+            let queue_writer = scope.spawn(move || {
+                writer_ref.enqueue_request_after_insert_for_tests(
+                    writer_options,
+                    Some(original),
+                    || {
+                        inserted_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                )
+            });
+            inserted_rx.recv().unwrap();
+            fs::rename(work.path(), &moved).unwrap();
+            fs::create_dir(work.path()).unwrap();
+            assert!(
+                recovering.old_root_unfinished_request().unwrap().is_none(),
+                "uncommitted Q1 is invisible to SELECT"
+            );
+            let busy = recovering
+                .recreate_pending_with_owner(&owner, &options, &cancel)
+                .unwrap_err();
+            assert!(busy.to_string().contains("root_changed"), "{busy:#}");
+            drop(owner);
+            assert!(
+                recovering.orphan_root_loss_owner().is_some(),
+                "failed serialized BEGIN IMMEDIATE cannot release EX after empty SELECT"
+            );
+            fs::remove_dir(work.path()).unwrap();
+            fs::rename(&moved, work.path()).unwrap();
+            assert!(recovering.roots.leader(&recovering.identity).is_err());
+            resume_tx.send(()).unwrap();
+            let ack = queue_writer.join().unwrap().unwrap();
+            assert_eq!(ack.state, "queued", "same-inode restore permits late ACK");
+            fs::rename(work.path(), &moved).unwrap();
+            fs::create_dir(work.path()).unwrap();
+            let orphan = recovering.orphan_root_loss_owner().unwrap();
+            assert_eq!(recovering.fail_changed_root_requests(&orphan).unwrap(), 1);
+            let state_after: String = Connection::open(&queue)
+                .unwrap()
+                .query_row("SELECT state FROM requests WHERE id=?1", [&ack.id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(state_after, "failed");
+            drop(orphan);
+            recovering.clear_orphan_root_loss_owner();
+            fs::remove_dir(work.path()).unwrap();
+            fs::rename(&moved, work.path()).unwrap();
+            assert!(recovering.roots.leader(&recovering.identity).is_ok());
+        });
+    }
+
+    #[test]
+    fn exceptional_ex_root_loss_with_locked_q1_retains_exact_owner_until_terminal() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let first = store.leader_session().unwrap();
+        let original = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                first.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let q1 = store.enqueue_request(&options, Some(original)).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        let queue = store.roots.requests_db(&store.identity);
+        drop(first);
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+        drop(db);
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        let (at_ex_tx, at_ex_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        recovering.test_exclusive_recovery_hook.set(move || {
+            at_ex_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        });
+        let moved = state.path().join("old-root");
+        std::thread::scope(|scope| {
+            let worker_owner = owner.clone();
+            let recovering_ref = &recovering;
+            let options_ref = &options;
+            let cancel_ref = &cancel;
+            let worker = scope.spawn(move || {
+                recovering_ref.recreate_pending_with_owner(&worker_owner, options_ref, cancel_ref)
+            });
+            at_ex_rx.recv().unwrap();
+            fs::rename(work.path(), &moved).unwrap();
+            fs::create_dir(work.path()).unwrap();
+            let writer = Connection::open(&queue).unwrap();
+            writer.busy_timeout(Duration::ZERO).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            resume_tx.send(()).unwrap();
+            assert!(
+                worker.join().unwrap().is_err(),
+                "lost root cannot publish H"
+            );
+            drop(owner);
+            assert!(
+                recovering.orphan_root_loss_owner().is_some(),
+                "inconclusive Q1 settlement retains original EX"
+            );
+            fs::remove_dir(work.path()).unwrap();
+            fs::rename(&moved, work.path()).unwrap();
+            assert!(
+                recovering.roots.leader(&recovering.identity).is_err(),
+                "restored root must not acquire another leader EX while Q1 uncertain"
+            );
+            fs::rename(work.path(), &moved).unwrap();
+            fs::create_dir(work.path()).unwrap();
+            writer.execute_batch("ROLLBACK").unwrap();
+            let orphan = recovering.orphan_root_loss_owner().unwrap();
+            assert_eq!(recovering.fail_changed_root_requests(&orphan).unwrap(), 1);
+            let durable_state: String = Connection::open(&queue)
+                .unwrap()
+                .query_row("SELECT state FROM requests WHERE id=?1", [&q1.id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(durable_state, "failed");
+            drop(orphan);
+            recovering.clear_orphan_root_loss_owner();
+            fs::remove_dir(work.path()).unwrap();
+            fs::rename(&moved, work.path()).unwrap();
+            assert!(recovering.roots.leader(&recovering.identity).is_ok());
+        });
+    }
+
+    #[test]
+    fn same_owner_transition_busy_reader_and_raw_gc_ex_skip_until_recreate_done() {
+        use std::os::unix::fs::MetadataExt;
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        drop(store);
+        fs::write(&path, b"short").unwrap();
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let old_inode = fs::metadata(&path).unwrap().ino();
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let reader = recovering
+            .roots
+            .index_use_existing_readonly(&recovering.identity)
+            .unwrap();
+        let busy = recovering
+            .recreate_pending_with_owner(&owner, &options, &cancel)
+            .unwrap_err();
+        assert!(busy.to_string().contains("storage_busy"), "{busy:#}");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
+        drop(reader);
+        let (at_ex_tx, at_ex_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        recovering.test_exclusive_recovery_hook.set(move || {
+            at_ex_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        });
+        std::thread::scope(|scope| {
+            let worker =
+                scope.spawn(|| recovering.recreate_pending_with_owner(&owner, &options, &cancel));
+            at_ex_rx.recv().unwrap();
+            let raw_gc_attempt = topology::UseGuard::acquire_existing(
+                &recovering.roots.index_use_lock(&recovering.identity),
+                true,
+                true,
+            );
+            assert!(
+                raw_gc_attempt.is_err(),
+                "raw canonical EX must take transition SH"
+            );
+            assert_eq!(fs::metadata(&path).unwrap().ino(), old_inode);
+            resume_tx.send(()).unwrap();
+            assert!(worker.join().unwrap().is_ok());
+        });
+    }
+
+    #[test]
+    fn same_owner_exceptional_recreation_keeps_exact_leader_ex_and_queued_work() {
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        fs::write(work.path().join("a.js"), "function a() {}\n").unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let (graph, native, capture) =
+            index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap();
+        let first_owner = store.leader_session().unwrap();
+        let original = store
+            .publish_native(
+                &graph,
+                &capture,
+                &native,
+                first_owner.leader_guard().unwrap(),
+                store.index_baseline().unwrap(),
+                &cancel,
+            )
+            .unwrap();
+        let q1 = store.enqueue_request(&options, Some(original)).unwrap();
+        let index = store.roots.index_db(&store.identity);
+        drop(first_owner);
+        drop(store);
+        let db = Connection::open(&index).unwrap();
+        db.execute_batch(
+            "PRAGMA ignore_check_constraints=ON;
+            UPDATE index_metadata SET schema_version=7;",
+        )
+        .unwrap();
+        drop(db);
+        let recovering = Store::open_for_tests(state.path(), work.path()).unwrap();
+        assert_eq!(
+            recovering.disposition(),
+            RecoveryDisposition::RecreatePending
+        );
+        let owner = Arc::new(topology::LeaderSession::leader(
+            recovering.roots.leader(&recovering.identity).unwrap(),
+            recovering.identity.clone(),
+        ));
+        let held_incarnation = owner.incarnation();
+        let (pin, returned) = recovering
+            .recreate_pending_with_owner(&owner, &options, &cancel)
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&returned, &owner),
+            "replacement must return exact original EX"
+        );
+        assert_eq!(returned.incarnation(), held_incarnation);
+        assert_eq!(recovering.status().unwrap().revision, pin);
+        assert_eq!(
+            recovering.request_by_id(&q1.id).unwrap().unwrap().state,
+            "queued"
+        );
+        assert!(
+            recovering.roots.leader(&recovering.identity).is_err(),
+            "same EX remains held after replacement H"
+        );
     }
 
     #[test]

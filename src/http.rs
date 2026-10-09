@@ -25,6 +25,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "test-causal-witness")]
+use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
@@ -32,7 +34,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -246,9 +248,13 @@ pub struct DaemonState {
             crate::index_coordinator::LeaderWork,
         )>,
     >,
+    #[cfg(feature = "test-causal-witness")]
     causal_witness: Mutex<Option<Arc<crate::daemon::causal_witness::CausalWitness>>>,
+    #[cfg(feature = "test-causal-witness")]
     causal_runtime: Mutex<Option<std::sync::Weak<crate::daemon::registry::CheckoutRuntime>>>,
+    #[cfg(feature = "test-causal-witness")]
     causal_lineage_ordinal: Arc<AtomicU64>,
+    #[cfg(feature = "test-causal-witness")]
     causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     empty_takeover_retry: AtomicBool,
@@ -411,9 +417,13 @@ pub fn new_with_dependency_options(
         native_stream: Mutex::new(()),
         maintenance_stream: Mutex::new(()),
         leader_work: Mutex::new(None),
+        #[cfg(feature = "test-causal-witness")]
         causal_witness: Mutex::new(None),
+        #[cfg(feature = "test-causal-witness")]
         causal_runtime: Mutex::new(None),
+        #[cfg(feature = "test-causal-witness")]
         causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
+        #[cfg(feature = "test-causal-witness")]
         causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         empty_takeover_retry: AtomicBool::new(false),
@@ -437,6 +447,7 @@ pub fn new_with_dependency_options(
 impl DaemonState {
     /// Register a test-only, read-only witness after this checkout activates.
     /// The reverse edge is weak: release may drop the runtime independently.
+    #[cfg(feature = "test-causal-witness")]
     pub fn set_causal_witness_runtime(
         &self,
         reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
@@ -447,6 +458,7 @@ impl DaemonState {
     }
 
     /// Called only after queue_tick returned and released its native/work locks.
+    #[cfg(feature = "test-causal-witness")]
     fn report_causal_h_ready(self: &Arc<Self>) {
         let runtime = self.causal_runtime.lock().unwrap().clone();
         if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
@@ -454,6 +466,7 @@ impl DaemonState {
         }
     }
 
+    #[cfg(feature = "test-causal-witness")]
     pub fn causal_lineage_for(
         &self,
         session: &Arc<crate::store::topology::LeaderSession>,
@@ -473,6 +486,7 @@ impl DaemonState {
         scheduler.causal_lineage()
     }
 
+    #[cfg(feature = "test-causal-witness")]
     pub fn causal_h_already_reported(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
@@ -485,6 +499,7 @@ impl DaemonState {
             ))
     }
 
+    #[cfg(feature = "test-causal-witness")]
     pub fn emit_causal_h_ready_once(
         &self,
         lineage: crate::daemon::causal_witness::Lineage,
@@ -628,6 +643,7 @@ impl DaemonState {
                 // The witness may read phase only after queue_tick released the
                 // native stream, watcher mutex and any SQLite statement.
                 if result.as_ref().is_ok_and(|outcome| outcome.is_ok()) {
+                    #[cfg(feature = "test-causal-witness")]
                     state.report_causal_h_ready();
                 }
                 match result {
@@ -1059,7 +1075,6 @@ impl DaemonState {
                 .unwrap()
                 .clone()
                 .filter(|session| session.is_leader())
-                .or_else(|| self.store.restricted_owner_for_root_loss())
                 .or_else(|| self.store.orphan_root_loss_owner());
             if let Some(session) = retained {
                 *self.root_loss_session.lock().unwrap() = Some(session);
@@ -1067,7 +1082,6 @@ impl DaemonState {
             // Transfer the sole restricted EX to root-loss authority BEFORE
             // revoking its selected-read association. Accepted FIFO work must
             // reach root_changed while an old-owner EX still exists.
-            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             let authority = self.root_loss_session.lock().unwrap().clone();
             if let Some(session) = authority {
@@ -1174,7 +1188,6 @@ impl DaemonState {
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
             // The native stream excludes the tick while the old owner is removed.
             // A restricted predecessor's EX must not pin exceptional recreation.
-            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             match self
                 .store
@@ -1208,13 +1221,11 @@ impl DaemonState {
                 .as_ref()
                 .filter(|session| session.is_leader())
                 .cloned()
-                .or_else(|| self.store.restricted_owner_for_root_loss())
                 .or_else(|| self.store.orphan_root_loss_owner());
             if let Some(ref session) = root_loss_owner {
                 self.store.fail_changed_root_requests(session)?;
             }
             self.store.clear_orphan_root_loss_owner();
-            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             return Ok(());
         }
@@ -1274,11 +1285,13 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
+                        #[allow(unused_mut)] // test-only witness attaches before scheduling
                         let mut scheduler = crate::index_coordinator::LeaderWork::new(
                             &self.store,
                             session,
                             &selected_options,
                         )?;
+                        #[cfg(feature = "test-causal-witness")]
                         if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                             scheduler.attach_causal_witness(
                                 reporter,
@@ -1289,6 +1302,7 @@ impl DaemonState {
                         *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
+                        #[allow(unused_variables)] // witness ACK exists only with the test feature
                         let accounted = scheduler.reconcile_due(
                             &self.store,
                             session,
@@ -1299,6 +1313,7 @@ impl DaemonState {
                         // ACK only a verified, acknowledged full inventory.
                         // Neither a failed FIFO probe nor a newer accepted hint
                         // can be called settled. The reporter only try_sends here.
+                        #[cfg(feature = "test-causal-witness")]
                         if accounted
                             && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
                             && !scheduler.accepted_watch_intent(&selected_options)
@@ -1377,7 +1392,6 @@ impl DaemonState {
                     })();
                 // The restricted read association cannot retain a failed EX.
                 // Successful H already replaced it with strict current proof.
-                self.store.revoke_restricted_predecessor();
                 match takeover {
                     Ok(session) if session.is_leader() => {
                         self.replace_serving_session(Some(session));
@@ -1471,11 +1485,13 @@ impl DaemonState {
                     // serve. Retain it before drain commits a terminal ACK; a
                     // later drain error may still release it for safe reclamation.
                     self.replace_serving_session(Some(session.clone()));
+                    #[allow(unused_mut)] // test-only witness attaches before scheduling
                     let mut scheduler = crate::index_coordinator::LeaderWork::new(
                         &self.store,
                         &session,
                         &takeover_options,
                     )?;
+                    #[cfg(feature = "test-causal-witness")]
                     if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
                         scheduler.attach_causal_witness(
                             reporter,
@@ -1499,7 +1515,6 @@ impl DaemonState {
                     }
                     Ok(Some(processed))
                 })();
-                self.store.revoke_restricted_predecessor();
                 let recorded_completion = if outcome.is_ok() || mandatory_reconcile_incomplete {
                     Ok(false)
                 } else {
@@ -7287,7 +7302,7 @@ async fn selected_provider_preflight(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response().map_err(question_error)?;
-        response.require_mutation_ready().map_err(question_error)?;
+        let _mutation_guard = response.require_mutation_ready().map_err(question_error)?;
         let revision = response.status().map_err(question_error)?.revision;
         let packet = if let Some(id) = packet_id {
             let state = runtime.browser_scheduler().map_err(question_error)?;
@@ -7338,7 +7353,7 @@ async fn selected_provider_postflight(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, _) = runtime.evidence_response()?;
-        response.require_mutation_ready()?;
+        let _mutation_guard = response.require_mutation_ready()?;
         anyhow::ensure!(
             response.status()?.revision == revision,
             "revision conflict: provider basis changed"
@@ -7385,7 +7400,7 @@ async fn selected_mutation<T: IntoResponse + Send + 'static>(
     let runtime = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let (response, catching_up) = runtime.evidence_response()?;
-        response.require_mutation_ready()?;
+        let _mutation_guard = response.require_mutation_ready()?;
         preflight(&response)?;
         response.finish(())?;
         if let Some(hook) = &hook {
