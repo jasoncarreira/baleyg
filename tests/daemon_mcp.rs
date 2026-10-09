@@ -16,6 +16,7 @@ struct Peer {
     stdin: Option<ChildStdin>,
     lines: Receiver<Value>,
     reaped: bool,
+    auto_daemon_pid: PathBuf,
 }
 impl Peer {
     fn start(home: &Path, root: &Path) -> Self {
@@ -27,6 +28,7 @@ impl Peer {
             .env("HOME", home)
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_DATA_HOME", home.join("data"))
+            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -51,6 +53,7 @@ impl Peer {
             child,
             lines,
             reaped: false,
+            auto_daemon_pid: home.join("auto-daemon.pid"),
         }
     }
     fn ask(&mut self, id: u64, method: &str, params: Value) -> Value {
@@ -62,8 +65,8 @@ impl Peer {
         .unwrap();
         self.lines.recv_timeout(Duration::from_secs(10)).unwrap()
     }
-    // Preserve the leader PID until its entire inherited process group is
-    // stopped. A daemon started on demand inherits one of the client groups.
+    // Preserve the leader PID until its client group has stopped.
+    // The auto-started daemon is in another session and is cleaned up in Drop.
     fn finish_unreaped(&mut self) {
         self.stdin.take();
         let pid = self.child.id() as libc::pid_t;
@@ -93,7 +96,90 @@ impl Drop for Peer {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        stop_fixture_daemon(self.auto_daemon_pid.parent().unwrap());
     }
+}
+
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn owned_daemon_connection(home: &Path, pid: u32) -> Option<UnixStream> {
+    let stream = UnixStream::connect(socket_under(home)?).ok()?;
+    if connected_peer_pid(&stream) != Some(pid) {
+        return None;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    (output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim()
+            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+    .then_some(stream)
+}
+
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("auto-daemon.pid");
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    let Some(connection) = owned_daemon_connection(home, pid) else {
+        return;
+    };
+    let sent = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !sent {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if owned_daemon_connection(home, pid).is_none() {
+            let _ = fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // No numeric-PID SIGKILL if the elected process did not stop normally.
+    drop(connection);
 }
 
 fn socket_under(home: &Path) -> Option<PathBuf> {
@@ -154,6 +240,69 @@ fn checkout(home: &Path) -> PathBuf {
     let root = home.join("checkout");
     fs::create_dir_all(root.join(".git")).unwrap();
     root
+}
+
+#[test]
+fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let mut dummy = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+    fs::write(home.path().join("auto-daemon.pid"), dummy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = dummy.try_wait().unwrap().is_none();
+    let _ = dummy.kill();
+    let _ = dummy.wait();
+    drop(owner);
+    assert!(
+        alive,
+        "stale marker signaled an unrelated test-owned process"
+    );
+}
+
+#[test]
+fn demand_started_daemon_survives_first_client_process_group_death() {
+    use std::os::unix::fs::MetadataExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut first = Peer::start(home.path(), &root);
+    let metadata = json!({"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    }});
+    let discover = first.ask(1, "server/discover", metadata.clone());
+    assert_eq!(discover["id"], 1);
+    assert!(discover["result"].is_object(), "{discover}");
+    let socket = socket_ready(home.path());
+    let inode = fs::metadata(&socket).unwrap().ino();
+    let daemon_pid = fs::read_to_string(home.path().join("auto-daemon.pid")).unwrap();
+    let group = format!("-{}", first.child.id());
+    let killed = Command::new("/bin/kill")
+        .args(["-KILL", "--", &group])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "unable to signal isolated client group");
+    assert!(!first.child.wait().unwrap().success());
+    first.reaped = true;
+    // The old group is gone. Do not demand-start another daemon before this check.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        UnixStream::connect(&socket).is_ok(),
+        "daemon died with first client group"
+    );
+    assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
+    assert_eq!(
+        fs::read_to_string(home.path().join("auto-daemon.pid")).unwrap(),
+        daemon_pid
+    );
+    let mut second = Peer::start(home.path(), &root);
+    assert_eq!(second.ask(2, "server/discover", metadata)["id"], 2);
+    assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
+    drop(second);
+    drop(first);
 }
 
 #[test]

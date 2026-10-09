@@ -86,6 +86,106 @@ fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         }
     }
 }
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn private_socket_under(home: &Path) -> Option<PathBuf> {
+    let mut dirs = vec![home.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                return Some(baleyg::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    None
+}
+
+fn owned_daemon_connection(home: &Path, pid: u32) -> Option<std::os::unix::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::connect(private_socket_under(home)?).ok()?;
+    if connected_peer_pid(&stream) != Some(pid) {
+        return None;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    (output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim()
+            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+    .then_some(stream)
+}
+
+/// Signal only the elected binary that owns THIS fixture's private socket.
+/// Leave a stale or ambiguous marker untouched rather than targeting a reused PID.
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("auto-daemon.pid");
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    let Some(connection) = owned_daemon_connection(home, pid) else {
+        return;
+    };
+    let sent = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !sent {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if owned_daemon_connection(home, pid).is_none() {
+            let _ = fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // No numeric-PID SIGKILL: a disconnected/replaced socket makes it ambiguous.
+    drop(connection);
+}
+
 struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -115,6 +215,10 @@ impl Peer {
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .env(
+                "BALEYG_TEST_DAEMON_PID_FILE",
+                home.path().join("auto-daemon.pid"),
+            )
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -192,6 +296,7 @@ impl Peer {
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
+        stop_fixture_daemon(self._home.path());
         let (status, expired) = bounded_group_wait(&mut self.child);
         self.reaped = true;
         assert!(!expired, "MCP subprocess exceeded 10-second deadline");
@@ -201,6 +306,9 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        // Also covers assertion failure before finish(): only this unique HOME's
+        // elected daemon can have written its opt-in marker.
+        stop_fixture_daemon(self._home.path());
         if !self.reaped {
             // No previous wait/reap occurred: this PID/PGID cannot be recycled.
             unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
@@ -208,6 +316,67 @@ impl Drop for Peer {
         }
     }
 }
+
+#[test]
+fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let mut dummy = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+    fs::write(home.path().join("auto-daemon.pid"), dummy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = dummy.try_wait().unwrap().is_none();
+    let _ = dummy.kill();
+    let _ = dummy.wait();
+    drop(owner);
+    assert!(
+        alive,
+        "stale marker signaled an unrelated test-owned process"
+    );
+}
+
+#[test]
+fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut decoy = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", other.path())
+        .env("XDG_CACHE_HOME", other.path().join("cache"))
+        .env("XDG_DATA_HOME", other.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if private_socket_under(other.path())
+            .is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
+        {
+            break;
+        }
+        assert!(decoy.try_wait().unwrap().is_none());
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(home.path().join("auto-daemon.pid"), decoy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = decoy.try_wait().unwrap().is_none();
+    let _ = decoy.kill();
+    let _ = decoy.wait();
+    drop(owner);
+    assert!(alive, "a different fixture's elected daemon was signaled");
+}
+
 fn checkout(base: &Path) -> PathBuf {
     let path = base.join("checkout");
     fs::create_dir_all(path.join(".git")).unwrap();

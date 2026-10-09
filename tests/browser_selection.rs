@@ -69,6 +69,119 @@ fn git(root: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+/// Test-scope guard for only the daemon elected under this disposable HOME.
+struct FixtureDaemon(std::path::PathBuf);
+impl FixtureDaemon {
+    fn new(home: &std::path::Path) -> Self {
+        Self(home.to_path_buf())
+    }
+}
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let marker = self.0.join("auto-daemon.pid");
+        let Ok(raw) = fs::read_to_string(&marker) else {
+            return;
+        };
+        let Ok(pid) = raw.parse::<u32>() else {
+            return;
+        };
+        let mut dirs = vec![self.0.clone()];
+        let mut socket = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    socket = path
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+            if socket.is_some() {
+                break;
+            }
+        }
+        let Some(socket) = socket else {
+            return;
+        };
+        let owned = || {
+            let connection = std::os::unix::net::UnixStream::connect(&socket).ok()?;
+            if connected_peer_pid(&connection) != Some(pid) {
+                return None;
+            }
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+                .ok()?;
+            (output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim()
+                    == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+            .then_some(connection)
+        };
+        let Some(connection) = owned() else {
+            return;
+        };
+        let sent = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !sent {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if owned().is_none() {
+                let _ = fs::remove_file(&marker);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Never SIGKILL a numeric PID after the socket identity becomes ambiguous.
+        drop(connection);
+    }
+}
+
 struct Server(std::process::Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -81,6 +194,7 @@ impl Drop for Server {
 async fn production_browser_selects_two_real_worktrees_without_global_attachment() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     fs::create_dir(&home).unwrap();
     let a = temp.path().join("a");
     let b = temp.path().join("b");
@@ -161,6 +275,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     drop(listener);
     let log = temp.path().join("serve-stderr");
     let child = command(&home)
+        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&a)
@@ -197,6 +312,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     })
     .await
     .unwrap();
+    assert!(home.join("auto-daemon.pid").exists());
     let global = client
         .get(format!("{base}/api/daemon/status"))
         .send()

@@ -107,8 +107,8 @@ struct IndexArgs {
     #[arg(long, requires = "scip")]
     manifest: Option<PathBuf>,
     /// Larger files are skipped with a diagnostic; valid range 1..16777216.
-    #[arg(long, default_value_t = 2_097_152)]
-    max_file_bytes: u64,
+    #[arg(long)]
+    max_file_bytes: Option<u64>,
 }
 #[derive(Args)]
 struct ServeArgs {
@@ -205,8 +205,9 @@ impl WorkspaceArgs {
 }
 impl IndexArgs {
     fn resolve(&self) -> Result<(Store, IndexOptions, PathBuf)> {
+        let max_file_bytes = self.max_file_bytes.unwrap_or(2_097_152);
         ensure!(
-            (1..=16_777_216).contains(&self.max_file_bytes),
+            (1..=16_777_216).contains(&max_file_bytes),
             "max-file-bytes must be 1..16777216"
         );
         let (roots, identity) = self.workspace.resolve()?;
@@ -217,7 +218,7 @@ impl IndexArgs {
         options.scip_path = self.scip.clone();
         options.manifest_path = self.manifest.clone();
         options.anchor_optional_inputs(&std::env::current_dir()?)?;
-        options.max_file_bytes = self.max_file_bytes;
+        options.max_file_bytes = max_file_bytes;
         Ok((store, options, cache))
     }
 }
@@ -918,12 +919,29 @@ fn socket_path() -> Result<PathBuf> {
 }
 
 fn start_daemon() -> std::io::Result<client::StartOutcome> {
-    std::process::Command::new(std::env::current_exe()?)
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // The daemon must outlive the first CLI/MCP client's process group/session.
+    // setsid is async-signal-safe: no allocation or lock is taken in the child.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
+    // Election losers exit quickly; a still-running winner must not block the caller.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(client::StartOutcome::Started)
 }
 
@@ -997,7 +1015,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
     let (roots, identity) = workspace.resolve_unattached()?;
     if let Command::Index(args) = command {
         ensure!(
-            (1..=16_777_216).contains(&args.max_file_bytes),
+            (1..=16_777_216).contains(&args.max_file_bytes.unwrap_or(2_097_152)),
             "max-file-bytes must be 1..16777216"
         );
         let mut options = IndexOptions::new(identity.root.clone());
@@ -1006,6 +1024,12 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
         options.anchor_optional_inputs(&std::env::current_dir()?)?;
         payload["scip"] = serde_json::to_value(options.scip_path)?;
         payload["manifest"] = serde_json::to_value(options.manifest_path)?;
+        if args.max_file_bytes.is_none() {
+            payload
+                .as_object_mut()
+                .expect("index args object")
+                .remove("maxFileBytes");
+        }
     }
     if operation == "export"
         && let Command::Export(args) = command
@@ -1078,7 +1102,11 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
     let mut index_options = IndexOptions::new(identity.root.clone());
     index_options.scip_path = args.index.scip.clone();
     index_options.manifest_path = args.index.manifest.clone();
-    index_options.max_file_bytes = args.index.max_file_bytes;
+    index_options.max_file_bytes = args.index.max_file_bytes.unwrap_or(2_097_152);
+    ensure!(
+        (1..=16_777_216).contains(&index_options.max_file_bytes),
+        "max-file-bytes must be 1..16777216"
+    );
     index_options.anchor_optional_inputs(&std::env::current_dir()?)?;
     let rust_library = if let Some(path) = args
         .rust_library
@@ -1113,6 +1141,21 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         acp_state_dir: args.acp_state_dir.clone(),
         acp_max_attempts: args.acp_max_attempts,
     };
+    let mut options_json = serde_json::to_value(options)?;
+    let fields = options_json
+        .as_object_mut()
+        .expect("browser options object");
+    // Only index options actually supplied by this caller can supersede a
+    // durable option. Other BrowserOptions fields retain their normal shape.
+    if args.index.scip.is_none() {
+        fields.remove("scip");
+    }
+    if args.index.manifest.is_none() {
+        fields.remove("manifest");
+    }
+    if args.index.max_file_bytes.is_none() {
+        fields.remove("maxFileBytes");
+    }
     let socket = socket_path()?;
     let mut stream = client::connect_or_start(&socket, start_daemon, Duration::from_secs(5))
         .map_err(|_| anyhow::anyhow!("daemon_unavailable"))?;
@@ -1123,7 +1166,7 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
             "serve",
             serde_json::json!({
                 "workspace": identity.root, "bind": args.bind, "tokenFile": token_file,
-                "options": options,
+                "options": options_json,
             }),
         ),
     )?;
@@ -1177,6 +1220,10 @@ async fn run_daemon() -> Result<()> {
     let Some(owner) = daemon::SocketOwner::acquire(&paths)? else {
         return Ok(());
     };
+    // Test-only ownership marker: only the elected daemon records its PID.
+    if let Some(path) = std::env::var_os("BALEYG_TEST_DAEMON_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
     owner.listener().set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(owner.listener().try_clone()?)?;
     let registry = Arc::new(tokio::sync::Mutex::new(registry::CheckoutRegistry::new()));
@@ -1186,11 +1233,34 @@ async fn run_daemon() -> Result<()> {
     let (browser_shutdown, _) = tokio::sync::watch::channel(false);
     let idle = daemon::run_idle_lifecycle(registry.clone());
     tokio::pin!(idle);
+    // A single injected accept fault tests that the elected socket survives it.
+    let mut injected_accept_errno =
+        match std::env::var("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
+            Ok("emfile") => Some(libc::EMFILE),
+            Ok("econnaborted") => Some(libc::ECONNABORTED),
+            _ => None,
+        };
     loop {
         tokio::select! {
             result = &mut idle => { result.map_err(|e| anyhow::anyhow!("{}", e.reason()))?; break; }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+            accepted = async {
+                if let Some(errno) = injected_accept_errno {
+                    Err(std::io::Error::from_raw_os_error(errno))
+                } else {
+                    listener.accept().await
+                }
+            } => {
+                injected_accept_errno = None;
+                let (stream, _) = match accepted {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        use std::io::Write;
+                        let _ = writeln!(std::io::stderr().lock(), "daemon socket accept failed: {error}");
+                        // Even a persistent EMFILE must not hot-spin or drop the elected socket.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 let stream = stream.into_std()?;
                 stream.set_nonblocking(false)?;
                 let registry = registry.clone();
@@ -1209,6 +1279,34 @@ async fn run_daemon() -> Result<()> {
     drop(listener);
     drop(owner);
     Ok(())
+}
+
+fn checked_serve_options(raw: serde_json::Value) -> Result<registry::CheckoutOptions> {
+    let _: registry::BrowserOptions = serde_json::from_value(raw.clone())?;
+    // Validation must not fill in a missing optional key before lifecycle
+    // compares the caller's explicitly supplied options.
+    Ok(registry::CheckoutOptions(raw))
+}
+
+#[cfg(test)]
+mod serve_option_transport_tests {
+    use super::*;
+    #[test]
+    fn daemon_receipt_keeps_omitted_and_explicit_default_distinct() {
+        let options = serde_json::to_value(registry::BrowserOptions::default()).unwrap();
+        let mut omitted = options.clone();
+        for key in ["scip", "manifest", "maxFileBytes"] {
+            omitted.as_object_mut().unwrap().remove(key);
+        }
+        let absent = checked_serve_options(omitted).unwrap();
+        let explicit = checked_serve_options(options).unwrap();
+        for key in ["scip", "manifest", "maxFileBytes"] {
+            assert!(absent.0.get(key).is_none(), "{}", absent.0);
+        }
+        assert_eq!(explicit.0["maxFileBytes"], 2_097_152);
+        assert_eq!(explicit.0.get("scip"), Some(&serde_json::Value::Null));
+        assert_eq!(explicit.0.get("manifest"), Some(&serde_json::Value::Null));
+    }
 }
 
 fn dispatch_connection(
@@ -1296,14 +1394,13 @@ fn dispatch_connection(
         let identity = WorkspaceIdentity::discover_unattached(Some(&root), &root)?;
         TopologyRoots::production()?.reject_root_overlap(&identity)?;
         if serve {
-            let options: registry::BrowserOptions = serde_json::from_value(
+            let options = checked_serve_options(
                 request
                     .payload
                     .get("options")
                     .cloned()
                     .context("missing options")?,
             )?;
-            let options = registry::CheckoutOptions(serde_json::to_value(options)?);
             let bind = serde_json::from_value(
                 request
                     .payload
@@ -1375,9 +1472,9 @@ fn dispatch_connection(
                     let mut options = IndexOptions::new(identity.root.clone());
                     options.scip_path = serde_json::from_value(args["scip"].clone())?;
                     options.manifest_path = serde_json::from_value(args["manifest"].clone())?;
-                    options.max_file_bytes = args["maxFileBytes"]
-                        .as_u64()
-                        .context("missing maxFileBytes")?;
+                    if let Some(value) = args.get("maxFileBytes") {
+                        options.max_file_bytes = value.as_u64().context("invalid maxFileBytes")?;
+                    }
                     ensure!(
                         (1..=16_777_216).contains(&options.max_file_bytes),
                         "max-file-bytes must be 1..16777216"
