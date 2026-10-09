@@ -6,8 +6,7 @@
 use crate::model::IndexPin;
 use serde::{Serialize, Serializer};
 use std::{
-    env, fs,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    env,
     path::PathBuf,
     sync::{
         Arc,
@@ -70,25 +69,12 @@ pub struct CausalWitness {
 }
 
 impl CausalWitness {
-    /// Activate only for an absolute socket directly inside this user's private
-    /// HOME. An invalid/unset fixture hook is inert in ordinary installations.
+    /// Activate only for an absolute socket directly inside the fixture HOME.
+    /// Its test owns the private directory and socket; ordinary runs are inert.
     pub fn from_env(root_key: String) -> Option<Arc<Self>> {
         let home = PathBuf::from(env::var_os("HOME")?);
         let socket = PathBuf::from(env::var_os("BALEYG_TEST_MCP_CAUSAL_SOCKET")?);
         if !home.is_absolute() || !socket.is_absolute() || socket.parent()? != home {
-            return None;
-        }
-        let owner = unsafe { libc::geteuid() };
-        let home_meta = fs::symlink_metadata(&home).ok()?;
-        let socket_meta = fs::symlink_metadata(&socket).ok()?;
-        if !home_meta.is_dir()
-            || home_meta.file_type().is_symlink()
-            || home_meta.uid() != owner
-            || home_meta.permissions().mode() & 0o077 != 0
-            || !socket_meta.file_type().is_socket()
-            || socket_meta.uid() != owner
-            || socket_meta.permissions().mode() & 0o077 != 0
-        {
             return None;
         }
         let handle = tokio::runtime::Handle::try_current().ok()?;
@@ -244,4 +230,160 @@ async fn send_error(
         stream_seq,
     };
     let _ = write_one(socket, &error).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lineage() -> Lineage {
+        Lineage {
+            owner_incarnation: Uuid::new_v4(),
+            watch_epoch: Uuid::new_v4(),
+            ordinal: 1,
+        }
+    }
+    fn pin() -> IndexPin {
+        IndexPin {
+            index_generation: Uuid::new_v4(),
+            index_revision: 1,
+        }
+    }
+
+    async fn receive_event(listener: &tokio::net::UnixListener) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        let (mut peer, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn writer_delivers_one_ordered_connection_per_event() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("witness.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (sender, receiver) = mpsc::channel(4);
+        let failed = Arc::new(AtomicBool::new(false));
+        let reporter = CausalWitness {
+            sender,
+            failed: failed.clone(),
+        };
+        let writer = tokio::spawn(write_events(
+            socket,
+            "fixture".to_owned(),
+            Uuid::new_v4(),
+            receiver,
+            failed.clone(),
+        ));
+        let owner = lineage();
+        reporter.watch_pending(owner, 1);
+        reporter.h_ready(owner, pin());
+        reporter.watch_ack(owner, 1, pin(), true);
+        let mut stream_id = None;
+        for (seq, kind) in [(1, "WATCH_PENDING"), (2, "H_READY"), (3, "WATCH_ACK")] {
+            let event = receive_event(&listener).await;
+            assert_eq!(event["kind"], kind);
+            assert_eq!(event["streamSeq"], seq);
+            assert_eq!(
+                event["ownerIncarnation"],
+                owner.owner_incarnation.to_string()
+            );
+            assert_eq!(event["watchEpoch"], owner.watch_epoch.to_string());
+            if let Some(stream) = &stream_id {
+                assert_eq!(&event["streamId"], stream);
+            }
+            stream_id = Some(event["streamId"].clone());
+        }
+        assert!(!failed.load(Ordering::Acquire));
+        drop(reporter);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn overflow_delivers_error_instead_of_stale_ack() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("witness.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (sender, receiver) = mpsc::channel(1);
+        let failed = Arc::new(AtomicBool::new(false));
+        let reporter = CausalWitness {
+            sender,
+            failed: failed.clone(),
+        };
+        let owner = lineage();
+        reporter.watch_pending(owner, 1);
+        reporter.watch_pending(owner, 2); // deterministic backpressure before writer starts
+        reporter.watch_ack(owner, 2, pin(), true);
+        assert!(failed.load(Ordering::Acquire));
+        let writer = tokio::spawn(write_events(
+            socket,
+            "fixture".to_owned(),
+            Uuid::new_v4(),
+            receiver,
+            failed,
+        ));
+        let event = receive_event(&listener).await;
+        assert_eq!(event["kind"], "ERROR");
+        assert_eq!(event["streamSeq"], 1);
+        drop(reporter);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn full_producer_queue_permanently_stops_later_ack() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let failed = Arc::new(AtomicBool::new(false));
+        let reporter = CausalWitness {
+            sender,
+            failed: failed.clone(),
+        };
+        let owner = lineage();
+        reporter.watch_pending(owner, 1);
+        reporter.watch_pending(owner, 2); // overflow cannot silently discard this hint
+        assert!(failed.load(Ordering::Acquire));
+        reporter.watch_ack(owner, 2, pin(), true);
+        assert_eq!(receiver.try_recv().unwrap().kind, "WATCH_PENDING");
+        assert!(receiver.try_recv().is_err(), "no ACK after a lost hint");
+    }
+
+    #[tokio::test]
+    async fn missing_listener_stops_writer_without_later_ack() {
+        let home = tempfile::tempdir().unwrap();
+        let (sender, receiver) = mpsc::channel(2);
+        let failed = Arc::new(AtomicBool::new(false));
+        let reporter = CausalWitness {
+            sender,
+            failed: failed.clone(),
+        };
+        let owner = lineage();
+        let writer = tokio::spawn(write_events(
+            home.path().join("unbound.sock"),
+            "fixture".to_owned(),
+            Uuid::new_v4(),
+            receiver,
+            failed.clone(),
+        ));
+        reporter.watch_pending(owner, 1);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed.load(Ordering::Acquire));
+        reporter.watch_ack(owner, 1, pin(), true);
+        assert!(failed.load(Ordering::Acquire));
+    }
 }

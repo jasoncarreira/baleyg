@@ -317,6 +317,12 @@ impl CheckoutRegistry {
             pre_h_hook: std::sync::Mutex::new(None),
             release_permit_fault: AtomicBool::new(false),
         });
+        if let Some(reporter) = super::causal_witness::CausalWitness::from_env(key.to_owned()) {
+            runtime
+                .resources()?
+                .scheduler
+                .set_causal_witness_runtime(reporter, Arc::downgrade(&runtime));
+        }
         self.runtimes.insert(key.to_owned(), runtime.clone());
         runtime.start(options, permit, explicit_options);
         Ok(runtime)
@@ -1299,6 +1305,51 @@ impl CheckoutRuntime {
 
     pub fn browser_scheduler(&self) -> anyhow::Result<Arc<http::DaemonState>> {
         Ok(self.resources()?.scheduler.clone())
+    }
+
+    /// Invoked through a weak edge AFTER a queue tick releases all stream and
+    /// watcher locks. This is a snapshot of the current verified H owner, not a
+    /// claim that H ran again when a serving watcher gets a new epoch.
+    pub(crate) fn report_causal_h_ready(&self, scheduler: &Arc<http::DaemonState>) {
+        if !self.active.load(Ordering::Acquire) || self.h_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+        let owner = match &*self.phase.lock().unwrap() {
+            RuntimePhase::Ready(owner) => owner.clone(),
+            _ => return,
+        };
+        let Ok(resources) = self.resources() else {
+            return;
+        };
+        if !Arc::ptr_eq(&resources.scheduler, scheduler) {
+            return;
+        }
+        let Some(lineage) = scheduler.causal_lineage_for(&owner) else {
+            return;
+        };
+        if lineage.owner_incarnation != owner.incarnation()
+            || scheduler.causal_h_already_reported(lineage)
+            || owner.verify().is_err()
+        {
+            return;
+        }
+        let Ok(pin) = resources.store.index_baseline() else {
+            return;
+        };
+        let still_ready = matches!(&*self.phase.lock().unwrap(),
+            RuntimePhase::Ready(current) if Arc::ptr_eq(current, &owner));
+        if still_ready
+            && self.active.load(Ordering::Acquire)
+            && !self.h_in_flight.load(Ordering::Acquire)
+            && owner.verify().is_ok()
+            && scheduler.causal_lineage_for(&owner).is_some_and(|current| {
+                current.owner_incarnation == lineage.owner_incarnation
+                    && current.watch_epoch == lineage.watch_epoch
+                    && current.ordinal == lineage.ordinal
+            })
+        {
+            scheduler.emit_causal_h_ready_once(lineage, pin);
+        }
     }
 
     /// CLI calls share the activated checkout's Store and scheduler; they never

@@ -2307,10 +2307,14 @@ async fn next_causal_event(
 /// Generation comparisons are valid only within one owner and watcher epoch.
 #[derive(Default)]
 struct CausalReadiness {
+    stream_id: Option<String>,
+    stream_seq: u64,
+    lineage_ordinal: Option<u64>,
     lineage: Option<(String, String)>,
     h_ready: bool,
     acked: Option<u64>,
     pending: Option<u64>,
+    announced_generations: std::collections::HashSet<u64>,
 }
 
 fn causal_lineage(event: &Value) -> (String, String) {
@@ -2323,14 +2327,54 @@ fn causal_lineage(event: &Value) -> (String, String) {
 }
 
 impl CausalReadiness {
-    fn observe(&mut self, event: &Value, published: &Value) {
+    /// Return false for a sequenced but causally retired lineage. Never let an
+    /// old epoch's late connection reset a newer owner/watch witness.
+    fn observe(&mut self, event: &Value, published: &Value) -> bool {
+        let stream_id = event["streamId"].as_str().expect("witness stream ID");
+        uuid::Uuid::parse_str(stream_id).expect("invalid witness stream ID");
+        if let Some(first) = &self.stream_id {
+            assert_eq!(
+                stream_id, first,
+                "another daemon emitted into this witness stream"
+            );
+        } else {
+            self.stream_id = Some(stream_id.to_owned());
+        }
+        let sequence = event["streamSeq"]
+            .as_u64()
+            .expect("witness stream sequence");
+        assert_eq!(
+            sequence,
+            self.stream_seq + 1,
+            "lost, duplicate, or reordered causal event"
+        );
+        self.stream_seq = sequence;
+        // Transport failure invalidates the whole stream, even if its last
+        // queued record belonged to a now-retired watcher epoch.
+        assert_ne!(
+            event["kind"], "ERROR",
+            "fixture causal witness transport failed: {event}"
+        );
+
+        let lineage_ordinal = event["lineageOrdinal"].as_u64().expect("lineage ordinal");
         let lineage = causal_lineage(event);
-        if self.lineage.as_ref() != Some(&lineage) {
-            // A new owner or replacement watcher has its own generation domain.
-            *self = Self {
-                lineage: Some(lineage),
-                ..Self::default()
-            };
+        match self.lineage_ordinal {
+            Some(current) if lineage_ordinal < current => return false,
+            Some(current) if lineage_ordinal == current => {
+                assert_eq!(
+                    self.lineage.as_ref(),
+                    Some(&lineage),
+                    "lineage ordinal collision"
+                );
+            }
+            _ => {
+                self.lineage_ordinal = Some(lineage_ordinal);
+                self.lineage = Some(lineage);
+                self.h_ready = false;
+                self.acked = None;
+                self.pending = None;
+                self.announced_generations.clear();
+            }
         }
         match event["kind"].as_str().expect("witness kind") {
             "H_READY" => {
@@ -2342,14 +2386,20 @@ impl CausalReadiness {
             }
             "WATCH_PENDING" => {
                 let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                self.announced_generations.insert(generation);
                 self.pending = Some(
                     self.pending
                         .map_or(generation, |prior| prior.max(generation)),
                 );
             }
+            "ERROR" => panic!("fixture causal witness transport failed: {event}"),
             "WATCH_ACK" => {
                 assert_eq!(event["queueEmpty"], true, "ACK requires an empty FIFO");
                 let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                assert!(
+                    self.announced_generations.contains(&generation),
+                    "ACK without same-lineage WATCH_PENDING for its generation"
+                );
                 // CLI row completion is not H/watch settlement. Earlier H ACKs
                 // may be observed, but only the accepted CLI pin binds this ACK.
                 if event["pin"] == *published {
@@ -2358,13 +2408,14 @@ impl CausalReadiness {
             }
             kind => panic!("unknown causal witness: {kind}"),
         }
+        true
     }
 
     fn settled(&self) -> bool {
         self.h_ready
             && self
                 .acked
-                .is_some_and(|ack| self.pending.is_none_or(|hint| ack >= hint))
+                .is_some_and(|ack| self.pending.is_some_and(|hint| ack >= hint))
     }
 }
 
@@ -2424,7 +2475,9 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     assert!(second["result"]["structuredContent"]["catchingUp"].is_boolean());
 
     // Future opt-in daemon hooks send one bounded JSON record per connection:
-    // {kind,rootKey,ownerIncarnation,watchEpoch,pin,watchGeneration,queueEmpty}.
+    // {kind,rootKey,streamId,streamSeq,lineageOrdinal,ownerIncarnation,
+    //  watchEpoch,pin,watchGeneration,queueEmpty}. A single FIFO writer sends
+    // one complete event per connection. Any missing/duplicate sequence fails.
     // H_READY follows verified owner installation AND phase Ready/H=false.
     // WATCH_ACK follows full inventory acknowledgment with no unfinished FIFO.
     // WATCH_PENDING is
@@ -2446,9 +2499,12 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         readiness.observe(&next_event().await, published);
     }
 
-    // A newly accepted hint between WATCH_ACK and this tool call makes true
-    // legitimate. Only retry after witnessing that later generation and its
-    // corresponding ACK. Never spin on catchingUp or turn a timeout into false.
+    // One CLI index is the only Q submission in this private fixture. There
+    // are no other clients or fixture edits, and 15 seconds is below the 60s
+    // periodic inventory interval. If another FIFO row unexpectedly appears,
+    // the lack of a watcher witness must fail, not be called a watcher hint.
+    // A genuine new hint after ACK can make true legitimate. Retry only after
+    // witnessing that generation's ACK; never poll catchingUp or infer false.
     for id in 3..=5 {
         let reply = peer.ask(call(
             false,
@@ -2470,26 +2526,289 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
             id < 5,
             "new watcher hints exceeded the bounded transition budget"
         );
-        let prior_lineage = readiness.lineage.clone().expect("correlated H/ACK lineage");
+        let prior_ordinal = readiness.lineage_ordinal.expect("correlated H/ACK lineage");
         let prior_ack = readiness.acked.expect("CLI-pinned watcher ACK");
         let mut witnessed_later = false;
         loop {
             let event = next_event().await;
-            let lineage = causal_lineage(&event);
-            // A replacement owner or watcher epoch starts a new generation
-            // domain; its own H_READY and CLI-pinned ACK are both required.
-            if lineage != prior_lineage {
-                witnessed_later = true;
-            } else if event["kind"] == "WATCH_PENDING"
-                && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack
-            {
+            let ordinal = event["lineageOrdinal"].as_u64().expect("lineage ordinal");
+            let later_hint = ordinal == prior_ordinal
+                && event["kind"] == "WATCH_PENDING"
+                && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack;
+            let current = readiness.observe(&event, published);
+            // Old-epoch deliveries still consume streamSeq but cannot replace
+            // a newer H witness or count as a new reason to retry.
+            if current && (ordinal > prior_ordinal || later_hint) {
                 witnessed_later = true;
             }
-            readiness.observe(&event, published);
             if witnessed_later && readiness.settled() {
                 break;
             }
         }
     }
     unreachable!("bounded tool calls return or fail")
+}
+
+/// Drive a real same-owner selected-options change through the daemon FIFO.
+/// The fresh H_READY is a Ready snapshot for the replacement watcher; it does
+/// not claim that mandatory H reran when the accepted CLI index changed inputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let (mut peer, listener) = Peer::start_with_causal_witness(Some(&root));
+    let selected = peer.ask(call(
+        false,
+        json!(1),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&selected, None, true);
+    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let home = peer._home.path().to_path_buf();
+    let index = |size: Option<u64>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+        command
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"));
+        if let Some(size) = size {
+            command.arg("--max-file-bytes").arg(size.to_string());
+        }
+        let output = bounded_output(command);
+        assert!(
+            output.status.success(),
+            "index: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["publishedRevision"].clone()
+    };
+    let first_pin = index(None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut state = CausalReadiness::default();
+    let mut records = 0;
+    while !state.settled() {
+        records += 1;
+        assert!(records <= 24, "initial watcher witness event budget");
+        let event = next_causal_event(&listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key);
+        state.observe(&event, &first_pin);
+    }
+    let original = state.lineage.clone().unwrap();
+    let original_ordinal = state.lineage_ordinal.unwrap();
+    let next_pin = index(Some(4096));
+    assert_eq!(next_pin["indexGeneration"], first_pin["indexGeneration"]);
+    // The CLI's published pin alone does not prove its selected option reached
+    // the store. Inspect this fixture's sole index.db read-only immediately
+    // after completion, before consuming the replacement watcher events.
+    let mut dirs = vec![home.clone()];
+    let mut index_db = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|name| name == "index.db") {
+                assert!(
+                    index_db.replace(path).is_none(),
+                    "fixture has multiple indexes"
+                );
+            } else if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        index_db.expect("selected index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let options: Value = serde_json::from_str(&options).unwrap();
+    assert_eq!(options["maxFileBytes"], 4096);
+    drop(db);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut observed = std::collections::HashSet::new();
+    while !state.settled() || state.lineage_ordinal == Some(original_ordinal) {
+        records += 1;
+        assert!(records <= 24, "replacement watcher witness event budget");
+        let event = next_causal_event(&listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key);
+        let ordinal = event["lineageOrdinal"].as_u64().unwrap();
+        let lineage = causal_lineage(&event);
+        if ordinal > original_ordinal {
+            assert_eq!(
+                lineage.0, original.0,
+                "option changes retain the same H owner"
+            );
+            assert_ne!(
+                lineage.1, original.1,
+                "replacement must mint a new watch epoch"
+            );
+            observed.insert(event["kind"].as_str().unwrap().to_owned());
+        }
+        state.observe(&event, &next_pin);
+    }
+    assert!(
+        observed.contains("H_READY"),
+        "new epoch needs its own H-ready snapshot"
+    );
+    assert!(
+        observed.contains("WATCH_PENDING"),
+        "new watcher needs a full wake"
+    );
+    assert!(
+        observed.contains("WATCH_ACK"),
+        "new watcher must acknowledge the full wake"
+    );
+    let final_reply = peer.ask(call(
+        false,
+        json!(2),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&final_reply, None, true);
+    assert_eq!(
+        final_reply["result"]["structuredContent"]["workspace"],
+        selected["result"]["structuredContent"]["workspace"]
+    );
+    assert!(final_reply["result"]["structuredContent"]["catchingUp"].is_boolean());
+    assert!(peer.finish().0.success());
+}
+
+/// Synthetic event ordering checks the fixture collector without a daemon.
+/// Explicit event fields keep each source/epoch transition visible at the call site.
+#[allow(clippy::too_many_arguments)]
+fn causal_fixture_event(
+    stream: uuid::Uuid,
+    seq: u64,
+    ordinal: u64,
+    owner: uuid::Uuid,
+    epoch: uuid::Uuid,
+    kind: &str,
+    pin: &Value,
+    generation: u64,
+) -> Value {
+    json!({"kind":kind,"rootKey":"fixture","streamId":stream.to_string(),
+      "streamSeq":seq,"lineageOrdinal":ordinal,
+      "ownerIncarnation":owner.to_string(),"watchEpoch":epoch.to_string(),"pin":pin,
+      "watchGeneration":generation,"queueEmpty":kind == "WATCH_ACK"})
+}
+
+#[test]
+fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let old = uuid::Uuid::new_v4();
+    let next = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":3});
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, old, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 2, 1, owner, old, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 3, 1, owner, old, "WATCH_ACK", &pin, 1),
+        &pin
+    ));
+    assert!(state.settled());
+    assert!(state.observe(
+        &causal_fixture_event(stream, 4, 2, owner, next, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled());
+    // An old epoch arrives after the new event. It consumes the stream sequence
+    // but cannot reset the new epoch or certify readiness with stale H/ACK.
+    assert!(!state.observe(
+        &causal_fixture_event(stream, 5, 1, owner, old, "WATCH_ACK", &pin, 2),
+        &pin
+    ));
+    assert_eq!(state.lineage_ordinal, Some(2));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 6, 2, owner, next, "WATCH_ACK", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled(), "ACK without successor H is insufficient");
+    assert!(state.observe(
+        &causal_fixture_event(stream, 7, 2, owner, next, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(state.settled());
+    assert!(state.observe(
+        &causal_fixture_event(stream, 8, 2, owner, next, "WATCH_PENDING", &pin, 2),
+        &pin
+    ));
+    assert!(!state.settled(), "post-ACK hint reopens catching up");
+    assert!(state.observe(
+        &causal_fixture_event(stream, 9, 2, owner, next, "WATCH_ACK", &pin, 2),
+        &pin
+    ));
+    assert!(state.settled());
+}
+
+#[test]
+fn causal_witness_rejects_ack_without_same_lineage_pending() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let epoch = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":3});
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, epoch, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled());
+    let ack_only = causal_fixture_event(stream, 2, 1, owner, epoch, "WATCH_ACK", &pin, 1);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || state.observe(&ack_only, &pin)
+        ))
+        .is_err()
+    );
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, epoch, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    let wrong_generation = causal_fixture_event(stream, 2, 1, owner, epoch, "WATCH_ACK", &pin, 2);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || state.observe(&wrong_generation, &pin)
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn causal_witness_rejects_missing_or_duplicate_stream_event() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let epoch = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":1});
+    let mut state = CausalReadiness::default();
+    let first = causal_fixture_event(stream, 1, 1, owner, epoch, "H_READY", &pin, 1);
+    assert!(state.observe(&first, &pin));
+    let duplicate =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.observe(&first, &pin)));
+    assert!(duplicate.is_err());
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(&first, &pin));
+    let gap = causal_fixture_event(stream, 3, 1, owner, epoch, "WATCH_ACK", &pin, 1);
+    let missing =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.observe(&gap, &pin)));
+    assert!(missing.is_err());
 }

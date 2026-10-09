@@ -32,7 +32,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -246,6 +246,10 @@ pub struct DaemonState {
             crate::index_coordinator::LeaderWork,
         )>,
     >,
+    causal_witness: Mutex<Option<Arc<crate::daemon::causal_witness::CausalWitness>>>,
+    causal_runtime: Mutex<Option<std::sync::Weak<crate::daemon::registry::CheckoutRuntime>>>,
+    causal_lineage_ordinal: Arc<AtomicU64>,
+    causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     empty_takeover_retry: AtomicBool,
     retention_last_run: Mutex<Instant>,
@@ -407,6 +411,10 @@ pub fn new_with_dependency_options(
         native_stream: Mutex::new(()),
         maintenance_stream: Mutex::new(()),
         leader_work: Mutex::new(None),
+        causal_witness: Mutex::new(None),
+        causal_runtime: Mutex::new(None),
+        causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
+        causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         empty_takeover_retry: AtomicBool::new(false),
         retention_last_run: Mutex::new(Instant::now()),
@@ -427,6 +435,76 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
+    /// Register a test-only, read-only witness after this checkout activates.
+    /// The reverse edge is weak: release may drop the runtime independently.
+    pub fn set_causal_witness_runtime(
+        &self,
+        reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
+        runtime: std::sync::Weak<crate::daemon::registry::CheckoutRuntime>,
+    ) {
+        *self.causal_witness.lock().unwrap() = Some(reporter);
+        *self.causal_runtime.lock().unwrap() = Some(runtime);
+    }
+
+    /// Called only after queue_tick returned and released its native/work locks.
+    fn report_causal_h_ready(self: &Arc<Self>) {
+        let runtime = self.causal_runtime.lock().unwrap().clone();
+        if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
+            runtime.report_causal_h_ready(self);
+        }
+    }
+
+    pub fn causal_lineage_for(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+    ) -> Option<crate::daemon::causal_witness::Lineage> {
+        let serving = self.serving_session.lock().unwrap();
+        if !serving
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, session))
+        {
+            return None;
+        }
+        let work = self.leader_work.lock().unwrap();
+        let (owner, scheduler) = work.as_ref()?;
+        owner
+            .upgrade()
+            .filter(|owner| Arc::ptr_eq(owner, session))?;
+        scheduler.causal_lineage()
+    }
+
+    pub fn causal_h_already_reported(
+        &self,
+        lineage: crate::daemon::causal_witness::Lineage,
+    ) -> bool {
+        self.causal_h_reported.lock().unwrap().as_ref()
+            == Some(&(
+                lineage.owner_incarnation,
+                lineage.watch_epoch,
+                lineage.ordinal,
+            ))
+    }
+
+    pub fn emit_causal_h_ready_once(
+        &self,
+        lineage: crate::daemon::causal_witness::Lineage,
+        pin: IndexPin,
+    ) {
+        let Some(reporter) = self.causal_witness.lock().unwrap().clone() else {
+            return;
+        };
+        let key = (
+            lineage.owner_incarnation,
+            lineage.watch_epoch,
+            lineage.ordinal,
+        );
+        let mut reported = self.causal_h_reported.lock().unwrap();
+        if reported.as_ref() != Some(&key) {
+            reporter.h_ready(lineage, pin);
+            *reported = Some(key);
+        }
+    }
+
     pub fn retain_serving_session(
         self: &Arc<Self>,
         session: Arc<crate::store::topology::LeaderSession>,
@@ -547,6 +625,11 @@ impl DaemonState {
                 };
                 let worker = state.clone();
                 let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
+                // The witness may read phase only after queue_tick released the
+                // native stream, watcher mutex and any SQLite statement.
+                if result.as_ref().is_ok_and(|outcome| outcome.is_ok()) {
+                    state.report_causal_h_ready();
+                }
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => best_effort_queue_stderr(
@@ -1191,23 +1274,49 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
-                        *work = Some((
-                            Arc::downgrade(session),
-                            crate::index_coordinator::LeaderWork::new(
-                                &self.store,
-                                session,
-                                &selected_options,
-                            )?,
-                        ));
+                        let mut scheduler = crate::index_coordinator::LeaderWork::new(
+                            &self.store,
+                            session,
+                            &selected_options,
+                        )?;
+                        if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
+                            scheduler.attach_causal_witness(
+                                reporter,
+                                session.incarnation(),
+                                self.causal_lineage_ordinal.clone(),
+                            );
+                        }
+                        *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
-                        scheduler.reconcile_due(
+                        let accounted = scheduler.reconcile_due(
                             &self.store,
                             session,
                             &selected_options,
                             &Arc::new(AtomicBool::new(false)),
                             false,
                         )?;
+                        // ACK only a verified, acknowledged full inventory.
+                        // Neither a failed FIFO probe nor a newer accepted hint
+                        // can be called settled. The reporter only try_sends here.
+                        if accounted
+                            && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
+                            && !scheduler.accepted_watch_intent(&selected_options)
+                            && matches!(self.store.earliest_unfinished_request(), Ok(None))
+                            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
+                                scheduler.causal_lineage(),
+                                scheduler.accounted_watch_generation(),
+                                scheduler.accounted_watch_pin(),
+                            )
+                            && self.store.verify_leader_session(session).is_ok()
+                            && self
+                                .store
+                                .index_baseline()
+                                .is_ok_and(|pin| pin == certified_pin)
+                            && self.store.verify_leader_session(session).is_ok()
+                        {
+                            reporter.watch_ack(lineage, generation, certified_pin, true);
+                        }
                     }
                 }
             }
@@ -1362,14 +1471,19 @@ impl DaemonState {
                     // serve. Retain it before drain commits a terminal ACK; a
                     // later drain error may still release it for safe reclamation.
                     self.replace_serving_session(Some(session.clone()));
-                    *self.leader_work.lock().unwrap() = Some((
-                        Arc::downgrade(&session),
-                        crate::index_coordinator::LeaderWork::new(
-                            &self.store,
-                            &session,
-                            &takeover_options,
-                        )?,
-                    ));
+                    let mut scheduler = crate::index_coordinator::LeaderWork::new(
+                        &self.store,
+                        &session,
+                        &takeover_options,
+                    )?;
+                    if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
+                        scheduler.attach_causal_witness(
+                            reporter,
+                            session.incarnation(),
+                            self.causal_lineage_ordinal.clone(),
+                        );
+                    }
+                    *self.leader_work.lock().unwrap() = Some((Arc::downgrade(&session), scheduler));
                     let processed = crate::index_coordinator::drain_one_request_observed(
                         &self.store,
                         &session,
