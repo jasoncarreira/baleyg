@@ -160,6 +160,8 @@ pub struct CheckoutRegistry {
     idle_permits: HashMap<String, PreHReadPermit>,
     idle_epochs: HashMap<String, Arc<AtomicU64>>,
     idle_exit_at: Option<Instant>,
+    orphan_scan_cache: Option<(Instant, bool)>,
+    orphan_scan_count: u64,
     clock_override: Option<Instant>,
 }
 
@@ -182,6 +184,8 @@ impl CheckoutRegistry {
             idle_permits: HashMap::new(),
             idle_epochs: HashMap::new(),
             idle_exit_at: Some(now + DAEMON_IDLE_DELAY),
+            orphan_scan_cache: None,
+            orphan_scan_count: 0,
             clock_override: None,
         }
     }
@@ -233,6 +237,14 @@ impl CheckoutRegistry {
         options.scip_path = config.scip;
         options.manifest_path = config.manifest;
         options.max_file_bytes = config.max_file_bytes;
+        // The raw registration preserves option presence. A supplied default
+        // value (or an explicit null for an optional input) is still explicit;
+        // comparing values would silently reuse an earlier checkout's inputs.
+        let explicit_options = entry.registration.as_ref().is_some_and(|registered| {
+            ["scip", "manifest", "maxFileBytes"]
+                .iter()
+                .any(|key| registered.0.get(*key).is_some())
+        });
         let provider = match (config.jev_budget_dir, config.jev_budget_cents) {
             (Some(dir), Some(cap)) => {
                 let key = std::env::var("JEV_KEY")?;
@@ -295,11 +307,12 @@ impl CheckoutRegistry {
             active_reads: Arc::new(AtomicUsize::new(0)),
             last_error: std::sync::Mutex::new(None),
             h_in_flight: AtomicBool::new(true),
+            retry_waiting: AtomicBool::new(false),
             pre_h_hook: std::sync::Mutex::new(None),
             release_permit_fault: AtomicBool::new(false),
         });
         self.runtimes.insert(key.to_owned(), runtime.clone());
-        runtime.start(options, permit);
+        runtime.start(options, permit, explicit_options);
         Ok(runtime)
     }
 
@@ -315,7 +328,7 @@ impl CheckoutRegistry {
         };
         let resources = runtime.resources()?;
         if runtime.h_in_flight.load(Ordering::Acquire)
-            || runtime.catching_up()
+            || (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
             || runtime.active_reads.load(Ordering::Acquire) != 0
             || CheckoutRuntime::queue_pending(&resources)
         {
@@ -324,7 +337,8 @@ impl CheckoutRegistry {
         let mut phase = runtime.phase.lock().unwrap();
         CheckoutRuntime::refresh_phase(&mut phase, &resources);
         if runtime.h_in_flight.load(Ordering::Acquire)
-            || matches!(*phase, RuntimePhase::Transitional(_, _))
+            || (matches!(*phase, RuntimePhase::Transitional(_, _))
+                && !runtime.retry_waiting.load(Ordering::Acquire))
             || runtime.active_reads.load(Ordering::Acquire) != 0
         {
             return Ok(false);
@@ -335,6 +349,7 @@ impl CheckoutRegistry {
         resources.scheduler.release_checkout_runtime();
         *phase = RuntimePhase::Reconciling;
         runtime.resources.lock().unwrap().take();
+        resources.store.retire_checkout_sqlite_witnesses();
         drop(phase);
         drop(resources);
         self.runtimes.remove(key);
@@ -390,12 +405,23 @@ impl CheckoutRegistry {
             }
             self.register_discovered(&identity);
         }
-        self.entries
-            .get(key)
-            .ok_or(SelectionError::NotCheckout)?
-            .identity
-            .rediscover()
-            .map_err(|_| SelectionError::IdentityChanged)
+        let entry = self.entries.get(key).ok_or(SelectionError::NotCheckout)?;
+        if let Ok(identity) = entry.identity.rediscover() {
+            return Ok(identity);
+        }
+        // A stale pathname key may now name a different checkout. Discovery
+        // itself is read-only; never replace an attached, busy, or ambiguous
+        // incarnation. The ordinary retirement gate owns all old resources.
+        let root = entry.identity.root.clone();
+        let current = WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+            .map_err(|_| SelectionError::IdentityChanged)?;
+        if current.root_key != key || entry.identity.matches(&current) {
+            return Err(SelectionError::IdentityChanged);
+        }
+        self.retire_replaced(&current)?;
+        self.register_discovered(&current);
+        Ok(current)
     }
 
     fn register_discovered(&mut self, identity: &WorkspaceIdentity) {
@@ -427,7 +453,27 @@ impl CheckoutRegistry {
                 .as_ref()
                 .ok()
                 .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
-            let state = if entry.identity.rediscover().is_err() {
+            let old_verified = entry.identity.rediscover().is_ok();
+            // The old index belongs to the old inode and is never evidence for
+            // its replacement. Listing is observational: a new same-key root is
+            // selectable only after the old runtime has actually released.
+            // browser_identity rechecks and performs the mutable retirement.
+            let replaced_available = !old_verified
+                && entry.released
+                && !self.runtimes.contains_key(key)
+                && WorkspaceIdentity::discover_unattached(
+                    Some(&entry.identity.root),
+                    &entry.identity.root,
+                )
+                .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                .is_ok_and(|new| {
+                    new.root_key == *key
+                        && !entry.identity.matches(&new)
+                        && self.can_retire_replaced(&new)
+                });
+            let state = if replaced_available {
+                "available"
+            } else if !old_verified {
                 "unavailable"
             } else if index.as_ref().is_some_and(|index| index.is_file()) {
                 roots
@@ -639,6 +685,53 @@ impl CheckoutRegistry {
         Ok(())
     }
 
+    /// Retire a stale path incarnation only after its owner and accepted work
+    /// are quiescent. Never transfer a prior head permit to another identity.
+    fn retire_replaced(&mut self, identity: &WorkspaceIdentity) -> Result<(), SelectionError> {
+        let key = &identity.root_key;
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(());
+        };
+        if entry.identity.matches(identity) {
+            return Ok(());
+        }
+        if !self.can_retire_replaced(identity) {
+            return Err(SelectionError::IdentityChanged);
+        }
+        if !self.release(key)? {
+            return Err(SelectionError::IdentityChanged);
+        }
+        self.entries.remove(key);
+        self.idle_permits.remove(key);
+        self.idle_epochs.remove(key);
+        Ok(())
+    }
+
+    fn can_retire_replaced(&self, identity: &WorkspaceIdentity) -> bool {
+        let Some(entry) = self.entries.get(&identity.root_key) else {
+            return true;
+        };
+        if entry.identity.matches(identity) {
+            return true;
+        }
+        if !entry.sessions.is_empty()
+            || entry.browser_until.is_some()
+            || entry.pending_work
+            || entry.external_work
+        {
+            return false;
+        }
+        // Verify a *new* identity independently: rediscovering old metadata
+        // deliberately rejects the changed record_id after `git init`.
+        WorkspaceIdentity::discover_unattached(Some(&identity.root), &identity.root)
+            .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+            .is_ok_and(|found| {
+                !entry.identity.matches(&found)
+                    && found.record_id == identity.record_id
+                    && (found.device, found.inode) == (identity.device, identity.inode)
+            })
+    }
+
     pub fn can_register(
         &self,
         identity: &WorkspaceIdentity,
@@ -649,8 +742,11 @@ impl CheckoutRegistry {
             .map_err(|_| SelectionError::IdentityChanged)?;
         Self::validate_browser_options(identity, options)?;
         if let Some(entry) = self.entries.get(&identity.root_key) {
-            if !entry.identity.matches(identity) {
+            if !entry.identity.matches(identity) && !self.can_retire_replaced(identity) {
                 return Err(SelectionError::IdentityChanged);
+            }
+            if !entry.identity.matches(identity) {
+                return Ok(());
             }
             if entry.registration.as_ref() != Some(options)
                 && (entry.registration.is_some() || self.runtimes.contains_key(&identity.root_key))
@@ -671,6 +767,7 @@ impl CheckoutRegistry {
         identity
             .verify_readonly()
             .map_err(|_| SelectionError::IdentityChanged)?;
+        self.retire_replaced(identity)?;
         let key = &identity.root_key;
         if let Some(entry) = self.entries.get_mut(key) {
             if !entry.identity.matches(identity) {
@@ -837,7 +934,7 @@ impl CheckoutRegistry {
                     let resources = runtime
                         .resources()
                         .map_err(|_| SelectionError::Unavailable)?;
-                    runtime.catching_up()
+                    (runtime.catching_up() && !runtime.retry_waiting.load(Ordering::Acquire))
                         || runtime.active_reads.load(Ordering::Acquire) != 0
                         || CheckoutRuntime::queue_pending(&resources)
                 }
@@ -879,6 +976,7 @@ impl CheckoutRegistry {
         session: Option<u64>,
         identity: &WorkspaceIdentity,
     ) -> Result<Arc<WorkspaceIdentity>, SelectionError> {
+        self.retire_replaced(identity)?;
         let at_capacity = self.active_count() >= MAX_ACTIVE_CHECKOUTS;
         if let Some(entry) = self.entries.get_mut(&identity.root_key) {
             if !entry.identity.matches(identity) {
@@ -1004,13 +1102,28 @@ impl CheckoutRegistry {
         for key in self.entries.keys().cloned().collect::<Vec<_>>() {
             busy |= self.refresh_pending_work(&key)?;
         }
-        let exit = self.idle_exit_at.is_some_and(|at| now >= at)
+        let candidate = self.idle_exit_at.is_some_and(|at| now >= at)
             && !busy
-            && !self.orphan_queue_pending()
             && self
                 .entries
                 .values()
                 .all(|entry| entry.sessions.is_empty() && entry.browser_until.is_none());
+        // Never scan every index directory on the routine 250-ms tick. A
+        // genuinely pending orphan is checked again after a bounded interval.
+        let exit = if candidate {
+            let pending = match self.orphan_scan_cache {
+                Some((until, pending)) if now < until => pending,
+                _ => {
+                    let pending = self.orphan_queue_pending();
+                    self.orphan_scan_count += 1;
+                    self.orphan_scan_cache = Some((now + Duration::from_secs(5), pending));
+                    pending
+                }
+            };
+            !pending
+        } else {
+            false
+        };
         Ok(LifecycleTick { released, exit })
     }
 
@@ -1042,6 +1155,11 @@ impl CheckoutRegistry {
         };
         let active: HashSet<String> = self.runtimes.keys().cloned().collect();
         Store::orphan_queues_pending(&roots, &active)
+    }
+
+    #[doc(hidden)]
+    pub fn orphan_scan_count_for_tests(&self) -> u64 {
+        self.orphan_scan_count
     }
 
     pub fn idle_exit_deadline(&self) -> Option<Instant> {
@@ -1153,6 +1271,7 @@ pub struct CheckoutRuntime {
     active_reads: Arc<AtomicUsize>,
     last_error: std::sync::Mutex<Option<String>>,
     h_in_flight: AtomicBool,
+    retry_waiting: AtomicBool,
     pre_h_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     release_permit_fault: AtomicBool,
 }
@@ -1308,6 +1427,11 @@ impl CheckoutRuntime {
         self.last_error.lock().unwrap().clone()
     }
 
+    #[doc(hidden)]
+    pub fn retry_waiting_for_tests(&self) -> bool {
+        self.retry_waiting.load(Ordering::Acquire) && !self.h_in_flight.load(Ordering::Acquire)
+    }
+
     pub fn catching_up(&self) -> bool {
         let Ok(resources) = self.resources() else {
             return true;
@@ -1400,15 +1524,23 @@ impl CheckoutRuntime {
         )?))
     }
 
-    fn start(self: &Arc<Self>, options: IndexOptions, permit: Option<PreHReadPermit>) {
+    fn start(
+        self: &Arc<Self>,
+        options: IndexOptions,
+        permit: Option<PreHReadPermit>,
+        explicit_options: bool,
+    ) {
         let runtime = self.clone();
         tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(250);
             loop {
                 let worker = runtime.clone();
                 let options = options.clone();
                 let permit = permit.clone();
-                let outcome =
-                    tokio::task::spawn_blocking(move || worker.reconcile(&options, permit)).await;
+                let outcome = tokio::task::spawn_blocking(move || {
+                    worker.reconcile(&options, permit, explicit_options)
+                })
+                .await;
                 match outcome {
                     Ok(Ok(session)) => {
                         // Reconciliation cannot settle after release: release
@@ -1438,9 +1570,20 @@ impl CheckoutRuntime {
                             runtime.h_in_flight.store(false, Ordering::Release);
                             break;
                         }
-                        // A transient H failure keeps the same elected owner and
-                        // valid predecessor permit for the next guarded attempt.
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        // The active worker has finished. During backoff an empty
+                        // idle checkout can release; a queued row or live read
+                        // still pins its owner. Re-arm only under the phase lock,
+                        // paired with release's final gate.
+                        runtime.retry_waiting.store(true, Ordering::Release);
+                        runtime.h_in_flight.store(false, Ordering::Release);
+                        tokio::time::sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+                        let _phase = runtime.phase.lock().unwrap();
+                        if !runtime.active.load(Ordering::Acquire) {
+                            break;
+                        }
+                        runtime.h_in_flight.store(true, Ordering::Release);
+                        runtime.retry_waiting.store(false, Ordering::Release);
                     }
                 }
             }
@@ -1477,6 +1620,7 @@ impl CheckoutRuntime {
         &self,
         options: &IndexOptions,
         permit: Option<PreHReadPermit>,
+        explicit_options: bool,
     ) -> anyhow::Result<Arc<LeaderSession>> {
         let resources = self.resources()?;
         let store = &resources.store;
@@ -1501,9 +1645,13 @@ impl CheckoutRuntime {
                     store
                         .fail_changed_root_requests(&session)
                         .map_err(|e| anyhow::anyhow!("pre-H root requests: {e:#}"))?;
-                    let selected = store
-                        .recorded_index_options()?
-                        .unwrap_or_else(|| options.clone());
+                    let selected = if explicit_options {
+                        options.clone()
+                    } else {
+                        store
+                            .recorded_index_options()?
+                            .unwrap_or_else(|| options.clone())
+                    };
                     IndexJobCoordinator::prepare_with_session(store, None, session.clone())
                         .map_err(|e| anyhow::anyhow!("pre-H preparation: {e:#}"))?
                         .run_serving(&selected, &cancel, |_| {})
@@ -1525,7 +1673,14 @@ impl CheckoutRuntime {
         if let Some(hook) = self.pre_h_hook.lock().unwrap().take() {
             hook();
         }
-        establish_serving_session(store, Some(options), &cancel)
+        // Implicit CLI/MCP activation must not overwrite a published head's
+        // recorded SCIP, manifest or size options with daemon defaults.
+        // A different root inode at the same path must recreate its own index;
+        // the former checkout's recorded options are not authority for it.
+        let supplied = explicit_options
+            || store.is_recreate_pending()
+            || store.recorded_index_options()?.is_none();
+        establish_serving_session(store, supplied.then_some(options), &cancel)
     }
 }
 
