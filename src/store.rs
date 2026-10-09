@@ -235,6 +235,8 @@ pub struct Store {
     #[cfg(test)]
     test_claim_before_snapshot_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
+    test_exceptional_classification_before_lock: Arc<TestOneShotHook>,
+    #[cfg(test)]
     test_refresh_between_check_and_open: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_finish_failures: Arc<std::sync::atomic::AtomicUsize>,
@@ -5398,6 +5400,8 @@ impl Store {
             #[cfg(test)]
             test_claim_before_snapshot_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
+            test_exceptional_classification_before_lock: Arc::new(TestOneShotHook::default()),
+            #[cfg(test)]
             test_refresh_between_check_and_open: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_finish_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -6374,6 +6378,8 @@ impl Store {
             // Exceptional classification becomes visible atomically against
             // a FULL-proof-valid FIFO claim's durable COMMIT. Rebuild/read
             // latches do not erase an already attested healthy H.
+            #[cfg(test)]
+            self.test_exceptional_classification_before_lock.run();
             let mut attested = self.reconciled_leader.lock().unwrap();
             *attested = None;
             self.recovery_disposition
@@ -6986,11 +6992,11 @@ impl Store {
             *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
             anyhow::bail!("recovery_required: uncertain post-SH exceptional transition");
         }
-        if guard.held_exclusive_use_mode() {
-            if let Err(error) = guard.downgrade_use_to_shared() {
-                *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
-                return Err(error);
-            }
+        if guard.held_exclusive_use_mode()
+            && let Err(error) = guard.downgrade_use_to_shared()
+        {
+            *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
+            return Err(error);
         }
         if guard.uncertain_use_transition() || guard.verify_shared_use(&use_path).is_err() {
             *self.orphan_root_loss_owner.lock().unwrap() = Some(owner.clone());
@@ -7314,6 +7320,7 @@ impl Store {
         self.verify_leader_session(session)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn verify_reconciled_leader_claim(
         &self,
         session: &topology::LeaderSession,
@@ -13434,7 +13441,7 @@ mod rebaseline_fault_tests {
                 .roots
                 .index_use_exclusive_existing(&recovering.identity)
                 .unwrap();
-            let mut leader = recovering
+            let leader = recovering
                 .roots
                 .leader_under_exclusive(&recovering.identity, exclusive)
                 .unwrap();
@@ -13442,7 +13449,7 @@ mod rebaseline_fault_tests {
             let pin = recovering
                 .recreate_index_exclusive(
                     &IndexOptions::new(work.path().to_owned()),
-                    &mut leader,
+                    &leader,
                     &cancel,
                 )
                 .unwrap();
@@ -13783,11 +13790,19 @@ mod rebaseline_fault_tests {
             entered_rx.recv().unwrap();
             let other = store.clone();
             let (classifying_tx, classifying_rx) = std::sync::mpsc::channel();
+            store
+                .test_exceptional_classification_before_lock
+                .set(move || {
+                    classifying_tx.send(()).unwrap();
+                });
             let classify = scope.spawn(move || {
-                classifying_tx.send(()).unwrap();
                 other.mark_recovery(RecoveryDisposition::RecreatePending);
             });
-            classifying_rx.recv().unwrap();
+            classifying_rx.recv().unwrap(); // inside exceptional branch, immediately before lock
+            assert!(
+                store.reconciled_leader.try_lock().is_err(),
+                "claim holds cached-H COMMIT latch while classification attempts it"
+            );
             assert_eq!(
                 store.disposition(),
                 RecoveryDisposition::Ready,
@@ -14464,7 +14479,7 @@ mod rebaseline_fault_tests {
             .roots
             .index_use_exclusive_existing(&recovering.identity)
             .unwrap();
-        let mut leader = recovering
+        let leader = recovering
             .roots
             .leader_under_exclusive(&recovering.identity, exclusive)
             .unwrap();
@@ -14473,7 +14488,7 @@ mod rebaseline_fault_tests {
         let error = recovering
             .recreate_index_exclusive_with_hook(
                 &IndexOptions::new(work.path().to_owned()),
-                &mut leader,
+                &leader,
                 &cancel,
                 |phase| {
                     if phase == ActivationStage::BeforeRename {
@@ -14581,7 +14596,7 @@ mod rebaseline_fault_tests {
                 .roots
                 .index_use_exclusive_existing(&recovering.identity)
                 .unwrap();
-            let mut leader = recovering
+            let leader = recovering
                 .roots
                 .leader_under_exclusive(&recovering.identity, exclusive)
                 .unwrap();
@@ -14592,7 +14607,7 @@ mod rebaseline_fault_tests {
             }
             let result = recovering.recreate_index_exclusive_with_hook(
                 &options,
-                &mut leader,
+                &leader,
                 &cancel,
                 |phase| {
                     if Some(phase) == fault {
@@ -14622,7 +14637,7 @@ mod rebaseline_fault_tests {
                     fs::write(&wal, b"unsafe sidecar").unwrap();
                     assert!(
                         recovering
-                            .recreate_index_exclusive(&options, &mut leader, &cancel)
+                            .recreate_index_exclusive(&options, &leader, &cancel)
                             .is_err()
                     );
                     assert_eq!(fs::read(&wal).unwrap(), b"unsafe sidecar");

@@ -298,9 +298,7 @@ impl TopologyRoots {
             use_guard,
             gate,
             false,
-            || Ok(()),
-            || Ok(()),
-            || Ok(()),
+            (|| Ok(()), || Ok(()), || Ok(())),
         )
     }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
@@ -334,9 +332,7 @@ impl TopologyRoots {
             use_guard,
             gate,
             true,
-            after_open,
-            before_write,
-            before_sync,
+            (after_open, before_write, before_sync),
         )
     }
     fn acquire_leader(
@@ -345,10 +341,13 @@ impl TopologyRoots {
         use_guard: UseGuard,
         sidecar_gate: UseGuard,
         create: bool,
-        after_open: impl FnOnce() -> Result<()>,
-        before_write: impl FnOnce() -> Result<()>,
-        before_sync: impl FnOnce() -> Result<()>,
+        hooks: (
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+        ),
     ) -> Result<LeaderGuard> {
+        let (after_open, before_write, before_sync) = hooks;
         identity.verify()?;
         let path = self.leader_lock(identity);
         let mut hook = Some(after_open);
@@ -1518,14 +1517,17 @@ impl FollowerGuard {
 #[derive(Debug)]
 pub enum LeaderSession {
     Leader {
-        guard: LeaderGuard,
+        guard: Box<LeaderGuard>,
         identity: Arc<WorkspaceIdentity>,
     },
     Follower(FollowerGuard),
 }
 impl LeaderSession {
     pub fn leader(guard: LeaderGuard, identity: Arc<WorkspaceIdentity>) -> Self {
-        Self::Leader { guard, identity }
+        Self::Leader {
+            guard: Box::new(guard),
+            identity,
+        }
     }
     pub fn follower(guard: FollowerGuard) -> Self {
         Self::Follower(guard)
