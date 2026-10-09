@@ -481,6 +481,15 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
         registry.browser_identity(&key).is_err(),
         "browser must not retire an old incarnation with accepted FIFO work"
     );
+    assert_eq!(
+        registry
+            .browser_checkouts()
+            .iter()
+            .find(|row| row["rootKey"] == key)
+            .unwrap()["state"],
+        "unavailable",
+        "accepted FIFO row prevents replacement listing"
+    );
     tokio::time::timeout(Duration::from_secs(10), async {
         while registry.refresh_pending_work(&key).unwrap() {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -556,6 +565,15 @@ async fn root_loss_during_paused_reattach_h_waits_for_worker_then_releases() {
     assert!(
         registry.browser_identity(&key).is_err(),
         "paused H keeps old incarnation even after client disconnect"
+    );
+    assert_eq!(
+        registry
+            .browser_checkouts()
+            .iter()
+            .find(|row| row["rootKey"] == key)
+            .unwrap()["state"],
+        "unavailable",
+        "paused H prevents replacement listing"
     );
     assert!(
         paused.catching_up(),
@@ -815,6 +833,15 @@ async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
         registry.browser_identity(&key).is_err(),
         "old browser lease forbids takeover"
     );
+    assert_eq!(
+        registry
+            .browser_checkouts()
+            .iter()
+            .find(|row| row["rootKey"] == key)
+            .unwrap()["state"],
+        "unavailable",
+        "live browser lease must not list replacement as selectable"
+    );
     let due = now + BROWSER_IDLE_DELAY + CHECKOUT_RELEASE_DELAY;
     assert!(
         registry.advance(due).unwrap().released.is_empty(),
@@ -823,6 +850,15 @@ async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
     assert!(
         registry.browser_identity(&key).is_err(),
         "held read forbids replacement"
+    );
+    assert_eq!(
+        registry
+            .browser_checkouts()
+            .iter()
+            .find(|row| row["rootKey"] == key)
+            .unwrap()["state"],
+        "unavailable",
+        "held read must keep listing unavailable"
     );
     drop(held);
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -835,6 +871,24 @@ async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
     })
     .await
     .expect("old browser runtime did not retire");
+    let listed = registry.browser_checkouts();
+    let row = listed.iter().find(|row| row["rootKey"] == key).unwrap();
+    assert_eq!(
+        row["state"], "available",
+        "quiescent replacement must be selectable before browser_identity"
+    );
+    assert_eq!(
+        row["active"], false,
+        "old index is not an active new checkout"
+    );
+    assert_eq!(
+        row["workspaceRoot"],
+        new_id.root.to_string_lossy().to_string()
+    );
+    assert!(
+        registry.registration(&key).is_some(),
+        "listing is read-only and cannot retire old registration"
+    );
     let discovered = registry
         .browser_identity(&key)
         .expect("browser recovers replaced checkout without CLI attach");
@@ -985,5 +1039,38 @@ async fn explicit_null_scip_clears_recorded_input_on_cold_activation() {
     assert!(
         selected.scip_path.is_none(),
         "explicit null clears prior SCIP selection"
+    );
+}
+
+#[test]
+fn browser_listing_does_not_offer_ambiguous_same_inode_git_transition() {
+    let base = tempfile::tempdir().unwrap();
+    let checkout = base.path().join("work");
+    fs::create_dir(&checkout).unwrap();
+    let old = identity(&checkout);
+    let mut registry = CheckoutRegistry::with_roots(roots(base.path()));
+    registry
+        .register(&old, CheckoutOptions(serde_json::json!({})))
+        .unwrap();
+    fs::write(
+        checkout.join(".git"),
+        "not a git pointer
+",
+    )
+    .unwrap();
+    let listed = registry.browser_checkouts();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|row| row["rootKey"] == old.root_key)
+            .unwrap()["state"],
+        "unavailable",
+        "ambiguous same-inode Git metadata is not a proved replacement"
+    );
+    assert!(registry.browser_identity(&old.root_key).is_err());
+    assert_eq!(
+        fs::read(checkout.join(".git")).unwrap(),
+        b"not a git pointer
+"
     );
 }

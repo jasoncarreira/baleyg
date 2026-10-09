@@ -453,7 +453,27 @@ impl CheckoutRegistry {
                 .as_ref()
                 .ok()
                 .map(|roots| roots.cache.join("indexes").join(key).join("index.db"));
-            let state = if entry.identity.rediscover().is_err() {
+            let old_verified = entry.identity.rediscover().is_ok();
+            // The old index belongs to the old inode and is never evidence for
+            // its replacement. Listing is observational: a new same-key root is
+            // selectable only after the old runtime has actually released.
+            // browser_identity rechecks and performs the mutable retirement.
+            let replaced_available = !old_verified
+                && entry.released
+                && !self.runtimes.contains_key(key)
+                && WorkspaceIdentity::discover_unattached(
+                    Some(&entry.identity.root),
+                    &entry.identity.root,
+                )
+                .and_then(WorkspaceIdentity::attach_existing_marker_readonly)
+                .is_ok_and(|new| {
+                    new.root_key == *key
+                        && !entry.identity.matches(&new)
+                        && self.can_retire_replaced(&new)
+                });
+            let state = if replaced_available {
+                "available"
+            } else if !old_verified {
                 "unavailable"
             } else if index.as_ref().is_some_and(|index| index.is_file()) {
                 roots
