@@ -23,6 +23,7 @@ Legacy mode starts with MCP `initialize` carrying `protocolVersion`, `capabiliti
 | Unknown method | `-32601` |
 | Invalid protocol parameters, missing modern metadata, supplied list cursor, unknown tool | `-32602` |
 | Unexpected internal protocol failure | `-32603` |
+| Valid non-tool stdio request refused before daemon admission solely because the finite relay queue is full | `-32000` Server error; original ID and bounded `error.data.code:"too_many_requests"` |
 | Unsupported modern revision | `-32022` |
 
 For `-32022`, include required JSON-RPC `error.data:{supported:["2026-07-28","2025-11-25"],requested:<requested-version>}` so the client can negotiate; the requested value is the unsupported revision received. `-32021` is reserved for genuinely required missing client capability (none here); `-32020` HeaderMismatch does not apply to stdio. Bad **application** arguments to a known tool instead return the typed error envelope. Oversized wire input is discarded through its line delimiter and receives bounded `-32600`; malformed parsing has `-32700` precedence when no valid request was obtained.

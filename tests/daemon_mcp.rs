@@ -15,7 +15,6 @@ struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<Value>,
-    stderr: PathBuf,
     reaped: bool,
 }
 impl Peer {
@@ -51,7 +50,6 @@ impl Peer {
             stdin: child.stdin.take(),
             child,
             lines,
-            stderr,
             reaped: false,
         }
     }
@@ -85,20 +83,6 @@ impl Peer {
                 break;
             }
             assert!(Instant::now() < deadline, "MCP client did not finish");
-            std::thread::yield_now();
-        }
-    }
-    fn interrupted(mut self) -> (bool, String) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                self.reaped = true;
-                return (status.success(), fs::read_to_string(&self.stderr).unwrap());
-            }
-            assert!(
-                Instant::now() < deadline,
-                "MCP client did not observe daemon death"
-            );
             std::thread::yield_now();
         }
     }
@@ -303,23 +287,936 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
-    let (success, stderr) = client.interrupted();
-    assert!(!success, "daemon death cannot be a clean MCP EOF");
-    assert!(stderr.contains("daemon_unavailable"), "{stderr}");
-    let mut recovered = Peer::start(home.path(), &root);
-    assert_eq!(
-        recovered.ask(
-            2,
-            "server/discover",
-            json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}})
-        )["id"],
-        2
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "original MCP client exited"
     );
-    recovered.finish_unreaped();
+    let recovered = client.ask(
+        2,
+        "server/discover",
+        json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}),
+    );
+    assert_eq!(recovered["id"], 2);
+    assert!(recovered["result"].is_object(), "{recovered}");
+    client.finish_unreaped();
     assert_elected(home.path());
-    unsafe { libc::kill(-(recovered.child.id() as libc::pid_t), libc::SIGKILL) };
-    assert!(recovered.child.wait().unwrap().success());
-    recovered.reaped = true;
+    unsafe { libc::kill(-(client.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(client.child.wait().unwrap().success());
+    client.reaped = true;
+}
+
+#[test]
+fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&root, &["init", "--quiet"]);
+    git(
+        &root,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = home.path().join("linked");
+    git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let linked = linked.canonicalize().unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _socket = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let init = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0", "method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    assert_eq!(peer.ask(2, "tools/list", json!({}))["id"], 2);
+    let selected = peer.ask(
+        20,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1,"workspace":linked}
+        }),
+    );
+    assert_eq!(
+        selected["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(peer.child.try_wait().unwrap().is_none());
+    let result = peer.ask(
+        3,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1,"workspace":linked}
+        }),
+    );
+    assert_eq!(result["id"], 3, "{result}");
+    assert_eq!(
+        result["result"]["structuredContent"]["workspace"],
+        json!(linked)
+    );
+    assert_eq!(result["result"]["structuredContent"]["requestId"], 3);
+    peer.finish_unreaped();
+    assert_elected(home.path());
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+}
+
+#[test]
+fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
+    use std::os::unix::net::UnixListener;
+    for count in [1usize, 16usize, 18usize, 24usize, 25usize, 26usize] {
+        let home = tempfile::tempdir().unwrap();
+        let root = checkout(home.path());
+        let phase_path = PathBuf::from(format!(
+            "/tmp/baleyg-107-mcp-{}.sock",
+            rand::random::<u64>()
+        ));
+        let listener = UnixListener::bind(&phase_path).unwrap();
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+            .arg("daemon")
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("BALEYG_TEST_MCP_PHASE", "launch_final")
+            .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _ = socket_ready(home.path());
+        let mut peer = Peer::start(home.path(), &root);
+        let metadata = json!({"_meta":{
+            "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}
+        }});
+        writeln!(
+            peer.stdin.as_mut().unwrap(),
+            "{}",
+            json!({
+                "jsonrpc":"2.0","id":"cancel-A","method":"tools/call",
+                "params":{"name":"baleyg_workspace_describe",
+                    "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}
+            })
+        )
+        .unwrap();
+        let (mut phase, _) = listener.accept().unwrap();
+        phase
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut stage = String::new();
+        BufReader::new(phase.try_clone().unwrap())
+            .read_line(&mut stage)
+            .unwrap();
+        assert_eq!(stage, "launch_final\n");
+        let cancel = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"cancel-A\"}}\n";
+        let mut burst = if count == 1 {
+            format!("{cancel}{{bad json}}\n{}\n", "x".repeat(16_385))
+        } else {
+            String::new()
+        };
+        for n in 0..count {
+            let id = if count >= 25 && (n == 8 || n == 24) {
+                8
+            } else {
+                100 + n
+            };
+            let call = match n {
+                16 | 17 | 24 if n != 24 || count == 26 => {
+                    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe",
+                        "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
+                }
+                19 => json!({"jsonrpc":"2.0","id":119,"method":"no/such/method","params":metadata}),
+                20 => json!({"jsonrpc":"2.0","id":120,"method":"tools/call",
+                    "params":{"name":"unknown_tool","arguments":{},"_meta":metadata["_meta"]}}),
+                21 => json!({"jsonrpc":"2.0","id":121,"method":"tools/list",
+                    "params":{"cursor":"unexpected","_meta":metadata["_meta"]}}),
+                22 => json!({"jsonrpc":"2.0","id":122,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}}),
+                23 => json!({"jsonrpc":"2.0","id":123,"method":"tools/call",
+                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+                        "_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01",
+                            "io.modelcontextprotocol/clientCapabilities":{}}}}),
+                _ => json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":metadata}),
+            };
+            if count == 26 && n == 24 {
+                burst.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":8}}\n");
+            }
+            burst.push_str(&call.to_string());
+            burst.push('\n');
+        }
+        if count >= 16 {
+            burst.push_str(cancel);
+        }
+        peer.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(burst.as_bytes())
+            .unwrap();
+        if count >= 18 {
+            // The daemon is held at A: overflow replies must come from the thin relay.
+            for id in [116, 117] {
+                let overflow = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert_eq!(overflow["id"], id, "{overflow}");
+                assert_eq!(overflow["result"]["isError"], true, "{overflow}");
+                let envelope = &overflow["result"]["structuredContent"];
+                assert_eq!(envelope["requestId"], id, "{overflow}");
+                assert_eq!(
+                    envelope["error"]["code"], "workspace_selection_failed",
+                    "{overflow}"
+                );
+                assert_eq!(envelope["error"]["reason"], "unavailable", "{overflow}");
+                assert_eq!(envelope["error"]["retryable"], true, "{overflow}");
+                assert_eq!(
+                    envelope["error"]["attemptedWorkspace"]["value"],
+                    json!(root.canonicalize().unwrap())
+                );
+                assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+                assert_eq!(envelope["error"]["currentContentHash"], Value::Null);
+                assert!(envelope.get("workspace").is_none(), "{overflow}");
+                assert!(envelope.get("catchingUp").is_none(), "{overflow}");
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        overflow["result"]["content"][0]["text"].as_str().unwrap()
+                    )
+                    .unwrap(),
+                    *envelope
+                );
+            }
+            if count >= 24 {
+                for (id, code) in [
+                    (118, -32000),
+                    (119, -32601),
+                    (120, -32602),
+                    (121, -32602),
+                    (122, -32602),
+                    (123, -32022),
+                ] {
+                    let refused = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(refused["id"], id, "{refused}");
+                    assert_eq!(refused["error"]["code"], code, "{refused}");
+                    assert!(refused.get("result").is_none(), "{refused}");
+                    if id == 118 {
+                        assert_eq!(refused["error"]["data"]["code"], "too_many_requests");
+                    }
+                    if id == 123 {
+                        assert_eq!(refused["error"]["data"]["requested"], "2099-01-01");
+                    }
+                }
+                if count >= 25 {
+                    let duplicate = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert_eq!(duplicate["id"], 8, "{duplicate}");
+                    if count == 25 {
+                        assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+                        assert!(duplicate.get("result").is_none(), "{duplicate}");
+                    } else {
+                        // The earlier queued ID8 was canceled before this new admission.
+                        assert_eq!(duplicate["result"]["isError"], true, "{duplicate}");
+                        assert_eq!(duplicate["result"]["structuredContent"]["requestId"], 8);
+                        assert_eq!(
+                            duplicate["result"]["structuredContent"]["error"]["reason"],
+                            "unavailable"
+                        );
+                        let extra = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+                        assert_eq!(extra["id"], 125, "{extra}");
+                        assert_eq!(extra["error"]["code"], -32000, "{extra}");
+                    }
+                }
+            }
+        }
+        phase.write_all(b"x").unwrap();
+        if count == 1 {
+            let invalid = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(invalid["id"], Value::Null, "{invalid}");
+            assert_eq!(invalid["error"]["code"], -32700, "{invalid}");
+            let oversized = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(oversized["id"], Value::Null, "{oversized}");
+            assert_eq!(oversized["error"]["code"], -32600, "{oversized}");
+        }
+        for n in 0..count.min(16) {
+            if count == 26 && n == 8 {
+                continue;
+            }
+            let reply = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(
+                reply["id"],
+                if count >= 25 && n == 8 { 8 } else { 100 + n },
+                "cancelled/queued response: {reply}"
+            );
+            assert!(reply["result"].is_object(), "{reply}");
+        }
+        if count >= 25 {
+            let reused = peer.ask(8, "tools/list", metadata.clone());
+            assert_eq!(reused["id"], 8, "{reused}");
+            assert!(reused["result"].is_object(), "{reused}");
+        }
+        assert!(
+            peer.lines.recv_timeout(Duration::from_millis(200)).is_err(),
+            "canceled A produced stdout"
+        );
+        peer.finish_unreaped();
+        unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+        assert!(peer.child.wait().unwrap().success());
+        peer.reaped = true;
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        fs::remove_file(&phase_path).unwrap();
+    }
+}
+
+#[test]
+fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/baleyg-107-dup-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
+        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let meta = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}}});
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,
+        "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
+    )
+    .unwrap();
+    let (mut phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stage = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut stage)
+        .unwrap();
+    assert_eq!(stage, "launch_final\n");
+    let mut burst = String::new();
+    for id in [8, 8, 9] {
+        burst.push_str(
+            &json!({"jsonrpc":"2.0","id":id,
+            "method":"tools/list","params":meta})
+            .to_string(),
+        );
+        burst.push('\n');
+    }
+    peer.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(burst.as_bytes())
+        .unwrap();
+    let duplicate = peer
+        .lines
+        .recv_timeout(Duration::from_secs(3))
+        .expect("second queued ID8 must be rejected before A is released");
+    assert_eq!(duplicate["id"], 8, "{duplicate}");
+    assert_eq!(duplicate["error"]["code"], -32600, "{duplicate}");
+    // A is still held at this point: the duplicate must be rejected at admission.
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":1}
+        })
+    )
+    .unwrap();
+    // B can finish after A's cancellation while the old daemon hook stays held.
+    let first = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(first["id"], 8, "{first}");
+    assert!(first["result"].is_object(), "{first}");
+    phase.write_all(b"x").unwrap();
+    let next = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(next["id"], 9, "{next}");
+    assert!(next["result"].is_object(), "{next}");
+    let reused = peer.ask(8, "tools/list", meta);
+    assert_eq!(reused["id"], 8, "{reused}");
+    assert!(reused["result"].is_object(), "{reused}");
+    assert!(peer.lines.recv_timeout(Duration::from_millis(200)).is_err());
+    peer.finish_unreaped();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+    fs::remove_file(&phase_path).unwrap();
+}
+
+#[test]
+fn stdin_eof_cancels_in_flight_call_without_stdout() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/baleyg-107-eof-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
+        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","id":91,"method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}}}
+        })
+    )
+    .unwrap();
+    let (mut phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stage = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut stage)
+        .unwrap();
+    assert_eq!(stage, "launch_final\n");
+    peer.stdin.take();
+    phase.write_all(b"x").unwrap();
+    peer.finish_unreaped();
+    assert!(
+        peer.lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        "pending result after stdin EOF"
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+    fs::remove_file(&phase_path).unwrap();
+}
+
+#[test]
+fn canceled_read_is_not_replayed_after_daemon_death() {
+    use std::os::unix::net::UnixListener;
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let phase_path = PathBuf::from(format!(
+        "/tmp/baleyg-107-kill-{}.sock",
+        rand::random::<u64>()
+    ));
+    let listener = UnixListener::bind(&phase_path).unwrap();
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
+        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let metadata = json!({"_meta":{
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    }});
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","id":"cancel-A","method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe",
+                "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}
+        })
+    )
+    .unwrap();
+    let (phase, _) = listener.accept().unwrap();
+    phase
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut stage = String::new();
+    BufReader::new(phase.try_clone().unwrap())
+        .read_line(&mut stage)
+        .unwrap();
+    assert_eq!(stage, "launch_final\n");
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":"cancel-A"}
+        })
+    )
+    .unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    drop(phase);
+    assert!(peer.child.try_wait().unwrap().is_none());
+    let reply = peer.ask(5, "tools/list", metadata);
+    assert_eq!(reply["id"], 5, "{reply}");
+    assert!(reply["result"].is_object(), "{reply}");
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(200)).is_err(),
+        "canceled read was replayed"
+    );
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+    fs::remove_file(&phase_path).unwrap();
+}
+
+#[test]
+fn legacy_completed_initialize_cancel_does_not_abort_synthetic_reattach() {
+    check_legacy_synthetic_reattach_cancel(1, false);
+}
+
+#[test]
+fn legacy_pending_call_cancel_during_synthetic_reattach_is_silent() {
+    check_legacy_synthetic_reattach_cancel(5, false);
+}
+
+#[test]
+fn legacy_cancel_during_failed_synthetic_reattach_is_silent() {
+    check_legacy_synthetic_reattach_cancel(5, true);
+}
+
+fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let initialized = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(initialized["id"], 1);
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    assert_eq!(peer.ask(4, "tools/list", json!({}))["id"], 4);
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let mut dirs = vec![home.path().to_path_buf()];
+    let mut data = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                data = path.parent().and_then(Path::parent).map(Path::to_path_buf);
+                break;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let owner =
+        baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
+            .unwrap()
+            .expect("killed daemon released singleton lock");
+    let listener = owner.listener().try_clone().unwrap();
+    let (connected_tx, connected_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let fake = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let attach: protocol::Request = protocol::read_frame(&mut socket).unwrap();
+        assert_eq!(attach.operation, "mcp");
+        connected_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        protocol::write_frame(
+            &mut socket,
+            &protocol::Reply {
+                id: attach.id,
+                payload: json!({"result":true}),
+            },
+        )
+        .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        let mut steps = Vec::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let value: Value = serde_json::from_str(&line).unwrap();
+            let method = value["method"].as_str().unwrap();
+            steps.push(method.to_owned());
+            match method {
+                "initialize" => {
+                    assert_eq!(value["id"], 1);
+                    if fail_setup {
+                        break;
+                    }
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":1,"result":{
+                            "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
+                            "serverInfo":{"name":"baleyg","version":"fixture"}}
+                        })
+                    )
+                    .unwrap();
+                }
+                "notifications/cancelled" => assert_eq!(value["params"]["requestId"], cancel_id),
+                "notifications/initialized" => (),
+                "tools/list" => {
+                    assert_eq!(value["id"], 5);
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":5,"result":{"tools":[]}})
+                    )
+                    .unwrap();
+                }
+                "tools/call" => {
+                    assert_eq!(value["id"], 6);
+                    writeln!(
+                        socket,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":6,"result":{"isError":false}})
+                    )
+                    .unwrap();
+                    break;
+                }
+                other => panic!("unexpected synthetic MCP method {other}: {steps:?}"),
+            }
+        }
+        if !fail_setup {
+            assert!(
+                steps.contains(&"notifications/cancelled".into()),
+                "{steps:?}"
+            );
+        }
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|stage| stage.as_str() == "initialize")
+                .count(),
+            1
+        );
+        if cancel_id == 5 {
+            assert!(
+                !steps.contains(&"tools/list".to_owned()),
+                "canceled ID5 reached daemon: {steps:?}"
+            );
+        }
+    });
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","id":5,"method":"tools/list","params":{}
+        })
+    )
+    .unwrap();
+    connected_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":cancel_id}
+        })
+    )
+    .unwrap();
+    assert!(
+        peer.lines.recv_timeout(Duration::from_millis(150)).is_err(),
+        "setup replied while attach paused"
+    );
+    release_tx.send(()).unwrap();
+    if cancel_id == 5 {
+        assert!(
+            peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+            "canceled pending ID5 produced stdout"
+        );
+    } else {
+        let list = peer.lines.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(list["id"], 5, "{list}");
+        assert!(list["result"]["tools"].is_array(), "{list}");
+    }
+    let mut fake = Some(fake);
+    if fail_setup {
+        fake.take().unwrap().join().unwrap();
+        drop(owner);
+    }
+    let call = peer.ask(
+        6,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+        }),
+    );
+    assert_eq!(call["id"], 6, "{call}");
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    if let Some(fake) = fake {
+        fake.join().unwrap();
+    }
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+}
+
+#[test]
+fn legacy_await_initialized_refuses_tool_after_daemon_death() {
+    let home = tempfile::tempdir().unwrap();
+    let root = checkout(home.path());
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _ = socket_ready(home.path());
+    let mut peer = Peer::start(home.path(), &root);
+    let init = peer.ask(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":"2025-11-25","capabilities":{},
+            "clientInfo":{"name":"regression","version":"1"}
+        }),
+    );
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let rejected = peer.ask(
+        2,
+        "tools/call",
+        json!({
+            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+        }),
+    );
+    assert_eq!(rejected["id"], 2, "{rejected}");
+    assert_eq!(rejected["error"]["code"], -32600, "{rejected}");
+    assert!(rejected.get("result").is_none(), "{rejected}");
+    writeln!(
+        peer.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","method":"notifications/initialized"
+        })
+    )
+    .unwrap();
+    let ready = peer.ask(3, "tools/list", json!({}));
+    assert_eq!(ready["id"], 3, "{ready}");
+    assert!(ready["result"].is_object(), "{ready}");
+    peer.finish_unreaped();
+    unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+    assert!(peer.child.wait().unwrap().success());
+    peer.reaped = true;
+}
+
+#[test]
+fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
+    for close_stdin in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let root = checkout(home.path());
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+            .arg("daemon")
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _ = socket_ready(home.path());
+        let mut peer = Peer::start(home.path(), &root);
+        let meta = json!({"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities":{}}});
+        assert_eq!(peer.ask(1, "server/discover", meta.clone())["id"], 1);
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        let mut dirs = vec![home.path().to_path_buf()];
+        let mut data = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    data = path.parent().and_then(Path::parent).map(Path::to_path_buf);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+        }
+        let owner =
+            baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
+                .unwrap()
+                .unwrap();
+        let listener = owner.listener().try_clone().unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+            assert_eq!(attach.operation, "mcp");
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            protocol::write_frame(
+                &mut stream,
+                &protocol::Reply {
+                    id: attach.id,
+                    payload: json!({"error":"root_changed"}),
+                },
+            )
+            .unwrap();
+        });
+        writeln!(
+            peer.stdin.as_mut().unwrap(),
+            "{}",
+            json!({"jsonrpc":"2.0","id":7,
+            "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+                "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
+        )
+        .unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        if close_stdin {
+            peer.stdin.take();
+        } else {
+            writeln!(
+                peer.stdin.as_mut().unwrap(),
+                "{}",
+                json!({
+            "jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":7}})
+            )
+            .unwrap();
+        }
+        assert!(
+            peer.lines.recv_timeout(Duration::from_millis(150)).is_err(),
+            "attach still blocked"
+        );
+        release_tx.send(()).unwrap();
+        fake.join().unwrap();
+        if close_stdin {
+            peer.finish_unreaped();
+            assert!(
+                peer.lines.recv_timeout(Duration::from_secs(1)).is_err(),
+                "stdin EOF emitted pending failure"
+            );
+        } else {
+            assert!(
+                peer.lines.recv_timeout(Duration::from_millis(300)).is_err(),
+                "canceled ID7 emitted pending failure"
+            );
+            drop(owner);
+            let recovered = peer.ask(8, "tools/list", meta.clone());
+            assert_eq!(recovered["id"], 8, "{recovered}");
+            assert!(recovered["result"].is_object(), "{recovered}");
+            peer.finish_unreaped();
+        }
+        unsafe { libc::kill(-(peer.child.id() as libc::pid_t), libc::SIGKILL) };
+        assert!(peer.child.wait().unwrap().success());
+        peer.reaped = true;
+    }
 }
 
 #[test]
@@ -402,7 +1299,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["method"],
-            "server/discover"
+            "tools/call"
         );
         stream
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":")
@@ -425,14 +1322,156 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         child.stdin.as_mut().unwrap(),
         "{}",
         json!({
-            "jsonrpc":"2.0", "id":1,"method":"server/discover",
-            "params":{"_meta":{
-                "io.modelcontextprotocol/protocolVersion":"2026-07-28",
-                "io.modelcontextprotocol/clientCapabilities":{}
-            }}
+            "jsonrpc":"2.0", "id":1,"method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+                "_meta":{
+                    "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}
+                }}
         })
     )
     .unwrap();
+    // Keep stdin open until the interrupted call returns a typed failure.
+    // Closing it earlier must suppress that pending response entirely.
+    let (tx, lines) = mpsc::sync_channel(2);
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line).unwrap_or(0) != 0 {
+            assert!(line.len() <= 65_536);
+            if tx.send(std::mem::take(&mut line)).is_err() {
+                return;
+            }
+        }
+    });
+    let first = lines
+        .recv_timeout(Duration::from_secs(10))
+        .expect("typed interrupted result while stdin open");
+    let response: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(response["id"], 1);
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert_eq!(response["result"]["structuredContent"]["requestId"], 1);
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        "workspace_selection_failed"
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["reason"],
+        "unavailable"
+    );
+    assert!(
+        response["result"]["structuredContent"]
+            .get("workspace")
+            .is_none()
+    );
+    assert!(
+        response["result"]["structuredContent"]
+            .get("catchingUp")
+            .is_none()
+    );
+    let listener = owner.listener().try_clone().unwrap();
+    let failed_attach = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let attach: protocol::Request = protocol::read_frame(&mut stream).unwrap();
+        assert_eq!(attach.operation, "mcp");
+        protocol::write_frame(
+            &mut stream,
+            &protocol::Reply {
+                id: attach.id,
+                payload: json!({"error":"root_changed"}),
+            },
+        )
+        .unwrap();
+    });
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"baleyg_workspace_describe",
+                "arguments":{"schemaVersion":1,"workspace":root.canonicalize().unwrap()},
+                "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities":{}}}
+        })
+    )
+    .unwrap();
+    let selected: Value =
+        serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+    assert_eq!(selected["id"], 2);
+    assert_eq!(selected["result"]["isError"], true, "{selected}");
+    let envelope = &selected["result"]["structuredContent"];
+    assert_eq!(envelope["requestId"], 2);
+    assert_eq!(envelope["error"]["code"], "workspace_selection_failed");
+    assert_eq!(envelope["error"]["reason"], "unavailable");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(
+        envelope["error"]["attemptedWorkspace"]["value"],
+        json!(root.canonicalize().unwrap())
+    );
+    assert!(
+        envelope.get("workspace").is_none(),
+        "unverified checkout attributed: {selected}"
+    );
+    assert!(envelope.get("catchingUp").is_none(), "{selected}");
+    assert_eq!(
+        serde_json::from_str::<Value>(selected["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap(),
+        *envelope
+    );
+    failed_attach.join().unwrap();
+    // Even though attach now fails, prior modern mode still defines protocol errors.
+    let metadata = json!({
+        "io.modelcontextprotocol/protocolVersion":"2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities":{}
+    });
+    for (id, method, params, code) in [
+        (
+            3,
+            "tools/call",
+            json!({"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1}}),
+            -32602,
+        ),
+        (
+            4,
+            "tools/call",
+            json!({"name":"baleyg_workspace_describe",
+            "arguments":{"schemaVersion":1},"_meta":{
+                "io.modelcontextprotocol/protocolVersion":"2099-01-01",
+                "io.modelcontextprotocol/clientCapabilities":{}}}),
+            -32022,
+        ),
+        (5, "no/such/method", json!({"_meta":metadata}), -32601),
+        (
+            6,
+            "tools/call",
+            json!({"name":"unknown_tool","arguments":{},
+            "_meta":metadata}),
+            -32602,
+        ),
+    ] {
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            json!({
+                "jsonrpc":"2.0","id":id,"method":method,"params":params
+            })
+        )
+        .unwrap();
+        let rejected: Value =
+            serde_json::from_slice(&lines.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert_eq!(rejected["id"], id, "{rejected}");
+        assert_eq!(rejected["error"]["code"], code, "{rejected}");
+        assert!(rejected.get("result").is_none(), "{rejected}");
+        if id == 4 {
+            assert_eq!(rejected["error"]["data"]["requested"], "2099-01-01");
+        }
+    }
+    child.stdin.take();
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -440,18 +1479,10 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         }
         assert!(
             Instant::now() < deadline,
-            "client did not exit after partial reply"
+            "client did not finish after stdin EOF"
         );
         std::thread::yield_now();
     };
-    let mut stdout = Vec::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .take(65_537)
-        .read_to_end(&mut stdout)
-        .unwrap();
     let mut stderr = String::new();
     child
         .stderr
@@ -467,13 +1498,11 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .listener()
             .accept()
             .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
-        "client reattached after an interrupted MCP response"
+        "client reattached more than once after the controlled failure"
     );
-    assert!(!status.success());
+    assert!(status.success(), "{stderr}");
     assert!(
-        stdout.is_empty(),
-        "partial daemon reply leaked to MCP stdout"
+        lines.recv_timeout(Duration::from_secs(1)).is_err(),
+        "partial or duplicate stdout"
     );
-    assert!(stderr.contains("daemon_unavailable"), "{stderr}");
-    assert!(!stderr.contains("partial MCP response"), "{stderr}");
 }
