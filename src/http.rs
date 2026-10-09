@@ -1556,12 +1556,19 @@ impl DaemonState {
 
     /// Start a replacement generation without doing filesystem or database work on the caller.
     /// A previous generation can finish, but can never publish over its replacement.
-    pub fn start_dependency_index(self: &Arc<Self>) {
+    pub fn start_dependency_index(self: &Arc<Self>) -> bool {
         let Some(options) = self.dependency_options.clone() else {
-            return;
+            return false;
         };
-        if !self.dependencies.lock().unwrap().request_build() {
-            return;
+        let mut index = self.dependencies.lock().unwrap();
+        if index.stopped {
+            return false;
+        }
+        let needs_worker = index.request_build();
+        drop(index);
+        if !needs_worker {
+            // A running driver will observe the newly admitted generation.
+            return true;
         }
         let state = self.clone();
         tokio::spawn(async move {
@@ -1607,6 +1614,7 @@ impl DaemonState {
                 // can launch catalog work, and its previous blocking worker has exited.
             }
         });
+        true
     }
     fn publish_dependency_index(
         &self,
@@ -2248,7 +2256,13 @@ async fn dependency_refresh(
             "Daemon is shutting down",
         ));
     }
-    s.start_dependency_index();
+    if !s.start_dependency_index() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "Daemon is shutting down",
+        ));
+    }
     Ok((StatusCode::ACCEPTED, Json(json!({"state":"loading"}))))
 }
 #[derive(Deserialize)]
@@ -5126,6 +5140,9 @@ mod serving_holder_tests {
             "pre-H published A cannot grant current mutation authority"
         );
         admitted.finish(()).unwrap();
+        // An admitted exact A holds the index-use SH until its handle drops;
+        // the successor's H retry correctly needs EX after this diagnostic read.
+        drop(admitted);
         assert!(follower_store.current_request().unwrap().is_none());
         // The reads above may run beyond 250ms under CI load. Hold the same
         // retry branch open for the immediate-tick assertion without a clock race.
@@ -6824,6 +6841,154 @@ mod dependency_lifecycle_tests {
         drop(successor);
     }
 
+    #[tokio::test]
+    async fn selected_refresh_shutdown_after_precheck_never_reports_committed() {
+        use crate::daemon::registry::{CheckoutOptions, CheckoutRegistry};
+        use crate::store::topology::{TopologyRoots, WorkspaceIdentity};
+        use tower::ServiceExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("core.js"), "function stable() {}\n").unwrap();
+        let lib = temp.path().join("library");
+        std::fs::create_dir(&lib).unwrap();
+        let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        let roots =
+            TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
+        let mut registry = CheckoutRegistry::with_roots(roots);
+        registry
+            .register(
+                &identity,
+                CheckoutOptions(json!({
+                    "rustLibrary": lib,
+                    "cargoHome": temp.path().join("cargo-home")
+                })),
+            )
+            .unwrap();
+        let registry = Arc::new(tokio::sync::Mutex::new(registry));
+        let browser = ProvisionedBrowser::new(
+            registry.clone(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+        )
+        .unwrap();
+        let app = browser.clone().router();
+        let request = |suffix: &str, method: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/api/checkouts/{}/{suffix}", identity.root_key))
+                .header("host", "127.0.0.1:7331")
+                .header(
+                    "authorization",
+                    "Bearer 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let response = app.clone().oneshot(request("status", "GET")).await.unwrap();
+                if response.status() == StatusCode::OK {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let runtime = registry.lock().await.runtime(&identity.root_key).unwrap();
+        let state = runtime.browser_scheduler().unwrap();
+        assert!(state.dependency_options.is_some());
+        let before = state.dependencies.lock().unwrap().generation;
+        let fired = Arc::new(AtomicBool::new(false));
+        let state_for_hook = state.clone();
+        let fired_for_hook = fired.clone();
+        browser.set_selected_response_hook_for_tests(Arc::new(move |stage| {
+            if stage == "before_mutation" && !fired_for_hook.swap(true, Ordering::AcqRel) {
+                state_for_hook.cancel_active();
+            }
+        }));
+        let response = app
+            .clone()
+            .oneshot(request("dependencies/refresh", "POST"))
+            .await
+            .unwrap();
+        assert!(
+            fired.load(Ordering::Acquire),
+            "shutdown must happen after selected preflight begins"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key("X-Baleyg-Mutation-Outcome"));
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "shutting_down");
+        let stopped = state.dependencies.lock().unwrap();
+        assert!(stopped.stopped);
+        assert_eq!(
+            stopped.generation,
+            before + 1,
+            "only cancel_active increments generation; no refresh admitted after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_generation_coalesces_as_accepted_but_shutdown_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let store = Store::open_for_tests(&temp.path().join("state"), &root).unwrap();
+        let state = new_with_dependency_options(
+            store,
+            IndexOptions::new(root.clone()),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            "127.0.0.1:7331".parse().unwrap(),
+            None,
+            None,
+            root,
+            vec![],
+            Some(CatalogOptions::default()),
+        )
+        .unwrap();
+        state.dependencies.lock().unwrap().worker_running = true;
+        let before = state.dependencies.lock().unwrap().generation;
+        assert!(
+            state.start_dependency_index(),
+            "running driver coalesces accepted generation"
+        );
+        assert_eq!(state.dependencies.lock().unwrap().generation, before + 1);
+        let (status, _) = dependency_refresh(State(state.clone()), Bytes::from("{}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "coalesced generation must report accepted even without a new worker"
+        );
+        assert_eq!(state.dependencies.lock().unwrap().generation, before + 2);
+        state.cancel_active();
+        let stopped_generation = state.dependencies.lock().unwrap().generation;
+        assert!(
+            !state.start_dependency_index(),
+            "stopped generation cannot admit work"
+        );
+        assert_eq!(
+            state.dependencies.lock().unwrap().generation,
+            stopped_generation
+        );
+        let refused = dependency_refresh(State(state.clone()), Bytes::from("{}"))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.1, "shutting_down");
+        assert_eq!(
+            state.dependencies.lock().unwrap().generation,
+            stopped_generation,
+            "direct refresh must not admit a generation after shutdown"
+        );
+    }
+
     #[test]
     fn refresh_bursts_admit_one_worker_and_keep_only_latest_generation() {
         let mut index = DependencyIndex {
@@ -7475,15 +7640,25 @@ async fn selected_native_refresh_schedule(
     let runtime = runtime.clone();
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
-        let (response, _) = runtime.evidence_response()?;
-        let _mutation_guard = response.require_mutation_ready()?;
-        anyhow::ensure!(
-            response.status()?.revision == revision,
-            "revision conflict: native refresh basis changed"
-        );
-        response.finish(())?;
-        state.start_dependency_index();
-        Ok::<_, anyhow::Error>(())
+        let (response, _) = runtime.evidence_response().map_err(ApiError::from)?;
+        let _mutation_guard = response.require_mutation_ready().map_err(ApiError::from)?;
+        if response.status().map_err(ApiError::from)?.revision != revision {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "revision_conflict",
+                "The index revision changed",
+            ));
+        }
+        response.finish(()).map_err(ApiError::from)?;
+        if !state.start_dependency_index() {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "shutting_down",
+                "Daemon is shutting down",
+            ));
+        }
+        // Keep native SH until the accepted (or coalesced) generation exists.
+        Ok(())
     })
     .await
     .map_err(|_| {
@@ -7493,7 +7668,6 @@ async fn selected_native_refresh_schedule(
             "Operation failed",
         )
     })?
-    .map_err(ApiError::from)
 }
 
 fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
@@ -7593,15 +7767,8 @@ async fn provisioned_core_answer(
                     "Dependency catalog is disabled",
                 ));
             }
-            if state.dependencies.lock().unwrap().stopped {
-                return Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "shutting_down",
-                    "Daemon is shutting down",
-                ));
-            }
-            // Check once more immediately before scheduling work. Once scheduled,
-            // a later root or head change cannot undo the requested refresh.
+            // Admission checks shutdown atomically with generation allocation;
+            // the preflight cannot promise that a later schedule will succeed.
             selected_native_refresh_schedule(runtime, &state, revision).await?;
             let mut response = match selected_native_refresh_postflight(runtime, revision).await {
                 Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
