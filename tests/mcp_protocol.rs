@@ -2304,8 +2304,72 @@ async fn next_causal_event(
     serde_json::from_slice(&bytes).expect("causal witness must be JSON")
 }
 
+/// Generation comparisons are valid only within one owner and watcher epoch.
+#[derive(Default)]
+struct CausalReadiness {
+    lineage: Option<(String, String)>,
+    h_ready: bool,
+    acked: Option<u64>,
+    pending: Option<u64>,
+}
+
+fn causal_lineage(event: &Value) -> (String, String) {
+    let field = |name| {
+        let value = event[name].as_str().expect("missing causal lineage UUID");
+        uuid::Uuid::parse_str(value).expect("invalid causal lineage UUID");
+        value.to_owned()
+    };
+    (field("ownerIncarnation"), field("watchEpoch"))
+}
+
+impl CausalReadiness {
+    fn observe(&mut self, event: &Value, published: &Value) {
+        let lineage = causal_lineage(event);
+        if self.lineage.as_ref() != Some(&lineage) {
+            // A new owner or replacement watcher has its own generation domain.
+            *self = Self {
+                lineage: Some(lineage),
+                ..Self::default()
+            };
+        }
+        match event["kind"].as_str().expect("witness kind") {
+            "H_READY" => {
+                assert!(
+                    event["pin"].is_object(),
+                    "H requires its own publication pin"
+                );
+                self.h_ready = true;
+            }
+            "WATCH_PENDING" => {
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                self.pending = Some(
+                    self.pending
+                        .map_or(generation, |prior| prior.max(generation)),
+                );
+            }
+            "WATCH_ACK" => {
+                assert_eq!(event["queueEmpty"], true, "ACK requires an empty FIFO");
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                // CLI row completion is not H/watch settlement. Earlier H ACKs
+                // may be observed, but only the accepted CLI pin binds this ACK.
+                if event["pin"] == *published {
+                    self.acked = Some(self.acked.map_or(generation, |prior| prior.max(generation)));
+                }
+            }
+            kind => panic!("unknown causal witness: {kind}"),
+        }
+    }
+
+    fn settled(&self) -> bool {
+        self.h_ready
+            && self
+                .acked
+                .is_some_and(|ack| self.pending.is_none_or(|hint| ack >= hint))
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
+async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_checkout() {
     let temp = tempfile::tempdir().unwrap();
     let root = checkout(temp.path());
     let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
@@ -2316,6 +2380,8 @@ async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
         json!({"schemaVersion":1}),
     ));
     tool(&first, None, true);
+    // This first true means pending work; without a phase witness it does not
+    // distinguish mandatory H from a queued watcher hint.
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
     let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
@@ -2358,16 +2424,15 @@ async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
     assert!(second["result"]["structuredContent"]["catchingUp"].is_boolean());
 
     // Future opt-in daemon hooks send one bounded JSON record per connection:
-    // {kind,rootKey,pin,watchGeneration,queueEmpty}. H_READY follows verified
-    // owner installation AND phase Ready/H=false. WATCH_ACK follows the initial
-    // full inventory acknowledgment and no unfinished FIFO. WATCH_PENDING is
+    // {kind,rootKey,ownerIncarnation,watchEpoch,pin,watchGeneration,queueEmpty}.
+    // H_READY follows verified owner installation AND phase Ready/H=false.
+    // WATCH_ACK follows full inventory acknowledgment with no unfinished FIFO.
+    // WATCH_PENDING is
     // emitted for a later accepted hint, so an ACK is never a future quiet lease.
     // The socket is read-only, private to HOME, and does not address a PID.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut events = 0;
-    let mut h_ready = false;
-    let mut acked: Option<u64> = None;
-    let mut pending: Option<u64> = None;
+    let mut readiness = CausalReadiness::default();
     let mut next_event = async || {
         events += 1;
         assert!(events <= 24, "causal witness transition budget exhausted");
@@ -2375,34 +2440,10 @@ async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
         assert_eq!(event["rootKey"], root_key, "foreign causal witness");
         event
     };
-    loop {
-        let event = next_event().await;
-        match event["kind"].as_str().expect("witness kind") {
-            "H_READY" => {
-                assert!(
-                    event["pin"].is_object(),
-                    "H requires its own publication pin"
-                );
-                h_ready = true;
-            }
-            "WATCH_PENDING" => {
-                let generation = event["watchGeneration"].as_u64().expect("watch generation");
-                pending = Some(pending.map_or(generation, |previous| previous.max(generation)));
-            }
-            "WATCH_ACK" => {
-                assert_eq!(event["queueEmpty"], true, "ACK requires an empty FIFO");
-                let generation = event["watchGeneration"].as_u64().expect("watch generation");
-                // An ACK for an earlier H revision may precede the CLI request.
-                // It cannot witness the selected CLI publication's inventory.
-                if event["pin"] == *published {
-                    acked = Some(acked.map_or(generation, |previous| previous.max(generation)));
-                }
-            }
-            kind => panic!("unknown causal witness: {kind}"),
-        }
-        if h_ready && acked.is_some_and(|generation| pending.is_none_or(|p| generation >= p)) {
-            break;
-        }
+    // H and ACK must be from the SAME verified owner and watch epoch. If a
+    // successor takes over, discard the former generation and require new H.
+    while !readiness.settled() {
+        readiness.observe(&next_event().await, published);
     }
 
     // A newly accepted hint between WATCH_ACK and this tool call makes true
@@ -2419,25 +2460,8 @@ async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
         let data = &reply["result"]["structuredContent"];
         assert_eq!(&data["workspace"], selected);
         if data["catchingUp"] == false {
-            // Describe has no evidenceBasis pin of its own. Check the selected
-            // store's immutable revision through the read-only CLI status path.
-            let mut status_command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
-            status_command
-                .arg("status")
-                .arg("--workspace")
-                .arg(&root)
-                .env("HOME", &home)
-                .env("XDG_CACHE_HOME", home.join("cache"))
-                .env("XDG_DATA_HOME", home.join("data"));
-            let status = bounded_output(status_command);
-            assert!(
-                status.status.success(),
-                "status: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-            let selected_status: Value =
-                serde_json::from_slice(&status.stdout).expect("selected read-only status");
-            assert_eq!(selected_status["revision"], *published);
+            // Describe has evidenceBasis:null; this proves the selected checkout
+            // is now settled, not that ID3 atomically returned the CLI pin.
             assert!(peer.finish().0.success());
             return;
         }
@@ -2446,30 +2470,24 @@ async fn catching_up_reports_pending_h_then_committed_h_on_the_same_checkout() {
             id < 5,
             "new watcher hints exceeded the bounded transition budget"
         );
-        let prior_ack = acked.expect("already witnessed CLI publication ACK");
-        let mut later_hint = None;
+        let prior_lineage = readiness.lineage.clone().expect("correlated H/ACK lineage");
+        let prior_ack = readiness.acked.expect("CLI-pinned watcher ACK");
+        let mut witnessed_later = false;
         loop {
             let event = next_event().await;
-            match event["kind"].as_str().expect("witness kind") {
-                "WATCH_PENDING" => {
-                    let generation = event["watchGeneration"].as_u64().expect("watch generation");
-                    if generation > prior_ack {
-                        later_hint =
-                            Some(later_hint.map_or(generation, |p: u64| p.max(generation)));
-                    }
-                }
-                "WATCH_ACK" => {
-                    assert_eq!(event["queueEmpty"], true);
-                    let generation = event["watchGeneration"].as_u64().expect("watch generation");
-                    if event["pin"] == *published
-                        && later_hint.is_some_and(|hint| generation >= hint)
-                    {
-                        acked = Some(generation);
-                        break;
-                    }
-                }
-                "H_READY" => panic!("H restarted after its ready witness"),
-                kind => panic!("unknown causal witness: {kind}"),
+            let lineage = causal_lineage(&event);
+            // A replacement owner or watcher epoch starts a new generation
+            // domain; its own H_READY and CLI-pinned ACK are both required.
+            if lineage != prior_lineage {
+                witnessed_later = true;
+            } else if event["kind"] == "WATCH_PENDING"
+                && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack
+            {
+                witnessed_later = true;
+            }
+            readiness.observe(&event, published);
+            if witnessed_later && readiness.settled() {
+                break;
             }
         }
     }
