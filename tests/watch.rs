@@ -993,6 +993,8 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     };
     let http_client = reqwest::Client::new();
     let ready_deadline = Instant::now() + Duration::from_secs(12);
+    let mut status_busy_count = 0;
+    let mut source_busy_count = 0;
     let prior_revision = old["revision"]["indexRevision"].as_u64().unwrap();
     let ready_status: serde_json::Value = loop {
         let response = http_client
@@ -1014,7 +1016,18 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 failure_details(&mut successor, &old)
             )
         });
-        // A positive predecessor exists: 503/409 is not a successful H wait.
+        if code == reqwest::StatusCode::CONFLICT
+            && body.pointer("/error/code").and_then(|code| code.as_str()) == Some("storage_busy")
+        {
+            status_busy_count += 1;
+            assert!(
+                Instant::now() < ready_deadline,
+                "status public storage_busy outlived successor H deadline: status_busy_count={status_busy_count} source_busy_count={source_busy_count}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        // A positive predecessor exists: only public typed BUSY may delay H.
         assert_eq!(
             code,
             reqwest::StatusCode::OK,
@@ -1034,7 +1047,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 // still be the authenticated predecessor, not the lost edit.
                 assert!(
                     Instant::now() < ready_deadline,
-                    "predecessor source probe began after readiness deadline; {}",
+                    "predecessor source probe began after readiness deadline; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                     failure_details(&mut successor, &body)
                 );
                 let old_revision = prior_revision.to_string();
@@ -1053,12 +1066,25 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(
-                    source.status(),
-                    reqwest::StatusCode::OK,
-                    "predecessor selected source unavailable during H"
-                );
+                let source_code = source.status();
                 let source: serde_json::Value = source.json().await.unwrap();
+                if source_code == reqwest::StatusCode::CONFLICT
+                    && source.pointer("/error/code").and_then(|code| code.as_str())
+                        == Some("storage_busy")
+                {
+                    source_busy_count += 1;
+                    assert!(
+                        Instant::now() < ready_deadline,
+                        "predecessor source public storage_busy outlived H deadline: status_busy_count={status_busy_count} source_busy_count={source_busy_count}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue; // Discard this status candidate; no source or H proof.
+                }
+                assert_eq!(
+                    source_code,
+                    reqwest::StatusCode::OK,
+                    "predecessor selected source unavailable during H: {source:?}"
+                );
                 assert_eq!(source["revision"], old["revision"]);
                 assert_eq!(
                     source["file"]["text"], "function before() {}\n",
@@ -1066,7 +1092,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 );
                 assert!(
                     Instant::now() < ready_deadline,
-                    "predecessor source arrived after readiness deadline; {}",
+                    "predecessor source arrived after readiness deadline; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                     failure_details(&mut successor, &body)
                 );
                 if body["catchingUp"] == false {
@@ -1082,7 +1108,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                         );
                         assert!(
                             Instant::now() < ready_deadline,
-                            "typed CLI read contention outlived successor H deadline"
+                            "typed CLI read contention outlived successor H deadline: status_busy_count={status_busy_count} source_busy_count={source_busy_count}"
                         );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -1107,7 +1133,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 }
                 assert!(
                     Instant::now() < ready_deadline,
-                    "successor never committed H before deadline; {}",
+                    "successor never committed H before deadline; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                     failure_details(&mut successor, &body)
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1116,7 +1142,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 if body["catchingUp"] == true {
                     assert!(
                         Instant::now() < ready_deadline,
-                        "new H pin never settled watcher/FIFO; {}",
+                        "new H pin never settled watcher/FIFO; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                         failure_details(&mut successor, &body)
                     );
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1133,7 +1159,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 );
                 assert!(
                     Instant::now() < ready_deadline,
-                    "new H pin settled after readiness deadline; {}",
+                    "new H pin settled after readiness deadline; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                     failure_details(&mut successor, &body)
                 );
                 let new_revision = revision.to_string();
@@ -1152,12 +1178,25 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(
-                    source.status(),
-                    reqwest::StatusCode::OK,
-                    "new H pin selected source unavailable"
-                );
+                let source_code = source.status();
                 let source: serde_json::Value = source.json().await.unwrap();
+                if source_code == reqwest::StatusCode::CONFLICT
+                    && source.pointer("/error/code").and_then(|code| code.as_str())
+                        == Some("storage_busy")
+                {
+                    source_busy_count += 1;
+                    assert!(
+                        Instant::now() < ready_deadline,
+                        "new H source public storage_busy outlived H deadline: status_busy_count={status_busy_count} source_busy_count={source_busy_count}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue; // Discard this status candidate; no source or H proof.
+                }
+                assert_eq!(
+                    source_code,
+                    reqwest::StatusCode::OK,
+                    "new H pin selected source unavailable: {source:?}"
+                );
                 assert_eq!(source["revision"], body["revision"]);
                 assert_eq!(
                     source["file"]["text"], "function after() {}\n",
@@ -1165,7 +1204,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 );
                 assert!(
                     Instant::now() < ready_deadline,
-                    "repaired source arrived after readiness deadline; {}",
+                    "repaired source arrived after readiness deadline; status_busy_count={status_busy_count} source_busy_count={source_busy_count}; {}",
                     failure_details(&mut successor, &body)
                 );
                 break body;
