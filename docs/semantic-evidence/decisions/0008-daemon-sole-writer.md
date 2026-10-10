@@ -85,7 +85,7 @@ A crash at any point simply repeats these steps on the next activation. No **dur
 
 ### 5. SQLite access
 
-Only the daemon opens these databases, so other processes can no longer contend for them. The daemon's own connections can still contend with each other: reader snapshots against writer transactions, and maintenance against publication.
+Only the daemon opens these databases, so no other supported Baleyg process contends for them. The daemon's own connections can still contend with each other: reader snapshots against writer transactions, and maintenance against publication.
 - **Contention stays typed and retried** (`storage_busy`, bounded) as AGENTS.md requires. Reduce it where that's simple, for example by serializing writers per checkout. Durability is unchanged (DELETE journal, FULL sync).
 - **Keep the retained-FD rule** from #67: never close a separate file descriptor on a live SQLite inode. Retire only the parts of the handle cache that are provably unused.
 
