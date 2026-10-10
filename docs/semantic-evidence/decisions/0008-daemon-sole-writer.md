@@ -1,6 +1,6 @@
 # Decision 0008: the user daemon is the only writer
 
-- **Status:** owner-approved 2026-10-10. Ratified when this record merges. It governs the follow-up issue to #117 (#107).
+- **Status:** owner-approved 2026-10-10. Ratified when this record merges. It governs #122, the follow-up to #107 (PR #117).
 - **What it amends:**
   - Decision 0007 §1: standalone CLI, and the daemon as follower;
   - #16's leader lifecycle;
