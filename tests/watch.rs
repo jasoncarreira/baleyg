@@ -1379,9 +1379,10 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                     let current = cli(&root, &home, "status").output().unwrap();
                     if !current.status.success() {
                         let error = String::from_utf8_lossy(&current.stderr);
-                        assert!(
-                            error.trim_start().starts_with("Error: storage_busy:"),
-                            "settled old response lacks a decodable current head: {error}"
+                        assert_eq!(
+                            error.trim(),
+                            "Error: storage_busy: CLI read contention wait expired",
+                            "settled old response lacks a decodable current head"
                         );
                         assert!(
                             Instant::now() < ready_deadline,
