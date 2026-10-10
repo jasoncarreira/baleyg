@@ -1200,11 +1200,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     match active_status {
         Ok(status) => assert_eq!(status.revision, previous),
         Err(error) => {
-            let text = error.to_string();
-            assert!(
-                text.contains("index_not_ready") || text.contains("storage_busy"),
-                "{error:#}"
-            );
+            assert_eq!(error.to_string(), "storage_busy: SQLite lock contention");
         }
     }
     match active_source {
@@ -1216,11 +1212,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         }
         Ok(None) => panic!("active DELETE journal hid the prior committed source"),
         Err(error) => {
-            let text = error.to_string();
-            assert!(
-                text.contains("index_not_ready") || text.contains("storage_busy"),
-                "{error:#}"
-            );
+            assert_eq!(error.to_string(), "storage_busy: SQLite lock contention");
         }
     }
     match raw_pair {
