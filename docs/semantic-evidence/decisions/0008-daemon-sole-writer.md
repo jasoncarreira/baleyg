@@ -1,7 +1,5 @@
 # Decision 0008: the user daemon is the only writer
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** owner-approved 2026-10-10. Ratified when this record merges. It governs #122, the follow-up to #107 (PR #117).
 - **What it amends:**
   - Decision 0007 §1: standalone CLI, and the daemon as follower;

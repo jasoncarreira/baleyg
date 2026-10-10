@@ -1,7 +1,5 @@
 # Decision 0007: user-level daemon, per-call workspace selection and idle timeouts
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** owner-approved 2026-10-06; ratified when this record merges. It governs #107, and #17 builds on it. It amends `../../mcp-readonly-pilot-contract.md` (#24) where noted, and adds to `../../local-topology.md`.
 - **Scope:** how Trellis processes are arranged when many coding-agent sessions run at once, how an MCP call chooses its workspace, and when idle resources are released. Per-checkout indexes, pins, revisions, retention (Decision 0006), the #67 queue and the evidence contracts are unchanged.
 - **Compatibility:** none needed (pre-release).

@@ -1,7 +1,5 @@
 # Decision 0002: authenticated SCIP facts and publication-time rejoin
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** prospective docs-only #11A amendment; no deployed importer, checker, schema, or migration
 - **Scope:** `../contract-v1.md` and `../publication-rejoin-vectors-v1.md`
 - **Amended by:** [Decision 0003](0003-per-document-occurrence-ids.md) (proposed). Occurrence IDs become per document version and extraction context (`occ:v2`), so a byte-identical document at the same `DocumentKey`, under the same native producer ID, version and extraction context has equal r1 and r2 occurrence IDs; a context or producer change makes them differ. Rejoin still requires a separately verified r2 native candidate, mints new r2 provenance and associations, and carries no r1 provenance or binding into r2.

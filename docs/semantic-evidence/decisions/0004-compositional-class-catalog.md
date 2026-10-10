@@ -1,7 +1,5 @@
 # Decision 0004: two-step class catalog (per-file extraction, per-revision composition)
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** approved by the owner on 2026-10-01; ratified when this record merges. It changes normative text in `../../class-diagram-contract.md`. It changes no deployed schema by itself; implementation follows in #67 (see [Implementation impact](#implementation-impact)).
 - **Scope:** how the Java/Python class catalog (`Catalog`, `src/classes.rs`) is built and persisted. The class DTOs, IDs, relation kinds, scoped-matching rules, HTTP API and class-diagram behaviour are unchanged.
 - **Compatibility: none.** Pre-release, the owner requires no backward compatibility. Catalog output may differ from the current build **only** when a workspace-wide cap is reached (see [Behaviour change](#behaviour-change)).

@@ -1,7 +1,5 @@
 # Decision 0001: prospective semantic-evidence core contract v1
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** proposed for ratification by the independent integrated review
 - **Date:** 2026-09-23
 - **Scope:** documentation-only Stage 1A contract

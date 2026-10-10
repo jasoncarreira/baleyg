@@ -1,7 +1,5 @@
 # Decision 0003: per-document occurrence identity, revision-scoped semantic validity
 
-> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
-
 - **Status:** proposed amendment for owner ratification. It changes normative text in `../contract-v1.md` (#22), `0002-publication-rejoin.md` and `../publication-rejoin-vectors-v1.md` (#11A). It changes no deployed schema by itself; implementation follows in separate reviewed work (see [Implementation impact](#implementation-impact)).
 - **Scope:** occurrence identity (`OccurrenceId`), the extraction-context digest it depends on, and the rules that relied on occurrence IDs being revision-bound. Syntax identity (`SyntaxId`), canonical bytes, `Revision.id`, coverage, freshness, warnings-v1, and the 11A raw envelope and proof rules are unchanged.
 - **Compatibility: none.** Pre-release, the owner requires no backward compatibility. There is **one** occurrence identity, `occ:v2`. The revision-bound `occ:v1` derivation is withdrawn everywhere. This supersedes Decision 0002's clause keeping legacy #26 `formatVersion:1` example bytes immutable, as far as those bytes carry occurrence IDs: the frozen normalized `formatVersion:1` fixture records and the #57 v1 vector rows are regenerated under `occ:v2`.
