@@ -903,6 +903,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         .spawn()
         .unwrap();
     let mut successor = Server(successor_process);
+    let successor_pid = successor.0.id();
     let deadline = Instant::now() + Duration::from_secs(12);
     while std::net::TcpStream::connect_timeout(&successor_addr, Duration::from_millis(50)).is_err()
     {
@@ -916,10 +917,8 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // A bound TCP listener is not an evidence-readiness signal. Only the
-    // authenticated HTTP selected snapshot can prove that this daemon serves
-    // H. A 503 index_not_ready is unserved and may be retried until the fixed
-    // deadline; 200 with the predecessor pin fails immediately.
+    // A bound TCP listener is not an H-ready signal. A coherent predecessor
+    // can remain readable while the successor reconciles the lost edit.
     let mut failure_details = |observed: &serde_json::Value| -> String {
         // Failure-only snapshot. Keep the original strict AC1 assertion:
         // a later watcher tick or explicit index cannot turn this RED green.
@@ -994,6 +993,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     };
     let http_client = reqwest::Client::new();
     let ready_deadline = Instant::now() + Duration::from_secs(12);
+    let prior_revision = old["revision"]["indexRevision"].as_u64().unwrap();
     let ready_status: serde_json::Value = loop {
         let response = http_client
             .get(format!("http://{successor_addr}/api/status"))
@@ -1014,37 +1014,147 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 failure_details(&old)
             )
         });
-        if code == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            && body.pointer("/error/code").and_then(|v| v.as_str()) == Some("index_not_ready")
-        {
-            assert!(
-                Instant::now() < ready_deadline,
-                "successor never reconciled before serving; {}",
-                failure_details(&body)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            continue;
-        }
+        // A positive predecessor exists: 503/409 is not a successful H wait.
         assert_eq!(
             code,
             reqwest::StatusCode::OK,
             "unexpected successor HTTP readiness response {code} {body:?}; {}",
             failure_details(&body)
         );
+        assert_eq!(body["workspaceRoot"], old["workspaceRoot"]);
         assert_eq!(
             body["revision"]["indexGeneration"],
             old["revision"]["indexGeneration"],
             "successor HTTP selected generation differs; {}",
             failure_details(&body)
         );
-        assert!(
-            body["revision"]["indexRevision"]
-                .as_u64()
-                .is_some_and(|n| n > old["revision"]["indexRevision"].as_u64().unwrap()),
-            "successor served old selected pin before H; {}",
-            failure_details(&body)
-        );
-        break body;
+        match body["revision"]["indexRevision"].as_u64() {
+            Some(revision) if revision == prior_revision => {
+                // An interim 200 never proves takeover. Its selected source must
+                // still be the authenticated predecessor, not the lost edit.
+                let old_revision = prior_revision.to_string();
+                let source = http_client
+                    .get(format!("http://{successor_addr}/api/source"))
+                    .bearer_auth(TOKEN)
+                    .query(&[
+                        ("path", "a.js"),
+                        (
+                            "indexGeneration",
+                            old["revision"]["indexGeneration"].as_str().unwrap(),
+                        ),
+                        ("indexRevision", old_revision.as_str()),
+                    ])
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    source.status(),
+                    reqwest::StatusCode::OK,
+                    "predecessor selected source unavailable during H"
+                );
+                let source: serde_json::Value = source.json().await.unwrap();
+                assert_eq!(source["revision"], old["revision"]);
+                assert_eq!(
+                    source["file"]["text"], "function before() {}\n",
+                    "lost edit leaked into predecessor pin"
+                );
+                if body["catchingUp"] == false {
+                    // H may commit after the old status snapshot but before its
+                    // point-in-time freshness probe. Require a fresh current head.
+                    let current = cli(&root, &home, "status").output().unwrap();
+                    if !current.status.success() {
+                        let error = String::from_utf8_lossy(&current.stderr);
+                        assert_eq!(
+                            error.trim(),
+                            "Error: storage_busy: CLI read contention wait expired",
+                            "old pin reported settled without a decodable current H head"
+                        );
+                        assert!(
+                            Instant::now() < ready_deadline,
+                            "typed CLI read contention outlived successor H deadline"
+                        );
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    let current: serde_json::Value =
+                        serde_json::from_slice(&current.stdout).unwrap();
+                    assert_eq!(
+                        current["revision"]["indexGeneration"],
+                        old["revision"]["indexGeneration"]
+                    );
+                    assert!(
+                        current["revision"]["indexRevision"]
+                            .as_u64()
+                            .is_some_and(|revision| revision > prior_revision),
+                        "old pin reported settled before any successor H: {body:?} {current:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        body["catchingUp"], true,
+                        "old pin freshness is not boolean: {body:?}"
+                    );
+                }
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "successor never committed H before deadline; {}",
+                    failure_details(&body)
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Some(revision) if revision > prior_revision => {
+                if body["catchingUp"] == true {
+                    assert!(
+                        Instant::now() < ready_deadline,
+                        "new H pin never settled watcher/FIFO; {}",
+                        failure_details(&body)
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                assert_eq!(
+                    body["catchingUp"], false,
+                    "new H freshness is not boolean: {body:?}"
+                );
+                assert_eq!(successor.0.id(), successor_pid);
+                assert!(
+                    successor.0.try_wait().unwrap().is_none(),
+                    "successor exited before serving settled new H pin"
+                );
+                let new_revision = revision.to_string();
+                let source = http_client
+                    .get(format!("http://{successor_addr}/api/source"))
+                    .bearer_auth(TOKEN)
+                    .query(&[
+                        ("path", "a.js"),
+                        (
+                            "indexGeneration",
+                            body["revision"]["indexGeneration"].as_str().unwrap(),
+                        ),
+                        ("indexRevision", new_revision.as_str()),
+                    ])
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    source.status(),
+                    reqwest::StatusCode::OK,
+                    "new H pin selected source unavailable"
+                );
+                let source: serde_json::Value = source.json().await.unwrap();
+                assert_eq!(source["revision"], body["revision"]);
+                assert_eq!(
+                    source["file"]["text"], "function after() {}\n",
+                    "successor declared H ready without the lost edit"
+                );
+                break body;
+            }
+            _ => panic!(
+                "successor served malformed/stale generation or revision: {body:?}; {}",
+                failure_details(&body)
+            ),
+        }
     };
     assert_ne!(
         fs::read(leader_lock_under(&home).unwrap()).unwrap(),
