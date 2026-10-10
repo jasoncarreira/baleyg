@@ -691,6 +691,9 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
         before
     );
     restored.finish(()).unwrap();
+    // The exact A read holds index-use SH until its handle drops; the later
+    // explicit rebaseline must acquire EX only after this read is released.
+    drop(restored);
 
     let control = store.index_baseline().unwrap();
     assert_eq!(control, prior);
