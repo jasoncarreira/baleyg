@@ -7,17 +7,13 @@ Neither output proves runtime ordering or constitutes a sequence diagram.
 
 ## Authorization and startup
 
-The user authorized a $5 budget for the feature-factory snapshot. Its original independent
-ledger was `.baleyg/jev-question-budget` (the pre-rename in-checkout path); that in-checkout path is no longer allowed. With
-Trellis stopped, manually move the existing ledger to an external private directory before
-reopening it; do not create a fresh ledger to reset its balance. The previous experiment
-ledger stays closed.
+The user authorized a $5 budget for the feature-factory snapshot. Keep its ledger in an external
+private directory, never inside the checkout. Do not create a fresh ledger to reset its balance.
 Supply `JEV_KEY` through the process environment from a local secret store. The daemon
 never reads `.env` itself. Do not put the key in command arguments, source or logs.
 
 ```sh
 mkdir -m 700 -p "$HOME/.trellis-private"
-# With Trellis stopped, first move the old ledger here if it still exists in .baleyg/ (pre-rename).
 cargo run --locked -- serve \
   --workspace tests/fixtures/extraction/inputs/feature-factory \
   --token-file "$HOME/.trellis-private/token" \
