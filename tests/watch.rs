@@ -864,7 +864,9 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     let first = cli(&root, &home, "status").output().unwrap();
     assert!(
         first.status.success(),
-        "first selected status unavailable; first startup stderr={:?}",
+        "first selected status unavailable: exit={:?} cli_stderr={:?}; first startup stderr={:?}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stderr),
         String::from_utf8_lossy(&fs::read(&first_log).unwrap())
     );
     let old: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
