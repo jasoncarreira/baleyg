@@ -214,6 +214,8 @@ pub struct IndexProgress {
 #[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
     pub workspace_root: String,
+    #[serde(default)]
+    pub catching_up: bool,
     pub revision: IndexPin,
     pub indexed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

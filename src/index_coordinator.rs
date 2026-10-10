@@ -421,7 +421,14 @@ pub struct LeaderWork {
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
+    last_accounted_pin: Option<IndexPin>,
     options: IndexOptions,
+    witness: Option<Arc<crate::daemon::causal_witness::CausalWitness>>,
+    witness_owner: Option<uuid::Uuid>,
+    witness_epoch: uuid::Uuid,
+    witness_ordinal: u64,
+    witness_ordinal_source: Option<Arc<std::sync::atomic::AtomicU64>>,
+    witness_reported_generation: Option<u64>,
 }
 
 impl LeaderWork {
@@ -442,8 +449,48 @@ impl LeaderWork {
             last_inventory: std::time::Instant::now(),
             retry_after: None,
             last_accounted_generation: None,
+            last_accounted_pin: None,
             options: options.clone(),
+            witness: None,
+            witness_owner: None,
+            witness_epoch: uuid::Uuid::nil(),
+            witness_ordinal: 0,
+            witness_ordinal_source: None,
+            witness_reported_generation: None,
         })
+    }
+
+    /// Bind the optional fixture reporter only after this verified owner installs
+    /// the watcher. Generation numbers belong to this exact watch epoch.
+    pub fn attach_causal_witness(
+        &mut self,
+        reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
+        owner: uuid::Uuid,
+        ordinal_source: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.witness_ordinal = ordinal_source.fetch_add(1, Ordering::AcqRel) + 1;
+        self.witness_epoch = uuid::Uuid::new_v4();
+        self.witness_owner = Some(owner);
+        self.witness_ordinal_source = Some(ordinal_source);
+        self.witness = Some(reporter);
+    }
+
+    pub fn causal_lineage(&self) -> Option<crate::daemon::causal_witness::Lineage> {
+        Some(crate::daemon::causal_witness::Lineage {
+            owner_incarnation: self.witness_owner?,
+            watch_epoch: self.witness_epoch,
+            ordinal: self.witness_ordinal,
+        })
+    }
+
+    pub fn accounted_watch_generation(&self) -> Option<u64> {
+        self.last_accounted_generation
+    }
+
+    /// Captured while the publication permit still covered the acknowledged
+    /// inventory. A later head must not borrow this watch ACK.
+    pub fn accounted_watch_pin(&self) -> Option<IndexPin> {
+        self.last_accounted_pin
     }
 
     /// An accepted signal is visible at ingress, before debounce and before
@@ -555,11 +602,26 @@ impl LeaderWork {
             self.watch = next;
             self.options = options.clone();
             self.last_accounted_generation = None;
+            self.last_accounted_pin = None;
+            if let Some(source) = &self.witness_ordinal_source {
+                self.witness_epoch = uuid::Uuid::new_v4();
+                self.witness_reported_generation = None;
+                self.witness_ordinal = source.fetch_add(1, Ordering::AcqRel) + 1;
+            }
         }
         let now = std::time::Instant::now();
         let periodic =
             now.duration_since(self.last_inventory) >= std::time::Duration::from_secs(60);
         let batch = self.watch.drain();
+        // Observe each new generation before its capture can acknowledge it.
+        // The queue tick holds leader_work across this call; the bounded
+        // reporter only try_sends and never opens a socket on this path.
+        if self.witness_reported_generation != Some(batch.generation) {
+            if let (Some(reporter), Some(lineage)) = (&self.witness, self.causal_lineage()) {
+                reporter.watch_pending(lineage, batch.generation);
+            }
+            self.witness_reported_generation = Some(batch.generation);
+        }
         // A failing periodic inventory obeys the same retry delay as a failed
         // watcher run. Do not spin at the queue tick rate while inputs are bad.
         if !force && self.retry_after.is_some_and(|deadline| deadline > now) {
@@ -625,11 +687,20 @@ impl LeaderWork {
         })();
         match outcome {
             Ok(publication) => {
+                // Optional witness data must be captured under the same
+                // publication permit as this inventory. An uncertain read
+                // suppresses only the fixture event, not real reconciliation.
+                let witnessed_pin = self
+                    .witness
+                    .as_ref()
+                    .and_then(|_| store.index_baseline().ok());
                 after_cutoff(&self.watch);
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
                     self.last_accounted_generation = Some(batch.generation);
+                    self.last_accounted_pin = witnessed_pin;
                 } else {
+                    self.last_accounted_pin = None;
                     // A concurrent event is not part of this selected capture.
                     // Keep it dirty for the next tick or successor full takeover.
                     self.watch.require_full();

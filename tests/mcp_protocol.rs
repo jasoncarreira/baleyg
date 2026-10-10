@@ -86,6 +86,106 @@ fn drain_stdout(lines: Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
         }
     }
 }
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn private_socket_under(home: &Path) -> Option<PathBuf> {
+    let mut dirs = vec![home.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                return Some(baleyg::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    None
+}
+
+fn owned_daemon_connection(home: &Path, pid: u32) -> Option<std::os::unix::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::connect(private_socket_under(home)?).ok()?;
+    if connected_peer_pid(&stream) != Some(pid) {
+        return None;
+    }
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    (output.status.success()
+        && String::from_utf8_lossy(&output.stdout).trim()
+            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+    .then_some(stream)
+}
+
+/// Signal only the elected binary that owns THIS fixture's private socket.
+/// Leave a stale or ambiguous marker untouched rather than targeting a reused PID.
+fn stop_fixture_daemon(home: &Path) {
+    let marker = home.join("auto-daemon.pid");
+    let Ok(raw) = fs::read_to_string(&marker) else {
+        return;
+    };
+    let Ok(pid) = raw.parse::<u32>() else {
+        return;
+    };
+    let Some(connection) = owned_daemon_connection(home, pid) else {
+        return;
+    };
+    let sent = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !sent {
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if owned_daemon_connection(home, pid).is_none() {
+            let _ = fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // No numeric-PID SIGKILL: a disconnected/replaced socket makes it ambiguous.
+    drop(connection);
+}
+
 struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -99,7 +199,37 @@ impl Peer {
         Self::start_in(workspace, None)
     }
     fn start_in(workspace: Option<&Path>, cwd: Option<&Path>) -> Self {
+        Self::start_with_phase(workspace, cwd, None)
+    }
+    fn start_with_phase(
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+    ) -> Self {
+        Self::start_with_fixture_home(tempfile::tempdir().unwrap(), workspace, cwd, phase, None)
+    }
+    fn start_with_causal_witness(workspace: Option<&Path>) -> (Self, tokio::net::UnixListener) {
+        use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = home.path().join("mcp-causal.sock");
+        assert!(socket.is_absolute());
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::metadata(home.path()).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let peer = Self::start_with_fixture_home(home, workspace, None, None, Some(&socket));
+        (peer, listener)
+    }
+    fn start_with_fixture_home(
+        home: tempfile::TempDir,
+        workspace: Option<&Path>,
+        cwd: Option<&Path>,
+        phase: Option<(&str, &Path)>,
+        causal_socket: Option<&Path>,
+    ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
@@ -108,12 +238,23 @@ impl Peer {
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .env(
+                "BALEYG_TEST_DAEMON_PID_FILE",
+                home.path().join("auto-daemon.pid"),
+            )
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(stderr));
         if let Some(path) = workspace {
             cmd.arg("--workspace").arg(path);
+        }
+        if let Some((stage, socket)) = phase {
+            cmd.env("BALEYG_TEST_MCP_PHASE", stage)
+                .env("BALEYG_TEST_MCP_PHASE_SOCKET", socket);
+        }
+        if let Some(socket) = causal_socket {
+            cmd.env("BALEYG_TEST_MCP_CAUSAL_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -181,6 +322,7 @@ impl Peer {
     }
     fn finish(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
+        stop_fixture_daemon(self._home.path());
         let (status, expired) = bounded_group_wait(&mut self.child);
         self.reaped = true;
         assert!(!expired, "MCP subprocess exceeded 10-second deadline");
@@ -190,6 +332,9 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
+        // Also covers assertion failure before finish(): only this unique HOME's
+        // elected daemon can have written its opt-in marker.
+        stop_fixture_daemon(self._home.path());
         if !self.reaped {
             // No previous wait/reap occurred: this PID/PGID cannot be recycled.
             unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
@@ -197,6 +342,67 @@ impl Drop for Peer {
         }
     }
 }
+
+#[test]
+fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let mut dummy = Command::new("/bin/sleep").arg("20").spawn().unwrap();
+    fs::write(home.path().join("auto-daemon.pid"), dummy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = dummy.try_wait().unwrap().is_none();
+    let _ = dummy.kill();
+    let _ = dummy.wait();
+    drop(owner);
+    assert!(
+        alive,
+        "stale marker signaled an unrelated test-owned process"
+    );
+}
+
+#[test]
+fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+        &home.path().join("private-data"),
+    ))
+    .unwrap()
+    .unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut decoy = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        .arg("daemon")
+        .env("HOME", other.path())
+        .env("XDG_CACHE_HOME", other.path().join("cache"))
+        .env("XDG_DATA_HOME", other.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if private_socket_under(other.path())
+            .is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok())
+        {
+            break;
+        }
+        assert!(decoy.try_wait().unwrap().is_none());
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(home.path().join("auto-daemon.pid"), decoy.id().to_string()).unwrap();
+    stop_fixture_daemon(home.path());
+    let alive = decoy.try_wait().unwrap().is_none();
+    let _ = decoy.kill();
+    let _ = decoy.wait();
+    drop(owner);
+    assert!(alive, "a different fixture's elected daemon was signaled");
+}
+
 fn checkout(base: &Path) -> PathBuf {
     let path = base.join("checkout");
     fs::create_dir_all(path.join(".git")).unwrap();
@@ -218,7 +424,7 @@ fn error(v: &Value, code: i64, id: Value) {
 fn tool(v: &Value, code: Option<&str>, modern: bool) {
     assert_eq!(v["jsonrpc"], "2.0");
     assert_eq!(v["result"]["resultType"].as_str().is_some(), modern);
-    assert_eq!(v["result"]["isError"], code.is_some());
+    assert_eq!(v["result"]["isError"], code.is_some(), "{v}");
     let envelope = &v["result"]["structuredContent"];
     assert_eq!(
         serde_json::from_str::<Value>(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap(),
@@ -229,22 +435,30 @@ fn tool(v: &Value, code: Option<&str>, modern: bool) {
         assert_eq!(envelope["error"]["code"], code);
     }
 }
-fn expected_envelope(id: &Value, code: Option<&str>, label: &str) -> Value {
+fn expected_envelope(id: &Value, code: Option<&str>, label: &str, root: &Value) -> Value {
     let fixture = fixture();
     if let Some(code) = code {
         let spec = &fixture["expected"]["failures"][code];
         assert!(spec.is_array(), "missing golden error {code}");
-        json!({"schemaVersion":1,"requestId":id,"error":{"code":code,
-            "message":spec[0],"retryable":spec[1],"currentBasis":null,"currentContentHash":null}})
+        let mut envelope = json!({"schemaVersion":1,"requestId":id,"error":{"code":code,
+            "message":spec[0],"retryable":spec[1],"currentBasis":null,"currentContentHash":null}});
+        if code != "invalid_request" && code != "range_too_large" {
+            envelope["workspace"] = root.clone();
+            envelope["catchingUp"] = json!(true);
+        }
+        envelope
     } else {
         let mut envelope = fixture["expected"]["describe"].clone();
         envelope["requestId"] = id.clone();
         envelope["data"]["workspaceLabel"] = json!(label);
+        envelope["workspace"] = root.clone();
+        envelope["catchingUp"] = json!(true);
         envelope
     }
 }
 fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
-    let envelope = expected_envelope(&v["id"], code, label);
+    let root = &v["result"]["structuredContent"]["workspace"];
+    let envelope = expected_envelope(&v["id"], code, label, root);
     let text = serde_json::to_string(&envelope).unwrap();
     let mut result = json!({"isError":code.is_some(),"structuredContent":envelope,
         "content":[{"type":"text","text":text}]});
@@ -252,6 +466,17 @@ fn exact_tool(v: &Value, code: Option<&str>, modern: bool, label: &str) {
         result["resultType"] = json!("complete");
     }
     assert_eq!(*v, json!({"jsonrpc":"2.0","id":v["id"],"result":result}));
+}
+fn exact_selection_failure(v: &Value, id: i64, reason: &str, attempted: &Path) {
+    let envelope = json!({"schemaVersion":1,"requestId":id,"error":{
+        "code":"workspace_selection_failed","message":"Workspace selection failed",
+        "retryable":reason == "unavailable","reason":reason,
+        "attemptedWorkspace":{"kind":"path","value":attempted,"utf8Bytes":attempted.to_str().unwrap().len(),"truncated":false},
+        "currentBasis":null,"currentContentHash":null}});
+    let result = json!({"resultType":"complete","isError":true,
+        "structuredContent":envelope,
+        "content":[{"type":"text","text":serde_json::to_string(&envelope).unwrap()}]});
+    assert_eq!(*v, json!({"jsonrpc":"2.0","id":id,"result":result}));
 }
 fn exact_tool_for_id(
     v: &Value,
@@ -284,6 +509,34 @@ fn call(legacy: bool, id: Value, name: &str, arguments: Value) -> Value {
         modern(id, "tools/call", fields)
     }
 }
+fn phase_barrier(listener: &std::os::unix::net::UnixListener, stage: &str, mutate: impl FnOnce()) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now()
+            }
+            Err(error) => panic!("MCP phase {stage} was not reached: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, format!("{stage}\n"));
+    mutate();
+    stream.write_all(b"x").unwrap();
+}
+
 fn no_db_under(root: &Path) {
     no_db_under_except(root, &[]);
 }
@@ -618,11 +871,10 @@ fn legacy_title_recovery_max_id_and_root_selection() {
     assert!(outcome.stdout.is_empty());
     assert!(!overlap.join(".git/baleyg/workspace-id").exists());
     assert!(root.join(".git/baleyg/workspace-id").is_file());
-    // A separate explicit non-Git workspace is legal, but cannot create a Git marker.
+    // A separate explicit non-Git workspace cannot attach to the daemon.
     let no_git = tmp.path().join("not-checkout");
     fs::create_dir(&no_git).unwrap();
-    let peer = Peer::start(Some(&no_git));
-    assert!(peer.finish().0.success());
+    silent_failure(Peer::start(Some(&no_git)));
     assert!(!no_git.join(".git").exists());
 }
 #[test]
@@ -1150,21 +1402,10 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let nearer_marker = fs::read(nearer.join(".git/baleyg/workspace-id")).unwrap();
     assert_ne!(first_marker, nearer_marker);
     assert!(implicit.finish().0.success());
-    // A non-Git cwd falls back to its canonical directory.
+    // A non-Git cwd cannot acquire a daemon checkout attachment or marker.
     let plain = tmp.path().join("plain");
     fs::create_dir(&plain).unwrap();
-    let mut fallback = Peer::start_in(None, Some(&plain));
-    exact_tool(
-        &fallback.ask(modern(
-            json!(4),
-            "tools/call",
-            json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}),
-        )),
-        None,
-        true,
-        "plain",
-    );
-    assert!(fallback.finish().0.success());
+    silent_failure(Peer::start_in(None, Some(&plain)));
     assert!(!plain.join(".git").exists());
     // A nearer malformed .git is not silently skipped for ancestor fallback.
     let bad = ancestor.join("bad-nearer");
@@ -1180,27 +1421,27 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let mut marker_lost = Peer::start(Some(&ancestor));
     assert!(marker_lost.ask(modern(json!(40), "server/discover", json!({})))["result"].is_object());
     fs::remove_file(&ancestor_marker).unwrap();
-    exact_tool(
+    exact_selection_failure(
         &marker_lost.ask(call(
             false,
             json!(5),
             "baleyg_workspace_describe",
             json!({"schemaVersion":1}),
         )),
-        Some("store_unavailable"),
-        true,
-        "ancestor",
+        5,
+        "identity_changed",
+        &ancestor.canonicalize().unwrap(),
     );
-    exact_tool(
+    exact_selection_failure(
         &marker_lost.ask(call(
             false,
             json!(6),
             "baleyg_workspace_describe",
             json!({"schemaVersion":1,"workspace":"escape"}),
         )),
-        Some("invalid_request"),
-        true,
-        "ancestor",
+        6,
+        "identity_changed",
+        Path::new("escape"),
     );
     no_db_under(marker_lost._home.path());
     assert!(marker_lost.finish().0.success());
@@ -1211,16 +1452,16 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
     let moved = ancestor.join("moved-nearer");
     fs::rename(&nearer, &moved).unwrap();
     std::os::unix::fs::symlink(&moved, &nearer).unwrap();
-    exact_tool(
+    exact_selection_failure(
         &root_changed.ask(call(
             false,
             json!(7),
             "baleyg_find_symbols",
             json!({"schemaVersion":1,"query":"a"}),
         )),
-        Some("root_changed"),
-        true,
-        "nearer",
+        7,
+        "identity_changed",
+        &ancestor.canonicalize().unwrap().join("nearer"),
     );
     assert!(root_changed.finish().0.success());
 }
@@ -1586,4 +1827,988 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
         ids[0], ids[1],
         "two real linked worktrees must not share a workspace UUID marker"
     );
+}
+
+#[test]
+fn per_call_linked_worktree_selection_and_closed_failures() {
+    assert_eq!(
+        fixture()["workspaceSelection"],
+        json!({
+        "inputField":"workspace","maxUtf8Bytes":4096,"attemptedValueBytes":256,
+        "resolvedFields":["workspace","catchingUp"],
+        "reasons":["not_absolute","not_checkout","different_repository","identity_changed","unavailable"]})
+    );
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git(temp.path(), &["init", "--quiet", main.to_str().unwrap()]);
+    git(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let foreign = temp.path().join("foreign");
+    git(temp.path(), &["init", "--quiet", foreign.to_str().unwrap()]);
+    let main = main.canonicalize().unwrap();
+    let linked = linked.canonicalize().unwrap();
+    let foreign = foreign.canonicalize().unwrap();
+    let foreign_marker = foreign.join(".git/baleyg/workspace-id");
+    let git_pointer = fs::read_to_string(linked.join(".git")).unwrap();
+    let linked_git =
+        fs::canonicalize(linked.join(git_pointer.trim().strip_prefix("gitdir: ").unwrap()))
+            .unwrap();
+    let linked_marker = linked_git.join("baleyg/workspace-id");
+    for legacy in [false, true] {
+        let mut peer = Peer::start(Some(&main));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        let describe = |peer: &mut Peer, id: i64, args: Value| {
+            peer.ask(call(legacy, json!(id), "baleyg_workspace_describe", args))
+        };
+        let selected = describe(&mut peer, 10, json!({"schemaVersion":1,"workspace":linked}));
+        tool(&selected, None, !legacy);
+        assert_eq!(
+            selected["result"]["structuredContent"]["workspace"],
+            json!(linked)
+        );
+        assert_eq!(selected["result"]["structuredContent"]["catchingUp"], true);
+        assert_eq!(
+            selected["result"]["structuredContent"]["data"]["workspaceLabel"],
+            "linked"
+        );
+        assert!(linked_marker.exists());
+        for (offset, name) in fixture()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let mut arguments = fixture()["validArguments"][offset].clone();
+            arguments["workspace"] = json!(linked);
+            let answer = peer.ask(call(
+                legacy,
+                json!(30 + offset),
+                name.as_str().unwrap(),
+                arguments,
+            ));
+            tool(&answer, Some("index_not_ready"), !legacy);
+            assert_eq!(
+                answer["result"]["structuredContent"]["workspace"],
+                json!(linked)
+            );
+            assert_eq!(answer["result"]["structuredContent"]["catchingUp"], true);
+        }
+        let launch = describe(&mut peer, 11, json!({"schemaVersion":1}));
+        tool(&launch, None, !legacy);
+        assert_eq!(
+            launch["result"]["structuredContent"]["workspace"],
+            json!(main)
+        );
+        assert_eq!(
+            launch["result"]["structuredContent"]["data"]["workspaceLabel"],
+            "main"
+        );
+        for (id, value, reason) in [
+            (12, json!("relative"), "not_absolute"),
+            (13, json!(foreign), "different_repository"),
+        ] {
+            let answer = describe(&mut peer, id, json!({"schemaVersion":1,"workspace":value}));
+            tool(&answer, Some("workspace_selection_failed"), !legacy);
+            let envelope = &answer["result"]["structuredContent"];
+            assert!(envelope.get("workspace").is_none());
+            assert!(envelope.get("catchingUp").is_none());
+            assert_eq!(envelope["error"]["reason"], reason);
+            assert_eq!(envelope["error"]["attemptedWorkspace"]["value"], value);
+            assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+        }
+        assert!(
+            !foreign_marker.exists(),
+            "foreign selection cannot create a marker"
+        );
+        let symlink = temp.path().join("link-to-linked");
+        if !symlink.exists() {
+            std::os::unix::fs::symlink(&linked, &symlink).unwrap();
+        }
+        let answer = describe(
+            &mut peer,
+            14,
+            json!({"schemaVersion":1,"workspace":symlink}),
+        );
+        tool(&answer, Some("workspace_selection_failed"), !legacy);
+        assert_eq!(
+            answer["result"]["structuredContent"]["error"]["reason"],
+            "not_checkout"
+        );
+        for (offset, (value, json_type)) in [
+            (Value::Null, "null"),
+            (json!(true), "boolean"),
+            (json!(42), "number"),
+            (json!([]), "array"),
+            (json!({"unexpected":"content"}), "object"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invalid = describe(
+                &mut peer,
+                150 + offset as i64,
+                json!({"schemaVersion":1,"workspace":value}),
+            );
+            tool(&invalid, Some("invalid_request"), !legacy);
+            assert!(
+                invalid.get("error").is_none(),
+                "not JSON-RPC invalid_params"
+            );
+            let result = &invalid["result"]["structuredContent"];
+            assert_eq!(
+                result["error"]["attemptedWorkspace"],
+                json!({"kind":"invalid_type","jsonType":json_type}),
+            );
+            assert_eq!(result["error"]["currentBasis"], Value::Null);
+            assert_eq!(result["error"]["currentContentHash"], Value::Null);
+            assert!(result.get("workspace").is_none());
+            assert!(result.get("catchingUp").is_none());
+        }
+        let long = format!("{}😀", "é".repeat(2047));
+        let invalid = describe(&mut peer, 16, json!({"schemaVersion":1,"workspace":long}));
+        tool(&invalid, Some("invalid_request"), !legacy);
+        let attempt = &invalid["result"]["structuredContent"]["error"]["attemptedWorkspace"];
+        assert_eq!(attempt["utf8Bytes"], 4098);
+        assert_eq!(attempt["value"].as_str().unwrap().len(), 256);
+        assert_eq!(attempt["truncated"], true);
+        assert_eq!(
+            describe(&mut peer, 17, json!({"schemaVersion":1}))["result"]["structuredContent"]["workspace"],
+            json!(main)
+        );
+        no_db_under(peer._home.path());
+        assert!(peer.finish().0.success());
+    }
+}
+
+#[test]
+fn catalog_rejects_contradictory_unresolved_and_resolved_failures() {
+    let catalog: Value = serde_json::from_str(include_str!("fixtures/mcp/catalog.json")).unwrap();
+    assert_eq!(catalog.as_array().unwrap().len(), 4);
+    for entry in catalog.as_array().unwrap() {
+        let defs = &entry["outputSchema"]["$defs"];
+        assert_eq!(
+            defs["Failure"]["properties"]["error"]["properties"]["code"],
+            json!({"$ref":"#/$defs/ResolvedFailureCode"})
+        );
+        assert!(
+            !defs["ResolvedFailureCode"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("workspace_selection_failed"))
+        );
+        for kind in ["SelectionFailure", "InvalidWorkspaceFailure"] {
+            let error = &defs[kind]["properties"]["error"]["properties"];
+            assert_eq!(error["currentBasis"], json!({"const":null}));
+            assert_eq!(error["currentContentHash"], json!({"const":null}));
+        }
+        assert_eq!(
+            defs["InvalidWorkspaceFailure"]["properties"]["error"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["then"]["properties"]["retryable"],
+            json!({"const":true})
+        );
+        assert_eq!(
+            defs["SelectionFailure"]["properties"]["error"]["allOf"][0]["else"]["properties"]["retryable"],
+            json!({"const":false})
+        );
+    }
+}
+
+fn git_selection(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+fn git_linked_fixture(temp: &Path) -> (PathBuf, PathBuf) {
+    let main = temp.join("main");
+    git_selection(temp, &["init", "--quiet", main.to_str().unwrap()]);
+    git_selection(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    let linked = temp.join("linked");
+    git_selection(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    (main.canonicalize().unwrap(), linked.canonicalize().unwrap())
+}
+fn linked_marker(linked: &Path) -> PathBuf {
+    let pointer = fs::read_to_string(linked.join(".git")).unwrap();
+    fs::canonicalize(linked.join(pointer.trim().strip_prefix("gitdir: ").unwrap()))
+        .unwrap()
+        .join("baleyg/workspace-id")
+}
+
+#[test]
+fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
+    for legacy in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (main, linked) = git_linked_fixture(temp.path());
+        let socket = temp.path().join("phase.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut peer = Peer::start_with_phase(Some(&main), None, Some(("selected_clone", &socket)));
+        if legacy {
+            ready_legacy(&mut peer);
+        }
+        peer.send_raw(
+            serde_json::to_string(&call(
+                legacy,
+                json!(8),
+                "baleyg_workspace_describe",
+                json!({"schemaVersion":1,"workspace":linked}),
+            ))
+            .unwrap()
+            .as_bytes(),
+        );
+        let marker = linked_marker(&linked);
+        phase_barrier(&listener, "selected_clone", || {
+            fs::remove_file(&marker).unwrap()
+        });
+        let reply = peer.reply();
+        tool(&reply, Some("root_changed"), !legacy);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(linked)
+        );
+        assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["error"]["currentBasis"],
+            Value::Null
+        );
+        assert!(
+            peer.finish().0.success(),
+            "daemon panic cannot interrupt thin client"
+        );
+    }
+}
+
+#[test]
+fn final_resolved_drift_is_attributed_for_four_tools_and_both_modes() {
+    for legacy in [false, true] {
+        for (index, name) in fixture()["names"].as_array().unwrap().iter().enumerate() {
+            for explicit in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let (main, linked) = git_linked_fixture(temp.path());
+                let root = if explicit { &linked } else { &main };
+                let stage = if explicit {
+                    "selected_final"
+                } else {
+                    "launch_final"
+                };
+                let socket = temp.path().join("phase.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let mut peer = Peer::start_with_phase(Some(&main), None, Some((stage, &socket)));
+                if legacy {
+                    ready_legacy(&mut peer);
+                }
+                let mut args = fixture()["validArguments"][index].clone();
+                if explicit {
+                    args["workspace"] = json!(linked);
+                }
+                peer.send_raw(
+                    serde_json::to_string(&call(
+                        legacy,
+                        json!(index),
+                        name.as_str().unwrap(),
+                        args,
+                    ))
+                    .unwrap()
+                    .as_bytes(),
+                );
+                if index % 2 == 0 {
+                    let marker = if explicit {
+                        linked_marker(root)
+                    } else {
+                        root.join(".git/baleyg/workspace-id")
+                    };
+                    let mut saved = Vec::new();
+                    phase_barrier(&listener, stage, || {
+                        saved = fs::read(&marker).unwrap();
+                        fs::remove_file(&marker).unwrap();
+                    });
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    let envelope = &reply["result"]["structuredContent"];
+                    assert_eq!(envelope["workspace"], json!(root));
+                    assert_eq!(envelope["catchingUp"], true);
+                    assert_eq!(envelope["error"]["currentBasis"], Value::Null);
+                    assert!(envelope["error"].get("reason").is_none());
+                    fs::write(&marker, saved).unwrap();
+                } else {
+                    let moved = temp.path().join(if explicit {
+                        "moved-linked"
+                    } else {
+                        "moved-main"
+                    });
+                    phase_barrier(&listener, stage, || fs::rename(root, &moved).unwrap());
+                    let reply = peer.reply();
+                    tool(&reply, Some("root_changed"), !legacy);
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["workspace"],
+                        json!(root)
+                    );
+                    assert_eq!(
+                        reply["result"]["structuredContent"]["error"]["currentBasis"],
+                        Value::Null
+                    );
+                    fs::rename(moved, root).unwrap();
+                }
+                assert!(peer.finish().0.success());
+            }
+        }
+    }
+}
+
+#[test]
+fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, first) = git_linked_fixture(temp.path());
+    let mut linked = vec![first];
+    for index in 1..=63 {
+        let path = temp.path().join(format!("linked-{index}"));
+        git_selection(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        linked.push(path.canonicalize().unwrap());
+    }
+    let socket = temp.path().join("phase.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let mut peer = Peer::start_with_phase(Some(&main), None, Some(("capacity_final", &socket)));
+    for (index, path) in linked.iter().take(63).enumerate() {
+        let reply = peer.ask(call(
+            false,
+            json!(index),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":path}),
+        ));
+        tool(&reply, None, true);
+        assert_eq!(
+            reply["result"]["structuredContent"]["workspace"],
+            json!(path)
+        );
+    }
+    let denied = &linked[63];
+    peer.send_raw(
+        serde_json::to_string(&call(
+            false,
+            json!(64),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1,"workspace":denied}),
+        ))
+        .unwrap()
+        .as_bytes(),
+    );
+    let marker = linked_marker(denied);
+    phase_barrier(&listener, "capacity_final", || {
+        fs::remove_file(&marker).unwrap()
+    });
+    let reply = peer.reply();
+    tool(&reply, Some("root_changed"), true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["workspace"],
+        json!(denied)
+    );
+    assert_eq!(reply["result"]["structuredContent"]["catchingUp"], true);
+    assert_eq!(
+        reply["result"]["structuredContent"]["error"]["currentBasis"],
+        Value::Null
+    );
+    assert!(peer.finish().0.success());
+}
+
+/// One bounded, read-only causal event per private fixture socket connection.
+async fn next_causal_event(
+    listener: &tokio::net::UnixListener,
+    deadline: tokio::time::Instant,
+) -> Value {
+    use tokio::io::AsyncReadExt;
+    let (socket, _) = tokio::time::timeout_at(deadline, listener.accept())
+        .await
+        .expect("daemon did not emit a causal H/watch witness")
+        .unwrap();
+    let mut bytes = Vec::new();
+    tokio::time::timeout_at(deadline, socket.take(513).read_to_end(&mut bytes))
+        .await
+        .expect("incomplete causal witness")
+        .unwrap();
+    assert!(
+        !bytes.is_empty() && bytes.len() <= 512,
+        "invalid causal witness size"
+    );
+    serde_json::from_slice(&bytes).expect("causal witness must be JSON")
+}
+
+/// Generation comparisons are valid only within one owner and watcher epoch.
+#[derive(Default)]
+struct CausalReadiness {
+    stream_id: Option<String>,
+    stream_seq: u64,
+    lineage_ordinal: Option<u64>,
+    lineage: Option<(String, String)>,
+    h_ready: bool,
+    acked: Option<u64>,
+    pending: Option<u64>,
+    announced_generations: std::collections::HashSet<u64>,
+}
+
+fn causal_lineage(event: &Value) -> (String, String) {
+    let field = |name| {
+        let value = event[name].as_str().expect("missing causal lineage UUID");
+        uuid::Uuid::parse_str(value).expect("invalid causal lineage UUID");
+        value.to_owned()
+    };
+    (field("ownerIncarnation"), field("watchEpoch"))
+}
+
+impl CausalReadiness {
+    /// Return false for a sequenced but causally retired lineage. Never let an
+    /// old epoch's late connection reset a newer owner/watch witness.
+    fn observe(&mut self, event: &Value, published: &Value) -> bool {
+        let stream_id = event["streamId"].as_str().expect("witness stream ID");
+        uuid::Uuid::parse_str(stream_id).expect("invalid witness stream ID");
+        if let Some(first) = &self.stream_id {
+            assert_eq!(
+                stream_id, first,
+                "another daemon emitted into this witness stream"
+            );
+        } else {
+            self.stream_id = Some(stream_id.to_owned());
+        }
+        let sequence = event["streamSeq"]
+            .as_u64()
+            .expect("witness stream sequence");
+        assert_eq!(
+            sequence,
+            self.stream_seq + 1,
+            "lost, duplicate, or reordered causal event"
+        );
+        self.stream_seq = sequence;
+        // Transport failure invalidates the whole stream, even if its last
+        // queued record belonged to a now-retired watcher epoch.
+        assert_ne!(
+            event["kind"], "ERROR",
+            "fixture causal witness transport failed: {event}"
+        );
+
+        let lineage_ordinal = event["lineageOrdinal"].as_u64().expect("lineage ordinal");
+        let lineage = causal_lineage(event);
+        match self.lineage_ordinal {
+            Some(current) if lineage_ordinal < current => return false,
+            Some(current) if lineage_ordinal == current => {
+                assert_eq!(
+                    self.lineage.as_ref(),
+                    Some(&lineage),
+                    "lineage ordinal collision"
+                );
+            }
+            _ => {
+                self.lineage_ordinal = Some(lineage_ordinal);
+                self.lineage = Some(lineage);
+                self.h_ready = false;
+                self.acked = None;
+                self.pending = None;
+                self.announced_generations.clear();
+            }
+        }
+        match event["kind"].as_str().expect("witness kind") {
+            "H_READY" => {
+                assert!(
+                    event["pin"].is_object(),
+                    "H requires its own publication pin"
+                );
+                self.h_ready = true;
+            }
+            "WATCH_PENDING" => {
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                self.announced_generations.insert(generation);
+                self.pending = Some(
+                    self.pending
+                        .map_or(generation, |prior| prior.max(generation)),
+                );
+            }
+            "ERROR" => panic!("fixture causal witness transport failed: {event}"),
+            "WATCH_ACK" => {
+                assert_eq!(event["queueEmpty"], true, "ACK requires an empty FIFO");
+                let generation = event["watchGeneration"].as_u64().expect("watch generation");
+                assert!(
+                    self.announced_generations.contains(&generation),
+                    "ACK without same-lineage WATCH_PENDING for its generation"
+                );
+                // CLI row completion is not H/watch settlement. Earlier H ACKs
+                // may be observed, but only the accepted CLI pin binds this ACK.
+                if event["pin"] == *published {
+                    self.acked = Some(self.acked.map_or(generation, |prior| prior.max(generation)));
+                }
+            }
+            kind => panic!("unknown causal witness: {kind}"),
+        }
+        true
+    }
+
+    fn settled(&self) -> bool {
+        self.h_ready
+            && self
+                .acked
+                .is_some_and(|ack| self.pending.is_some_and(|hint| ack >= hint))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let (mut peer, witness) = Peer::start_with_causal_witness(Some(&root));
+    let first = peer.ask(call(
+        false,
+        json!(1),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&first, None, true);
+    // This first true means pending work; without a phase witness it does not
+    // distinguish mandatory H from a queued watcher hint.
+    assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
+    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let home = peer._home.path().to_path_buf();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    command
+        .arg("index")
+        .arg("--workspace")
+        .arg(&root)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_HOME", home.join("data"));
+    let indexed = bounded_output(command);
+    assert!(
+        indexed.status.success(),
+        "index: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&indexed.stdout).expect("CLI index response");
+    let published = &cli["publishedRevision"];
+    assert!(published["indexGeneration"].is_string());
+    assert!(published["indexRevision"].is_u64());
+
+    // A completed CLI queue row pins a publication, not the daemon's mandatory
+    // H or its watcher inventory. The same Peer must keep its launch selection,
+    // but a second tool call may still report catchingUp=true.
+    let second = peer.ask(call(
+        false,
+        json!(2),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&second, None, true);
+    let selected = &first["result"]["structuredContent"]["workspace"];
+    assert_eq!(
+        &second["result"]["structuredContent"]["workspace"],
+        selected
+    );
+    assert!(second["result"]["structuredContent"]["catchingUp"].is_boolean());
+
+    // Future opt-in daemon hooks send one bounded JSON record per connection:
+    // {kind,rootKey,streamId,streamSeq,lineageOrdinal,ownerIncarnation,
+    //  watchEpoch,pin,watchGeneration,queueEmpty}. A single FIFO writer sends
+    // one complete event per connection. Any missing/duplicate sequence fails.
+    // H_READY follows verified owner installation AND phase Ready/H=false.
+    // WATCH_ACK follows full inventory acknowledgment with no unfinished FIFO.
+    // WATCH_PENDING is
+    // emitted for a later accepted hint, so an ACK is never a future quiet lease.
+    // The socket is read-only, private to HOME, and does not address a PID.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut events = 0;
+    let mut readiness = CausalReadiness::default();
+    let mut next_event = async || {
+        events += 1;
+        assert!(events <= 24, "causal witness transition budget exhausted");
+        let event = next_causal_event(&witness, deadline).await;
+        assert_eq!(event["rootKey"], root_key, "foreign causal witness");
+        event
+    };
+    // H and ACK must be from the SAME verified owner and watch epoch. If a
+    // successor takes over, discard the former generation and require new H.
+    while !readiness.settled() {
+        readiness.observe(&next_event().await, published);
+    }
+
+    // One CLI index is the only Q submission in this private fixture. There
+    // are no other clients or fixture edits, and 15 seconds is below the 60s
+    // periodic inventory interval. If another FIFO row unexpectedly appears,
+    // the lack of a watcher witness must fail, not be called a watcher hint.
+    // A genuine new hint after ACK can make true legitimate. Retry only after
+    // witnessing that generation's ACK; never poll catchingUp or infer false.
+    for id in 3..=5 {
+        let reply = peer.ask(call(
+            false,
+            json!(id),
+            "baleyg_workspace_describe",
+            json!({"schemaVersion":1}),
+        ));
+        tool(&reply, None, true);
+        let data = &reply["result"]["structuredContent"];
+        assert_eq!(&data["workspace"], selected);
+        if data["catchingUp"] == false {
+            // Describe has evidenceBasis:null; this proves the selected checkout
+            // is now settled, not that ID3 atomically returned the CLI pin.
+            assert!(peer.finish().0.success());
+            return;
+        }
+        assert_eq!(data["catchingUp"], true);
+        assert!(
+            id < 5,
+            "new watcher hints exceeded the bounded transition budget"
+        );
+        let prior_ordinal = readiness.lineage_ordinal.expect("correlated H/ACK lineage");
+        let prior_ack = readiness.acked.expect("CLI-pinned watcher ACK");
+        let mut witnessed_later = false;
+        loop {
+            let event = next_event().await;
+            let ordinal = event["lineageOrdinal"].as_u64().expect("lineage ordinal");
+            let later_hint = ordinal == prior_ordinal
+                && event["kind"] == "WATCH_PENDING"
+                && event["watchGeneration"].as_u64().expect("watch generation") > prior_ack;
+            let current = readiness.observe(&event, published);
+            // Old-epoch deliveries still consume streamSeq but cannot replace
+            // a newer H witness or count as a new reason to retry.
+            if current && (ordinal > prior_ordinal || later_hint) {
+                witnessed_later = true;
+            }
+            if witnessed_later && readiness.settled() {
+                break;
+            }
+        }
+    }
+    unreachable!("bounded tool calls return or fail")
+}
+
+/// Drive a real same-owner selected-options change through the daemon FIFO.
+/// The fresh H_READY is a Ready snapshot for the replacement watcher; it does
+/// not claim that mandatory H reran when the accepted CLI index changed inputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = checkout(temp.path());
+    let (mut peer, listener) = Peer::start_with_causal_witness(Some(&root));
+    let selected = peer.ask(call(
+        false,
+        json!(1),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&selected, None, true);
+    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+        .unwrap()
+        .root_key;
+    let home = peer._home.path().to_path_buf();
+    let index = |size: Option<u64>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+        command
+            .arg("index")
+            .arg("--workspace")
+            .arg(&root)
+            .env("HOME", &home)
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_DATA_HOME", home.join("data"));
+        if let Some(size) = size {
+            command.arg("--max-file-bytes").arg(size.to_string());
+        }
+        let output = bounded_output(command);
+        assert!(
+            output.status.success(),
+            "index: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        result["publishedRevision"].clone()
+    };
+    let first_pin = index(None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut state = CausalReadiness::default();
+    let mut records = 0;
+    while !state.settled() {
+        records += 1;
+        assert!(records <= 24, "initial watcher witness event budget");
+        let event = next_causal_event(&listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key);
+        state.observe(&event, &first_pin);
+    }
+    let original = state.lineage.clone().unwrap();
+    let original_ordinal = state.lineage_ordinal.unwrap();
+    let next_pin = index(Some(4096));
+    assert_eq!(next_pin["indexGeneration"], first_pin["indexGeneration"]);
+    // The CLI's published pin alone does not prove its selected option reached
+    // the store. Inspect this fixture's sole index.db read-only immediately
+    // after completion, before consuming the replacement watcher events.
+    let mut dirs = vec![home.clone()];
+    let mut index_db = None;
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|name| name == "index.db") {
+                assert!(
+                    index_db.replace(path).is_none(),
+                    "fixture has multiple indexes"
+                );
+            } else if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    let db = rusqlite::Connection::open_with_flags(
+        index_db.expect("selected index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let options: String = db
+        .query_row(
+            "SELECT reconcile_options FROM index_metadata WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let options: Value = serde_json::from_str(&options).unwrap();
+    assert_eq!(options["maxFileBytes"], 4096);
+    drop(db);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut observed = std::collections::HashSet::new();
+    while !state.settled() || state.lineage_ordinal == Some(original_ordinal) {
+        records += 1;
+        assert!(records <= 24, "replacement watcher witness event budget");
+        let event = next_causal_event(&listener, deadline).await;
+        assert_eq!(event["rootKey"], root_key);
+        let ordinal = event["lineageOrdinal"].as_u64().unwrap();
+        let lineage = causal_lineage(&event);
+        if ordinal > original_ordinal {
+            assert_eq!(
+                lineage.0, original.0,
+                "option changes retain the same H owner"
+            );
+            assert_ne!(
+                lineage.1, original.1,
+                "replacement must mint a new watch epoch"
+            );
+            observed.insert(event["kind"].as_str().unwrap().to_owned());
+        }
+        state.observe(&event, &next_pin);
+    }
+    assert!(
+        observed.contains("H_READY"),
+        "new epoch needs its own H-ready snapshot"
+    );
+    assert!(
+        observed.contains("WATCH_PENDING"),
+        "new watcher needs a full wake"
+    );
+    assert!(
+        observed.contains("WATCH_ACK"),
+        "new watcher must acknowledge the full wake"
+    );
+    let final_reply = peer.ask(call(
+        false,
+        json!(2),
+        "baleyg_workspace_describe",
+        json!({"schemaVersion":1}),
+    ));
+    tool(&final_reply, None, true);
+    assert_eq!(
+        final_reply["result"]["structuredContent"]["workspace"],
+        selected["result"]["structuredContent"]["workspace"]
+    );
+    assert!(final_reply["result"]["structuredContent"]["catchingUp"].is_boolean());
+    assert!(peer.finish().0.success());
+}
+
+/// Synthetic event ordering checks the fixture collector without a daemon.
+/// Explicit event fields keep each source/epoch transition visible at the call site.
+#[allow(clippy::too_many_arguments)]
+fn causal_fixture_event(
+    stream: uuid::Uuid,
+    seq: u64,
+    ordinal: u64,
+    owner: uuid::Uuid,
+    epoch: uuid::Uuid,
+    kind: &str,
+    pin: &Value,
+    generation: u64,
+) -> Value {
+    json!({"kind":kind,"rootKey":"fixture","streamId":stream.to_string(),
+      "streamSeq":seq,"lineageOrdinal":ordinal,
+      "ownerIncarnation":owner.to_string(),"watchEpoch":epoch.to_string(),"pin":pin,
+      "watchGeneration":generation,"queueEmpty":kind == "WATCH_ACK"})
+}
+
+#[test]
+fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let old = uuid::Uuid::new_v4();
+    let next = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":3});
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, old, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 2, 1, owner, old, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 3, 1, owner, old, "WATCH_ACK", &pin, 1),
+        &pin
+    ));
+    assert!(state.settled());
+    assert!(state.observe(
+        &causal_fixture_event(stream, 4, 2, owner, next, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled());
+    // An old epoch arrives after the new event. It consumes the stream sequence
+    // but cannot reset the new epoch or certify readiness with stale H/ACK.
+    assert!(!state.observe(
+        &causal_fixture_event(stream, 5, 1, owner, old, "WATCH_ACK", &pin, 2),
+        &pin
+    ));
+    assert_eq!(state.lineage_ordinal, Some(2));
+    assert!(state.observe(
+        &causal_fixture_event(stream, 6, 2, owner, next, "WATCH_ACK", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled(), "ACK without successor H is insufficient");
+    assert!(state.observe(
+        &causal_fixture_event(stream, 7, 2, owner, next, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(state.settled());
+    assert!(state.observe(
+        &causal_fixture_event(stream, 8, 2, owner, next, "WATCH_PENDING", &pin, 2),
+        &pin
+    ));
+    assert!(!state.settled(), "post-ACK hint reopens catching up");
+    assert!(state.observe(
+        &causal_fixture_event(stream, 9, 2, owner, next, "WATCH_ACK", &pin, 2),
+        &pin
+    ));
+    assert!(state.settled());
+}
+
+#[test]
+fn causal_witness_rejects_ack_without_same_lineage_pending() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let epoch = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":3});
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, epoch, "H_READY", &pin, 1),
+        &pin
+    ));
+    assert!(!state.settled());
+    let ack_only = causal_fixture_event(stream, 2, 1, owner, epoch, "WATCH_ACK", &pin, 1);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || state.observe(&ack_only, &pin)
+        ))
+        .is_err()
+    );
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(
+        &causal_fixture_event(stream, 1, 1, owner, epoch, "WATCH_PENDING", &pin, 1),
+        &pin
+    ));
+    let wrong_generation = causal_fixture_event(stream, 2, 1, owner, epoch, "WATCH_ACK", &pin, 2);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || state.observe(&wrong_generation, &pin)
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn causal_witness_rejects_missing_or_duplicate_stream_event() {
+    let stream = uuid::Uuid::new_v4();
+    let owner = uuid::Uuid::new_v4();
+    let epoch = uuid::Uuid::new_v4();
+    let pin = json!({"indexGeneration":uuid::Uuid::new_v4().to_string(),"indexRevision":1});
+    let mut state = CausalReadiness::default();
+    let first = causal_fixture_event(stream, 1, 1, owner, epoch, "H_READY", &pin, 1);
+    assert!(state.observe(&first, &pin));
+    let duplicate =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.observe(&first, &pin)));
+    assert!(duplicate.is_err());
+    let mut state = CausalReadiness::default();
+    assert!(state.observe(&first, &pin));
+    let gap = causal_fixture_event(stream, 3, 1, owner, epoch, "WATCH_ACK", &pin, 1);
+    let missing =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.observe(&gap, &pin)));
+    assert!(missing.is_err());
 }

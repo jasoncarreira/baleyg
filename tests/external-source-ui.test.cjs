@@ -12,6 +12,8 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return {promise, resolve, reject};
 }
+const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPED = `/api/checkouts/${ROOT}`;
 function harness() {
   const elements = new Map(), blobs = [], downloads = [], timers = new Map();
   let nextTimer = 0;
@@ -34,7 +36,23 @@ function harness() {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  // The app receives the production scoped URL; legacy suffixes below remain the
+  // fixture handlers' semantic route names, never an unscoped network fallback.
+  let handler = context.fetch;
+  const networkUrls = [];
+  Object.defineProperty(context, "fetch", {configurable:true, get:() => request, set(fn) {handler = fn;}});
+  const request = (url, ...args) => {
+    networkUrls.push(url);
+    if (url === "/api/checkouts" || url === "/api/daemon/status") {
+      assert.equal(args[0]?.method, "GET");
+      return handler(url, ...args);
+    }
+    assert.ok(url.startsWith(`${SCOPED}/`), `Unexpected unscoped or wrong-root request: ${url}`);
+    const result = handler("/api" + url.slice(SCOPED.length), ...args);
+    if (!url.startsWith(`${SCOPED}/status`)) return result;
+    return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
+  };
   const preserveNewFocus = () => {
     run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
@@ -46,7 +64,7 @@ function harness() {
     assert.equal(get("focus-state").textContent, "new valid focus");
     assert.equal(get("error").hidden, true);
   };
-  return {context, run, get, blobs, downloads, timers, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
 }
 
 

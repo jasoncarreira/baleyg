@@ -60,6 +60,78 @@ impl RetentionClock {
 // A single process/root gate serializes maintenance with the entire publication
 // lifetime, including terminal ACK. Independent Store instances share the gate.
 #[derive(Debug, Default)]
+struct OwnerValidation {
+    state: Mutex<OwnerValidationState>,
+    changed: Condvar,
+}
+#[derive(Debug, Default)]
+struct OwnerValidationState {
+    pending: bool,
+    associated: bool,
+    serial: u64,
+}
+
+/// Only metadata revalidation ends this interval. H publication is separate.
+struct OwnerValidationLease(Arc<OwnerValidation>);
+impl Drop for OwnerValidationLease {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.pending = false;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.0.changed.notify_all();
+    }
+}
+
+type RestrictedOwnerSlot = Arc<Mutex<Option<(Weak<topology::LeaderSession>, PreHReadPermit)>>>;
+struct RestrictedAssociationGuard {
+    slot: RestrictedOwnerSlot,
+    incarnation: uuid::Uuid,
+    armed: bool,
+}
+impl Drop for RestrictedAssociationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut slot = self.slot.lock().unwrap();
+            if slot.as_ref().is_some_and(|(owner, _)| {
+                owner
+                    .upgrade()
+                    .is_some_and(|owner| owner.incarnation() == self.incarnation)
+            }) {
+                slot.take();
+            }
+        }
+    }
+}
+
+// If metadata admission fails after EX is acquired, the H caller never
+// receives the session. Settle old-root FIFO while that EX still exists, or
+// retain it for the scheduler's retry instead of abandoning accepted work.
+pub(crate) struct RootLossOwnerLease<'a> {
+    store: &'a Store,
+    owner: Arc<topology::LeaderSession>,
+    armed: bool,
+}
+impl RootLossOwnerLease<'_> {
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for RootLossOwnerLease<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && self.store.root_path_replaced().is_ok_and(|lost| lost)
+            && self.store.fail_changed_root_requests(&self.owner).is_err()
+            // No old FIFO obligation means the EX need not outlive this failed
+            // admission. An ambiguous queue probe must retain it for retry.
+            && !matches!(self.store.old_root_unfinished_request(), Ok(None))
+        {
+            *self.store.orphan_root_loss_owner.lock().unwrap() = Some(self.owner.clone());
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct PublicationGate {
     state: Mutex<GateState>,
     changed: Condvar,
@@ -133,7 +205,7 @@ pub enum MaintenanceOutcome {
     Progress,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Store {
     roots: topology::TopologyRoots,
     identity: Arc<topology::WorkspaceIdentity>,
@@ -141,6 +213,11 @@ pub struct Store {
     maintenance_busy_attempts: Arc<AtomicU64>,
     workspace_root: String,
     recovery_required: Arc<AtomicBool>,
+    owner_validation: Arc<OwnerValidation>,
+    runtime_epoch: Arc<Mutex<Option<Arc<AtomicU64>>>>,
+    read_only_predecessor: Arc<Mutex<Option<PreHReadPermit>>>,
+    restricted_predecessor: RestrictedOwnerSlot,
+    orphan_root_loss_owner: Arc<Mutex<Option<Arc<topology::LeaderSession>>>>,
     recovery_disposition: Arc<AtomicU8>,
     obsolete_format_marker: Arc<Mutex<Option<IndexFormatMarker>>>,
     pending_request_completion: Arc<Mutex<Option<requests::PendingCompletion>>>,
@@ -154,6 +231,7 @@ pub struct Store {
     maintenance_before_writer_hook: Arc<TestOneShotHook>,
     maintenance_after_first_delete_hook: Arc<TestOneShotHook>,
     publication_before_commit_hook: Arc<TestOneShotHook>,
+    leader_before_metadata_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
     test_queue_before_shared_hook: Arc<TestOneShotHook>,
     #[cfg(test)]
@@ -175,6 +253,15 @@ pub struct Store {
     #[cfg(test)]
     test_publish_post_commit_busy_once: Arc<AtomicBool>,
 }
+impl std::fmt::Debug for Store {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Store")
+            .field("workspace_root", &self.workspace_root)
+            .finish_non_exhaustive()
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RecoveryDisposition {
@@ -544,20 +631,108 @@ impl ReadRevision {
 pub struct EvidenceResponse {
     store: Store,
     db: IndexConnection,
-    follower: topology::FollowerGuard,
-    marker: uuid::Uuid,
+    fence: ReadFence,
 }
+/// The idle permit's checkout witness contains no retained directory handle.
+#[derive(Clone)]
+struct PreHRootIdentity {
+    root: std::path::PathBuf,
+    record_id: String,
+    device: u64,
+    inode: u64,
+}
+impl PreHRootIdentity {
+    fn from_identity(identity: &topology::WorkspaceIdentity) -> Self {
+        Self {
+            root: identity.root.clone(),
+            record_id: identity.record_id.clone(),
+            device: identity.device,
+            inode: identity.inode,
+        }
+    }
+    fn matches(&self, identity: &topology::WorkspaceIdentity) -> bool {
+        self.root == identity.root
+            && self.record_id == identity.record_id
+            && (self.device, self.inode) == (identity.device, identity.inode)
+    }
+}
+
+/// The transitional fence does not grant the Store's reconciled-leader claim authority.
+#[derive(Clone)]
+pub struct PreHReadPermit {
+    identity: PreHRootIdentity,
+    pin: IndexPin,
+    predecessor: uuid::Uuid,
+    epoch: Arc<AtomicU64>,
+    captured_epoch: u64,
+}
+enum ReadFence {
+    Current(topology::FollowerGuard, uuid::Uuid),
+    PreH {
+        session: Arc<topology::LeaderSession>,
+        permit: PreHReadPermit,
+    },
+}
+impl ReadFence {
+    fn verify(&self, store: &Store, db: Option<&Connection>) -> Result<()> {
+        store.identity.verify()?;
+        match self {
+            Self::Current(follower, marker) => follower.verify(*marker),
+            Self::PreH { session, permit } => {
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
+                if permit.epoch.load(Ordering::Acquire) != permit.captured_epoch {
+                    return Err(topology::IndexNotReady::new("checkout epoch changed").into());
+                }
+                if !permit.identity.matches(&store.identity)
+                    || session.incarnation() == permit.predecessor
+                {
+                    return Err(
+                        topology::IndexNotReady::new("pre-H root or leader mismatch").into(),
+                    );
+                }
+                session.leader_guard()?.verify().map_err(|error| {
+                    anyhow::anyhow!("store_unavailable: pre-H leader lock unavailable: {error:#}")
+                })?;
+                session.verify()?;
+                if let Some(db) = db {
+                    store.verify_pre_h_snapshot(db, permit).map_err(|error| {
+                        if store.disposition() != RecoveryDisposition::Ready {
+                            anyhow::anyhow!(
+                                "store_unavailable: pre-H index recovery pending: {error:#}"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
+                }
+                store.identity.verify()?;
+                if store.disposition() != RecoveryDisposition::Ready {
+                    anyhow::bail!("store_unavailable: pre-H index recovery pending");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+type TreeOverlays = Vec<(usize, String, usize)>;
+
 impl EvidenceResponse {
     pub fn finish<T>(&self, value: T) -> Result<T> {
-        self.store.identity.verify()?;
-        self.follower.verify(self.marker)?;
+        self.fence.verify(&self.store, Some(&self.db))?;
         Ok(value)
     }
     pub fn status(&self) -> Result<IndexStatus> {
-        self.store.read_status(&self.db)
+        self.store
+            .read_status_for(&self.db, matches!(self.fence, ReadFence::PreH { .. }))
     }
     pub fn validate_pin(&self, pin: IndexPin) -> Result<()> {
-        self.store.read_revision(&self.db, Some(pin))?;
+        self.store.read_revision_for(
+            &self.db,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
         Ok(())
     }
     pub fn source_at(
@@ -565,7 +740,11 @@ impl EvidenceResponse {
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, SourceFile)>> {
-        let selected = self.store.read_revision(&self.db, expected)?;
+        let selected = self.store.read_revision_for(
+            &self.db,
+            expected,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
         let source = self
             .store
             .selected_source_row_for(&self.db, path, &selected)?;
@@ -580,23 +759,303 @@ impl EvidenceResponse {
             .validate_selected_view_in(&self.db, view, sources)
     }
     pub fn query_view(&self, query: &ViewQuery) -> Result<Option<ViewResult>> {
-        query.validate()?;
-        self.store.query_view_in(&self.db, query, None)
+        self.query_view_at(query, None)
     }
-    /// Release the SQLite snapshot before slow response assembly or provider work.
-    /// The follower guard retains protected use and the snapshot's incarnation.
+    pub fn query_view_at(
+        &self,
+        query: &ViewQuery,
+        expected: Option<&IndexPin>,
+    ) -> Result<Option<ViewResult>> {
+        query.validate()?;
+        self.store.query_view_in_for(
+            &self.db,
+            query,
+            expected,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn tree_metadata(
+        &self,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+    ) -> Result<(IndexPin, String)> {
+        let (revision, workspace_root, overlays) = self.store.tree_metadata_in(
+            &self.db,
+            root,
+            items,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )?;
+        for (index, path, count) in overlays {
+            items[index].indexed_path = Some(path);
+            items[index].method_count = Some(count);
+        }
+        Ok((revision, workspace_root))
+    }
+    pub fn files_at(
+        &self,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<serde_json::Value> {
+        self.store.files_in(
+            &self.db,
+            expected,
+            offset,
+            limit,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn methods_at(
+        &self,
+        path: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<serde_json::Value>> {
+        self.store.methods_in(
+            &self.db,
+            path,
+            expected,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn sequence_at(
+        &self,
+        seed: &str,
+        expected: IndexPin,
+        show_all: bool,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        self.store.sequence_in(
+            &self.db,
+            seed,
+            expected,
+            show_all,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn classes_at(
+        &self,
+        path: Option<&str>,
+        query: &str,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<crate::class_diagram::ClassPage> {
+        self.store.classes_in(
+            &self.db,
+            path,
+            query,
+            expected,
+            (offset, limit),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn navigation_at(
+        &self,
+        request: &crate::navigation::NavigationRequest,
+    ) -> Result<crate::navigation::NavigationResult> {
+        self.store.navigation_in(
+            &self.db,
+            request,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn class_diagram_at(
+        &self,
+        request: &crate::class_diagram::ClassDiagramRequest,
+    ) -> Result<crate::class_diagram::ClassDiagram> {
+        self.store.class_diagram_in(
+            &self.db,
+            request,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
+        self.store.symbols_in(
+            &self.db,
+            query,
+            limit,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn symbol_at(
+        &self,
+        id: &str,
+        expected_revision: Option<IndexPin>,
+    ) -> Result<Option<(IndexPin, Symbol)>> {
+        self.store.symbol_in(
+            &self.db,
+            id,
+            expected_revision,
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    fn saved_pin(&self, expected: Option<IndexPin>) -> Result<IndexPin> {
+        Ok(self
+            .store
+            .read_revision_for(
+                &self.db,
+                expected,
+                matches!(self.fence, ReadFence::PreH { .. }),
+            )?
+            .pin)
+    }
+    pub fn saved_views_at(&self, expected: Option<IndexPin>) -> Result<Vec<SavedViewState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .view_records()?
+            .into_iter()
+            .map(|v| {
+                Store::resolve_view(
+                    &self.db,
+                    &self.store,
+                    v,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .collect()
+    }
+    pub fn saved_view_at(
+        &self,
+        id: &str,
+        expected: Option<IndexPin>,
+    ) -> Result<Option<SavedViewState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .view_record(id)?
+            .map(|v| {
+                Store::resolve_view(
+                    &self.db,
+                    &self.store,
+                    v,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .transpose()
+    }
+    pub fn saved_annotations_at(&self, expected: Option<IndexPin>) -> Result<Vec<AnnotationState>> {
+        let pin = self.saved_pin(expected)?;
+        self.store
+            .records()
+            .annotation_records()?
+            .into_iter()
+            .map(|a| {
+                Store::resolve_annotation(
+                    &self.db,
+                    &self.store,
+                    a,
+                    Some(pin),
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )
+            })
+            .collect()
+    }
+    /// A predecessor permit is read-only. Mutations require a current strict
+    /// read, with the root and publication fence checked before sidecar work.
+    pub fn require_mutation_ready(&self) -> Result<()> {
+        if matches!(self.fence, ReadFence::PreH { .. }) {
+            return Err(topology::IndexNotReady::new("pre-H mutation is not ready").into());
+        }
+        self.store.ensure_public_read_ready()?;
+        self.finish(())
+    }
+    pub fn save_view_at(&self, pin: IndexPin, view: &SavedView) -> Result<SavedViewState> {
+        view.validate()?;
+        self.require_mutation_ready()?;
+        self.saved_pin(Some(pin))?;
+        ensure!(
+            self.status()?.revision == pin,
+            "revision conflict: mutation requires head"
+        );
+        let record = self.store.records().update_view_record(
+            &SavedViewRecord::from_base(view.clone(), None),
+            || {
+                serde_json::value::to_raw_value(&Store::selected_anchor_in(
+                    &self.db,
+                    &self.store,
+                    &view.query.seed,
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )?)
+                .map_err(Into::into)
+            },
+        )?;
+        Store::resolve_view(
+            &self.db,
+            &self.store,
+            record,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn save_annotation_at(
+        &self,
+        pin: IndexPin,
+        request: &AnnotationRequest,
+    ) -> Result<AnnotationState> {
+        request.validate()?;
+        self.require_mutation_ready()?;
+        self.saved_pin(Some(pin))?;
+        ensure!(
+            self.status()?.revision == pin,
+            "revision conflict: mutation requires head"
+        );
+        let title = request
+            .title
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let record = self.store.records().update_annotation_record(
+            &AnnotationRecord::from_base(request.base(), title, None),
+            request.title.is_none(),
+            || {
+                serde_json::value::to_raw_value(&Store::selected_anchor_in(
+                    &self.db,
+                    &self.store,
+                    &request.node_id,
+                    matches!(self.fence, ReadFence::PreH { .. }),
+                )?)
+                .map_err(Into::into)
+            },
+        )?;
+        Store::resolve_annotation(
+            &self.db,
+            &self.store,
+            record,
+            Some(pin),
+            matches!(self.fence, ReadFence::PreH { .. }),
+        )
+    }
+    pub fn delete_view(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_view(id)
+    }
+    pub fn delete_annotation(&self, id: &str) -> Result<bool> {
+        self.require_mutation_ready()?;
+        self.store.delete_annotation(id)
+    }
+    /// Ordinary reads release the snapshot before slow response assembly.
+    /// A transitional exact-pin fence retains its predecessor snapshot; T03
+    /// releases it after materialization so H may commit before finish.
     pub fn into_fence(self, policy: EvidenceFencePolicy) -> EvidenceFence {
-        let Self {
-            store,
-            db,
-            follower,
-            marker,
-        } = self;
-        drop(db);
+        let Self { store, db, fence } = self;
+        let pre_h_snapshot_valid =
+            !matches!(fence, ReadFence::PreH { .. }) || fence.verify(&store, Some(&db)).is_ok();
+        let snapshot = if matches!(fence, ReadFence::PreH { .. })
+            && matches!(policy, EvidenceFencePolicy::ExactPin(_))
+        {
+            Some(db)
+        } else {
+            drop(db);
+            None
+        };
         EvidenceFence {
             store,
-            follower,
-            marker,
+            fence,
+            snapshot,
+            pre_h_snapshot_valid,
             policy,
         }
     }
@@ -609,21 +1068,30 @@ pub enum EvidenceFencePolicy {
 }
 pub struct EvidenceFence {
     store: Store,
-    follower: topology::FollowerGuard,
-    marker: uuid::Uuid,
+    fence: ReadFence,
+    snapshot: Option<IndexConnection>,
+    pre_h_snapshot_valid: bool,
     policy: EvidenceFencePolicy,
 }
 impl EvidenceFence {
     pub fn finish<T>(&self, value: T) -> Result<T> {
-        self.store.identity.verify()?;
-        self.follower.verify(self.marker)?;
+        self.fence.verify(&self.store, self.snapshot.as_deref())?;
+        if !self.pre_h_snapshot_valid {
+            return Err(topology::IndexNotReady::new(
+                "pre-H snapshot changed during materialization",
+            )
+            .into());
+        }
         if let EvidenceFencePolicy::ExactPin(pin) = self.policy {
-            self.store.with_evidence(|db| {
-                self.store.read_revision(db, Some(pin))?;
-                Ok(())
-            })?;
-            self.store.identity.verify()?;
-            self.follower.verify(self.marker)?;
+            if let Some(db) = &self.snapshot {
+                self.store.read_revision_for(db, Some(pin), true)?;
+            } else {
+                self.store.with_evidence(|db| {
+                    self.store.read_revision(db, Some(pin))?;
+                    Ok(())
+                })?;
+            }
+            self.fence.verify(&self.store, self.snapshot.as_deref())?;
         }
         Ok(value)
     }
@@ -660,6 +1128,7 @@ struct RetainedSqliteWitnesses {
     by_path: std::collections::HashMap<std::path::PathBuf, Vec<Arc<std::fs::File>>>,
     live: std::collections::HashMap<(std::path::PathBuf, u64, u64), usize>,
     count: usize,
+    retired: std::collections::HashSet<std::path::PathBuf>,
 }
 static RETAINED_SQLITE_WITNESSES: std::sync::OnceLock<Mutex<RetainedSqliteWitnesses>> =
     std::sync::OnceLock::new();
@@ -673,6 +1142,49 @@ pub fn retained_sqlite_witness_count_for_tests() -> usize {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .count
+}
+
+// The opener mutex serializes the last-connection close and retired witness
+// removal. Closing any descriptor for a live SQLite inode releases all this
+// process's fcntl locks, so skip the entire path if any connection or borrower
+// still holds a handle. A later connection drop finishes deferred retirement.
+fn clean_retired_sqlite_witness(registry: &mut RetainedSqliteWitnesses, path: &Path) {
+    if !registry.retired.contains(path) {
+        return;
+    }
+    let Some(files) = registry.by_path.get(path) else {
+        registry.retired.remove(path);
+        return;
+    };
+    let safe = files.iter().all(|file| {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata().is_ok_and(|m| {
+            registry
+                .live
+                .get(&(path.to_owned(), m.dev(), m.ino()))
+                .copied()
+                .unwrap_or(0)
+                == 0
+                && Arc::strong_count(file) == 1
+        })
+    });
+    if safe {
+        let files = registry.by_path.remove(path).expect("retired witness path");
+        registry.count -= files.len();
+        registry.retired.remove(path);
+        drop(files);
+    }
+}
+
+struct SqliteWitnessRetirement(Vec<std::path::PathBuf>);
+impl Drop for SqliteWitnessRetirement {
+    fn drop(&mut self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        for path in &self.0 {
+            registry.retired.insert(path.clone());
+            clean_retired_sqlite_witness(&mut registry, path);
+        }
+    }
 }
 
 // Every managed SQLite opener carries a live-inode registration until SQLite closes.
@@ -703,6 +1215,7 @@ impl Drop for ProtectedSqliteConnection {
         if *live == 0 {
             registry.live.remove(&self.key);
         }
+        clean_retired_sqlite_witness(&mut registry, &self.key.0);
     }
 }
 fn protected_sqlite_open(
@@ -4841,6 +5354,123 @@ impl Store {
             && probe.check() == MaintenanceQueueState::Clear
             && std::panic::catch_unwind(std::panic::AssertUnwindSafe(priority)).unwrap_or(false)
     }
+    /// Inspect only already published, inactive index queues. Unknown paths or
+    /// unreadable identities keep the daemon alive rather than abandoning work.
+    pub fn orphan_queues_pending(
+        roots: &topology::TopologyRoots,
+        active: &std::collections::HashSet<String>,
+    ) -> bool {
+        let parent = roots.cache.join("indexes");
+        let dirs = match std::fs::read_dir(&parent) {
+            Ok(dirs) => dirs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+        for entry in dirs {
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else {
+                return true;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(key) = entry.file_name().to_str().map(str::to_owned) else {
+                return true;
+            };
+            if active.contains(&key) {
+                continue;
+            }
+            let pending = Self::orphan_queue_pending_at(roots, &key);
+            // The probe's SH guard and SQLite connection have now ended.
+            // Retire only without another active reader/leader on this index.
+            let lock = parent.join(format!("{key}.lock"));
+            if let Ok(_exclusive) = topology::UseGuard::acquire_existing_readonly_exclusive(&lock) {
+                let dir = parent.join(&key);
+                drop(SqliteWitnessRetirement(vec![
+                    dir.join("index.db"),
+                    dir.join("requests.db"),
+                ]));
+            }
+            if pending.unwrap_or(true) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn orphan_queue_pending_at(roots: &topology::TopologyRoots, key: &str) -> Result<bool> {
+        use sha2::{Digest, Sha256};
+        ensure!(
+            key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid index key"
+        );
+        let dir = roots.cache.join("indexes").join(key);
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "unsafe index directory"
+        );
+        let guard = topology::UseGuard::acquire_existing_readonly(
+            &roots.cache.join("indexes").join(format!("{key}.lock")),
+        )?;
+        let path = dir.join("index.db");
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let absent = requests::queue_absent_without_sidecars(&dir.join("requests.db"));
+                guard.verify()?;
+                return Ok(!absent);
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // SQLite may recover a hot journal or create shared-memory files even
+        // through a read-only connection. Check all sidecars before opening it.
+        reject_sidecars(&path, true)?;
+        let db = open_index_marker_probe(&path, false, Duration::ZERO)?;
+        let (spelling, device, inode): (String, String, String) = db.query_row(
+            "SELECT root_spelling,root_device,root_inode FROM index_metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        drop(db);
+        ensure!(
+            hex::encode(Sha256::digest(spelling.as_bytes())) == key,
+            "index identity mismatch"
+        );
+        let root = Path::new(&spelling);
+        // Only a proved pathname loss or new root inode is disposable. Unreadable
+        // paths, malformed metadata and marker errors are not proof that the old
+        // queue may be abandoned.
+        use std::os::unix::fs::MetadataExt;
+        let old_device = device.parse::<u64>()?;
+        let old_inode = inode.parse::<u64>()?;
+        match std::fs::symlink_metadata(root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+            Ok(named)
+                if !named.is_dir()
+                    || named.file_type().is_symlink()
+                    || (named.dev(), named.ino()) != (old_device, old_inode) =>
+            {
+                return Ok(false);
+            }
+            Ok(_) => {}
+        }
+        let identity = topology::WorkspaceIdentity::discover_unattached(Some(root), root)?
+            .attach_existing_marker_readonly()?;
+        ensure!(
+            identity.root_key == key
+                && identity.device == old_device
+                && identity.inode == old_inode,
+            "index root changed"
+        );
+        guard.verify()?;
+        let store = Self::unopened(roots.clone(), identity)?;
+        let pending = store.open_maintenance_queue_probe()?.check() != MaintenanceQueueState::Clear;
+        guard.verify()?;
+        Ok(pending)
+    }
+
     pub fn open(
         roots: topology::TopologyRoots,
         identity: topology::WorkspaceIdentity,
@@ -4920,6 +5550,11 @@ impl Store {
             identity: Arc::new(identity),
             maintenance_busy_attempts: Arc::new(AtomicU64::new(0)),
             recovery_required: Arc::new(AtomicBool::new(false)),
+            owner_validation: Arc::new(OwnerValidation::default()),
+            runtime_epoch: Arc::new(Mutex::new(None)),
+            read_only_predecessor: Arc::new(Mutex::new(None)),
+            restricted_predecessor: Arc::new(Mutex::new(None)),
+            orphan_root_loss_owner: Arc::new(Mutex::new(None)),
             recovery_disposition: Arc::new(AtomicU8::new(RecoveryDisposition::Ready as u8)),
             obsolete_format_marker: Arc::new(Mutex::new(None)),
             pending_request_completion: Arc::new(Mutex::new(None)),
@@ -4936,6 +5571,7 @@ impl Store {
             maintenance_before_writer_hook: Arc::new(TestOneShotHook::default()),
             maintenance_after_first_delete_hook: Arc::new(TestOneShotHook::default()),
             publication_before_commit_hook: Arc::new(TestOneShotHook::default()),
+            leader_before_metadata_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
             test_queue_before_shared_hook: Arc::new(TestOneShotHook::default()),
             #[cfg(test)]
@@ -4956,6 +5592,111 @@ impl Store {
             test_publish_post_commit_busy_once: Arc::new(AtomicBool::new(false)),
         })
     }
+    /// Read only bounded index identity metadata for browser discovery. This
+    /// existing-only probe shares the process-wide SQLite witness with readers
+    /// and writers. It does not run recovery or inspect evidence rows.
+    pub fn browser_index_root_existing(
+        roots: &topology::TopologyRoots,
+        key: &str,
+    ) -> std::result::Result<String, &'static str> {
+        use sha2::Digest;
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("unavailable");
+        }
+        let parent = roots.cache.join("indexes");
+        let directory = parent.join(key);
+        for path in [&roots.cache, &parent, &directory] {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                _ => return Err("unavailable"),
+            }
+        }
+        let lock = parent.join(format!("{key}.lock"));
+        let _use_guard = topology::UseGuard::acquire_existing_readonly(&lock).map_err(|error| {
+            if error.is::<topology::StorageBusy>() {
+                "storage_busy"
+            } else {
+                "unavailable"
+            }
+        })?;
+        let index = directory.join("index.db");
+        let observed = (|| -> std::result::Result<String, &'static str> {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = directory.join(format!("index.db{suffix}"));
+                match std::fs::symlink_metadata(sidecar) {
+                    Ok(_) => return Err("storage_busy"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err("unavailable"),
+                }
+            }
+            // Both the header witness and SQLite descriptor remain registered for
+            // this inode throughout the read, including concurrent active Stores.
+            let db = open_index_marker_probe(&index, false, Duration::from_millis(20)).map_err(
+                |error| {
+                    if error.is::<topology::StorageBusy>()
+                        || error.to_string().starts_with("storage_busy")
+                    {
+                        "storage_busy"
+                    } else if error.to_string().starts_with("incompatible_index")
+                        || error.is::<ExceptionalIndexFormat>()
+                    {
+                        "corrupt"
+                    } else {
+                        "unavailable"
+                    }
+                },
+            )?;
+            let marker = read_index_format_marker(&db).map_err(|error| {
+                if error.is::<topology::StorageBusy>() {
+                    "storage_busy"
+                } else {
+                    "corrupt"
+                }
+            })?;
+            let version: u32 =
+                storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))
+                    .map_err(|error| {
+                        if error.is::<topology::StorageBusy>() {
+                            "storage_busy"
+                        } else {
+                            "unavailable"
+                        }
+                    })?;
+            if marker.is_obsolete()
+                || version != DATABASE_SCHEMA_VERSION
+                || marker.schema_version != i64::from(DATABASE_SCHEMA_VERSION)
+            {
+                return Err("corrupt");
+            }
+            let (length, spelling): (i64, Option<String>) = storage_result(db.query_row(
+            "SELECT length(CAST(root_spelling AS BLOB)), CASE WHEN length(CAST(root_spelling AS BLOB))<=8192 THEN root_spelling END FROM index_metadata WHERE singleton=1 LIMIT 2",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )).map_err(|error| if error.is::<topology::StorageBusy>() { "storage_busy" } else { "corrupt" })?;
+            if !(1..=8192).contains(&length) {
+                return Err("corrupt");
+            }
+            let spelling = spelling.ok_or("corrupt")?;
+            if !Path::new(&spelling).is_absolute()
+                || hex::encode(sha2::Sha256::digest(spelling.as_bytes())) != key
+            {
+                return Err("corrupt");
+            }
+            Ok(spelling)
+        })();
+        drop(_use_guard);
+        // An active checkout holds SH on the use lock between its SQLite
+        // operations. Only an idle EX proof permits dropping its retained fd;
+        // a concurrent active Store or live connection keeps its own witness.
+        if let Ok(_exclusive) = topology::UseGuard::acquire_existing_readonly_exclusive(&lock) {
+            drop(SqliteWitnessRetirement(vec![index]));
+        }
+        observed
+    }
+
     /// Observe only an already-published index. In particular, this path may
     /// not create HOME/cache, a Git identity marker, an index or a use lock.
     pub fn status_existing_readonly(
@@ -5671,6 +6412,23 @@ impl Store {
         &self,
         before_write: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<topology::LeaderGuard> {
+        self.leader_with_owner(
+            before_write,
+            |guard| guard,
+            |guard| guard,
+            |_| None,
+            |_| Ok(false),
+        )
+    }
+
+    fn leader_with_owner<T>(
+        &self,
+        before_write: impl FnOnce(&Connection) -> Result<()>,
+        wrap: impl FnOnce(topology::LeaderGuard) -> T,
+        guard: impl Fn(&T) -> &topology::LeaderGuard,
+        root_loss_owner: impl Fn(&T) -> Option<Arc<topology::LeaderSession>>,
+        publish: impl FnOnce(&T) -> Result<bool>,
+    ) -> Result<T> {
         // Leader startup has its own live data_version→COMMIT interval before
         // coordinator preparation. Do not recursively acquire the gate inside
         // the coordinator: it enters publication only AFTER leader_session().
@@ -5683,10 +6441,43 @@ impl Store {
             self.cache()
                 .map_err(|error| self.report_live_read_failure(error))?,
         );
-        let leader = self.roots.leader(&self.identity)?;
-        // The leader incarnation is already durable. From this point every clone
-        // must remain closed unless a complete paired publication commits.
+        // A watcher or external CLI may have published B since activation or
+        // the last selected read of A. Refresh only from a finished strict
+        // read under the still-verifiable old owner, retaining this runtime's
+        // epoch. A lost/ambiguous old owner never supplies a new permit.
+        let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
+        if let Some(epoch) = prior_epoch
+            && let Ok(read) = self.evidence_response()
+        {
+            let _ = self.remember_read_only_predecessor(&read, epoch);
+        }
+        // Start the read-admission interval BEFORE flock acquisition writes a
+        // durable new incarnation. Acquiring the lock can fail; RAII wakes any
+        // waiting reader on that path too. Old verified owner reads still use
+        // their normal strict admission while its lock is unchanged.
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.pending = true;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        drop(state);
+        let _validation = OwnerValidationLease(self.owner_validation.clone());
+        let owner = wrap(self.roots.leader(&self.identity)?);
+        let mut root_loss_lease = root_loss_owner(&owner).map(|session| RootLossOwnerLease {
+            store: self,
+            owner: session,
+            armed: true,
+        });
+        let leader = guard(&owner);
+        // This incarnation is durable, but the old SQLite marker has not yet
+        // been validated or rebound. Never serve unproven evidence here.
         self.recovery_required.store(true, Ordering::Release);
+        let associated = publish(&owner)?;
+        let mut association_guard = RestrictedAssociationGuard {
+            slot: self.restricted_predecessor.clone(),
+            incarnation: leader.incarnation,
+            armed: associated,
+        };
+        self.leader_before_metadata_hook.run();
         // Opening can race a second SQLite writer: repeat validation only AFTER
         // BEGIN IMMEDIATE excludes schema changes and before any metadata UPDATE.
         let mut db = self
@@ -5733,7 +6524,11 @@ impl Store {
         if prior_readable && self.disposition() == RecoveryDisposition::Ready {
             self.recovery_required.store(false, Ordering::Release);
         }
-        Ok(leader)
+        association_guard.armed = false;
+        if let Some(lease) = &mut root_loss_lease {
+            lease.armed = false;
+        }
+        Ok(owner)
     }
     fn cache(&self) -> Result<IndexConnection> {
         self.connect_index(false)
@@ -6125,6 +6920,7 @@ impl Store {
         }
         Ok(IndexStatus {
             workspace_root: self.workspace_root.clone(),
+            catching_up: false,
             revision: pin,
             indexed_at: if row.7.is_empty() { None } else { Some(row.7) },
             stats: serde_json::from_str(&row.8)?,
@@ -6133,6 +6929,53 @@ impl Store {
                 .then(|| EVIDENCE_FORMAT.to_owned()),
         })
     }
+    /// Wait only for the new owner's metadata validation, never for H/FIFO.
+    /// The caller must already hold an independently validated prior head and
+    /// must retry full strict admission after this signal. Failure also wakes.
+    /// A selected read only waits for restricted EX proof, not owner metadata
+    /// validation or mandatory H. The cap protects an unavailable owner.
+    pub fn wait_for_restricted_owner(&self, timeout: Duration) -> bool {
+        let state = self.owner_validation.state.lock().unwrap();
+        if state.associated {
+            return true;
+        }
+        if !state.pending {
+            return false;
+        }
+        let serial = state.serial;
+        let (state, _) = self
+            .owner_validation
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.pending && !state.associated && state.serial == serial
+            })
+            .unwrap();
+        state.associated
+    }
+
+    pub fn owner_validation_pending(&self) -> bool {
+        self.owner_validation.state.lock().unwrap().pending
+    }
+
+    /// Releasing a checkout cancels admitted waiters; no head is implied.
+    pub fn notify_owner_validation_release(&self) {
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.pending = false;
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.owner_validation.changed.notify_all();
+        drop(state);
+        self.restricted_predecessor.lock().unwrap().take();
+    }
+
+    pub fn revoke_restricted_predecessor(&self) {
+        self.restricted_predecessor.lock().unwrap().take();
+        let mut state = self.owner_validation.state.lock().unwrap();
+        state.associated = false;
+        state.serial = state.serial.wrapping_add(1);
+        self.owner_validation.changed.notify_all();
+    }
+
     fn ensure_public_read_ready(&self) -> Result<()> {
         if !self.recovery_required.load(Ordering::Acquire) {
             return Ok(());
@@ -6164,7 +7007,17 @@ impl Store {
     }
 
     fn read_status(&self, db: &Connection) -> Result<IndexStatus> {
-        let status = self.read_public_control_status(db)?;
+        self.read_status_for(db, false)
+    }
+    fn read_status_for(&self, db: &Connection, pre_h: bool) -> Result<IndexStatus> {
+        let status = if pre_h {
+            self.verify_metadata_root(db)
+                .map_err(|error| self.report_live_read_failure(error))?;
+            self.decode_control_status_raw(db)
+                .map_err(|error| self.report_live_read_failure(error))?
+        } else {
+            self.read_public_control_status(db)?
+        };
         if status.evidence_format.is_none() {
             let schema: i64 =
                 storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
@@ -6273,6 +7126,20 @@ impl Store {
     pub fn verify_root(&self) -> Result<()> {
         self.identity.verify()
     }
+    /// Called after the checkout's worker streams stop and its last read ends.
+    /// Other Store users may still hold a connection: defer that exact witness
+    /// until its protected connection closes, never discard their fcntl locks.
+    pub(crate) fn retire_checkout_sqlite_witnesses(&self) {
+        let mut registry = sqlite_witnesses().lock().unwrap_or_else(|e| e.into_inner());
+        for path in [
+            self.roots.index_db(&self.identity),
+            self.roots.requests_db(&self.identity),
+        ] {
+            registry.retired.insert(path.clone());
+            clean_retired_sqlite_witness(&mut registry, &path);
+        }
+    }
+
     pub(crate) fn root_path_replaced(&self) -> Result<bool> {
         self.identity.root_path_replaced()
     }
@@ -6343,10 +7210,36 @@ impl Store {
         Ok((pin, session))
     }
     pub fn leader_session(&self) -> Result<Arc<topology::LeaderSession>> {
-        Ok(Arc::new(topology::LeaderSession::leader(
-            self.leader()?,
-            self.identity.clone(),
-        )))
+        self.leader_with_owner(
+            |_| Ok(()),
+            |guard| {
+                Arc::new(topology::LeaderSession::leader(
+                    guard,
+                    self.identity.clone(),
+                ))
+            },
+            |session| session.leader_guard().expect("wrapped EX owner"),
+            |session| Some(session.clone()),
+            |session| {
+                let Some(permit) = self.read_only_predecessor.lock().unwrap().clone() else {
+                    return Ok(false);
+                };
+                let guard = session.leader_guard()?;
+                if !permit.identity.matches(&self.identity)
+                    || guard.predecessor_incarnation != Some(permit.predecessor)
+                    || permit.epoch.load(Ordering::Acquire) != permit.captured_epoch
+                {
+                    return Ok(false);
+                }
+                *self.restricted_predecessor.lock().unwrap() =
+                    Some((Arc::downgrade(session), permit));
+                let mut state = self.owner_validation.state.lock().unwrap();
+                state.associated = true;
+                state.serial = state.serial.wrapping_add(1);
+                self.owner_validation.changed.notify_all();
+                Ok(true)
+            },
+        )
     }
     pub(crate) fn verify_leader_session(&self, session: &topology::LeaderSession) -> Result<()> {
         session.belongs_to(&self.identity, &self.roots.leader_lock(&self.identity))
@@ -6408,6 +7301,7 @@ impl Store {
         self.identity.verify()?;
         leader.belongs_to(&self.roots.leader_lock(&self.identity))?;
         *self.reconciled_leader.lock().unwrap() = Some(marker);
+        self.revoke_restricted_predecessor();
         Ok(())
     }
     /// The public Store::claim_request entry point must refuse pre-COMMIT
@@ -6525,6 +7419,263 @@ impl Store {
         self.identity.verify()?;
         follower.verify(marker)
     }
+    /// Reacquire without rewriting the predecessor metadata: mandatory H owns
+    /// the next marker publication. The permit never supplies claim authority.
+    pub fn leader_for_idle_reattach(
+        &self,
+        permit: &PreHReadPermit,
+    ) -> Result<Arc<topology::LeaderSession>> {
+        self.ensure_not_recreate_pending()?;
+        self.identity.verify()?;
+        if !permit.identity.matches(&self.identity)
+            || self.disposition() != RecoveryDisposition::Ready
+        {
+            return Err(topology::IndexNotReady::new("pre-H checkout unavailable").into());
+        }
+        let guard = self.roots.leader(&self.identity)?;
+        if guard.predecessor_incarnation != Some(permit.predecessor) {
+            return Err(topology::IndexNotReady::new("intervening leader").into());
+        }
+        self.recovery_required.store(true, Ordering::Release);
+        Ok(Arc::new(topology::LeaderSession::leader(
+            guard,
+            self.identity.clone(),
+        )))
+    }
+
+    /// Bind only the activated checkout's epoch, even when its first head is
+    /// cold. A later strict pre-takeover read may then prove a new current head.
+    pub fn bind_runtime_epoch(&self, epoch: Arc<AtomicU64>) {
+        *self.runtime_epoch.lock().unwrap() = Some(epoch);
+    }
+
+    /// A finished strict read can prove a predecessor for read-only rollover.
+    /// Unlike the idle leader permit, this never grants claim or H authority.
+    pub fn remember_read_only_predecessor(
+        &self,
+        response: &EvidenceResponse,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<()> {
+        let ReadFence::Current(_, predecessor) = &response.fence else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            PreHRootIdentity::from_identity(&self.identity).matches(&response.store.identity),
+            "index_not_ready: predecessor belongs to another checkout"
+        );
+        let status = response.status()?;
+        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
+            return Ok(());
+        }
+        response.finish(())?;
+        let permit = PreHReadPermit {
+            identity: PreHRootIdentity::from_identity(&self.identity),
+            pin: status.revision,
+            predecessor: *predecessor,
+            captured_epoch: epoch.load(Ordering::Acquire),
+            epoch,
+        };
+        let mut current = self.read_only_predecessor.lock().unwrap();
+        if let Some(previous) = current.as_ref() {
+            anyhow::ensure!(
+                Arc::ptr_eq(&previous.epoch, &permit.epoch),
+                "index_not_ready: predecessor belongs to another runtime epoch"
+            );
+            if previous.pin.index_generation == permit.pin.index_generation
+                && previous.pin.index_revision > permit.pin.index_revision
+            {
+                return Ok(());
+            }
+        }
+        *current = Some(permit);
+        Ok(())
+    }
+
+    pub fn has_read_only_predecessor_for_epoch(&self, epoch: &Arc<AtomicU64>) -> bool {
+        self.read_only_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|permit| {
+                permit.identity.matches(&self.identity)
+                    && Arc::ptr_eq(&permit.epoch, epoch)
+                    && permit.captured_epoch == epoch.load(Ordering::Acquire)
+            })
+    }
+
+    /// Restricted association is neither a serving owner nor an H proof.
+    /// Fixture only: emulate a restricted H owner surviving Store replacement
+    /// while testing exceptional index recreation and EX retirement.
+    #[doc(hidden)]
+    pub fn associate_restricted_owner_for_tests(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+        permit: PreHReadPermit,
+    ) {
+        *self.restricted_predecessor.lock().unwrap() = Some((Arc::downgrade(owner), permit));
+    }
+
+    pub fn restricted_owner_associated(&self) -> bool {
+        self.restricted_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(owner, _)| owner.strong_count() > 0)
+    }
+
+    /// Root-loss-only authority: borrow the live H worker's exact old EX to
+    /// terminally fail accepted work. A weak slot cannot pin that owner itself.
+    pub fn restricted_owner_for_root_loss(&self) -> Option<Arc<topology::LeaderSession>> {
+        self.restricted_predecessor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|(owner, _)| owner.upgrade())
+    }
+
+    /// Retain an acquired EX until the caller either hands it to a verified
+    /// serving owner or disposes old-root work on an error.
+    pub(crate) fn root_loss_owner_lease(
+        &self,
+        owner: &Arc<topology::LeaderSession>,
+    ) -> RootLossOwnerLease<'_> {
+        RootLossOwnerLease {
+            store: self,
+            owner: owner.clone(),
+            armed: true,
+        }
+    }
+
+    pub fn orphan_root_loss_owner(&self) -> Option<Arc<topology::LeaderSession>> {
+        self.orphan_root_loss_owner.lock().unwrap().clone()
+    }
+
+    pub fn clear_orphan_root_loss_owner(&self) {
+        self.orphan_root_loss_owner.lock().unwrap().take();
+    }
+
+    pub fn restricted_predecessor_read(&self) -> Result<EvidenceResponse> {
+        let (owner, permit) = self
+            .restricted_predecessor
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| topology::IndexNotReady::new("owner has not proved a predecessor"))?;
+        let owner = owner
+            .upgrade()
+            .ok_or_else(|| topology::IndexNotReady::new("restricted EX owner was released"))?;
+        self.evidence_response_pre_h(&permit, owner)
+    }
+
+    /// Mint only from a normally admitted, finished complete head before idle release.
+    pub fn pre_h_read_permit(
+        &self,
+        response: &EvidenceResponse,
+        session: &topology::LeaderSession,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<PreHReadPermit> {
+        self.verify_reconciled_leader_claim(session)?;
+        let ReadFence::Current(_, predecessor) = &response.fence else {
+            return Err(topology::IndexNotReady::new("cannot mint from transitional read").into());
+        };
+        if response.store.identity.root != self.identity.root
+            || response.store.identity.device != self.identity.device
+            || response.store.identity.inode != self.identity.inode
+        {
+            return Err(topology::IndexNotReady::new("different checkout").into());
+        }
+        if *predecessor != session.incarnation() {
+            return Err(topology::IndexNotReady::new("not the reconciled checkout leader").into());
+        }
+        let captured_epoch = epoch.load(Ordering::Acquire);
+        let status = response.status()?;
+        if status.evidence_format.is_none() || status.revision.index_revision == 0 {
+            return Err(topology::IndexNotReady::new("complete head required").into());
+        }
+        response.finish(())?;
+        if epoch.load(Ordering::Acquire) != captured_epoch {
+            return Err(topology::IndexNotReady::new("checkout epoch changed").into());
+        }
+        Ok(PreHReadPermit {
+            identity: PreHRootIdentity::from_identity(&self.identity),
+            pin: status.revision,
+            predecessor: *predecessor,
+            epoch,
+            captured_epoch,
+        })
+    }
+
+    fn verify_pre_h_snapshot(&self, db: &Connection, permit: &PreHReadPermit) -> Result<()> {
+        self.verify_metadata_root(db)
+            .map_err(|error| self.report_live_read_failure(error))
+            .map_err(|error| {
+                if self.disposition() != RecoveryDisposition::Ready {
+                    anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+                } else {
+                    error
+                }
+            })?;
+        let schema: u32 =
+            storage_result(db.pragma_query_value(None, "user_version", |row| row.get(0)))?;
+        if schema != DATABASE_SCHEMA_VERSION {
+            return Err(topology::IndexNotReady::new("pre-H schema changed").into());
+        }
+        let status = self.read_status_for(db, true)?;
+        let marker: Option<String> = db
+            .query_row(
+                "SELECT reconciled_incarnation FROM index_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| self.report_live_read_failure(selected_integrity(error.into())))?;
+        if status.revision != permit.pin
+            || status.evidence_format.is_none()
+            || marker.as_deref() != Some(permit.predecessor.to_string().as_str())
+        {
+            return Err(topology::IndexNotReady::new("pre-H predecessor changed").into());
+        }
+        Ok(())
+    }
+
+    /// Explicit transitional admission. Ordinary evidence_response stays strict.
+    pub fn evidence_response_pre_h(
+        &self,
+        permit: &PreHReadPermit,
+        session: Arc<topology::LeaderSession>,
+    ) -> Result<EvidenceResponse> {
+        self.ensure_not_recreate_pending()?;
+        if self.disposition() != RecoveryDisposition::Ready {
+            return Err(topology::IndexNotReady::new("recovery pending").into());
+        }
+        let guard = session.leader_guard()?;
+        if guard.predecessor_incarnation != Some(permit.predecessor) {
+            return Err(topology::IndexNotReady::new("intervening leader").into());
+        }
+        let fence = ReadFence::PreH {
+            session,
+            permit: permit.clone(),
+        };
+        fence.verify(self, None)?;
+        let db = self.cache().map_err(|error| {
+            let error = self.report_live_read_failure(error);
+            if self.disposition() != RecoveryDisposition::Ready {
+                anyhow::anyhow!("store_unavailable: pre-H index recovery pending: {error:#}")
+            } else {
+                error
+            }
+        })?;
+        storage_result(db.execute_batch("BEGIN DEFERRED"))?;
+        fence.verify(self, Some(&db))?;
+        if self.disposition() != RecoveryDisposition::Ready {
+            return Err(topology::IndexNotReady::new("recovery pending").into());
+        }
+        Ok(EvidenceResponse {
+            store: self.clone(),
+            db,
+            fence,
+        })
+    }
+
     pub fn evidence_response(&self) -> Result<EvidenceResponse> {
         self.ensure_not_recreate_pending()?;
         let db = self
@@ -6537,8 +7688,7 @@ impl Store {
         Ok(EvidenceResponse {
             store: self.clone(),
             db,
-            follower,
-            marker,
+            fence: ReadFence::Current(follower, marker),
         })
     }
     fn with_evidence<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -8763,6 +9913,15 @@ impl Store {
                 self.recovery_disposition
                     .store(RecoveryDisposition::Ready as u8, Ordering::Release);
                 self.recovery_required.store(false, Ordering::Release);
+                // A successful same-owner watcher publication can advance A→B
+                // without a browser read in between. Refresh only this Store's
+                // existing runtime epoch from a new strict, finished B read.
+                let prior_epoch = self.runtime_epoch.lock().unwrap().clone();
+                if let Some(epoch) = prior_epoch
+                    && let Ok(read) = self.evidence_response()
+                {
+                    let _ = self.remember_read_only_predecessor(&read, epoch);
+                }
             }
             PublicationTarget::Stage(stage) => {
                 stage.verify_path()?;
@@ -8776,7 +9935,15 @@ impl Store {
     /// consumers. Only typed UUID/integer pin components enter these SQL literals;
     /// the caller never supplies SQL or a raw revision key.
     fn read_revision(&self, db: &Connection, expected: Option<IndexPin>) -> Result<ReadRevision> {
-        let head = self.read_status(db)?.revision;
+        self.read_revision_for(db, expected, false)
+    }
+    fn read_revision_for(
+        &self,
+        db: &Connection,
+        expected: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<ReadRevision> {
+        let head = self.read_status_for(db, pre_h)?.revision;
         let pin = expected.unwrap_or(head);
         ensure!(
             pin.index_generation == head.index_generation
@@ -8965,6 +10132,13 @@ impl Store {
         leader: &topology::LeaderGuard,
     ) -> Result<Option<u64>> {
         Ok(self.oldest_due_debt_age(leader)?.map(|age| age.as_secs()))
+    }
+
+    /// Pause after a new lock incarnation is durable but before validated
+    /// predecessor metadata is rebound. Integration tests use this seam only.
+    #[doc(hidden)]
+    pub fn set_leader_before_metadata_hook_for_tests(&self, hook: impl FnOnce() + Send + 'static) {
+        self.leader_before_metadata_hook.set(hook);
     }
 
     /// Deterministic rollback after a complete index rebuild but before COMMIT.
@@ -10224,8 +11398,15 @@ impl Store {
         request: &crate::navigation::NavigationRequest,
     ) -> Result<crate::navigation::NavigationResult> {
         request.validate()?;
-        self.with_evidence(|tx| {
-        let selected = self.read_revision(tx, Some(request.expected_revision()))?;
+        self.with_evidence(|tx| self.navigation_in(tx, request, false))
+    }
+    fn navigation_in(
+        &self,
+        tx: &Connection,
+        request: &crate::navigation::NavigationRequest,
+        pre_h: bool,
+    ) -> Result<crate::navigation::NavigationResult> {
+        let selected = self.read_revision_for(tx, Some(request.expected_revision()), pre_h)?;
         let revision = selected.pin;
         // Navigation's source selector counts lines from the stored source BLOB,
         // and its member selector reads versioned class/node rows. Before either
@@ -10259,12 +11440,15 @@ impl Store {
         if let Some(path) = selected_path {
             // Gate allocation of the selected JSON/BLOB before decoding either.
             // This reads only SQLite byte lengths, not every workspace document.
-            let sizes: Option<(i64, i64)> = tx.query_row(
-                "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
+            let sizes: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT length(d.source_bytes),length(d.source_bytes) FROM revision_documents m
                  JOIN document_versions d ON d.id=m.document_version_id
                  WHERE m.revision_id=?2 AND m.path=?1",
-                params![path, selected.key], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
+                    params![path, selected.key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             if let Some((graph_len, native_len)) = sizes {
                 if graph_len > 2 * 1024 * 1024 || native_len > 2 * 1024 * 1024 {
                     return Err(self.report_selected_failure(
@@ -10292,7 +11476,6 @@ impl Store {
             }
         }
         crate::navigation::navigate(tx, request, revision, &selected.key)
-            })
     }
 
     pub fn classes_at(
@@ -10303,7 +11486,20 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<crate::class_diagram::ClassPage> {
-        use crate::class_diagram::{ClassPage, InvalidRequest};
+        self.with_evidence(|tx| self.classes_in(tx, path, query, expected, (offset, limit), false))
+    }
+    fn classes_in(
+        &self,
+        tx: &Connection,
+        path: Option<&str>,
+        query: &str,
+        expected: Option<IndexPin>,
+        pagination: (usize, usize),
+        pre_h: bool,
+    ) -> Result<crate::class_diagram::ClassPage> {
+        use crate::class_diagram::ClassPage;
+        let (offset, limit) = pagination;
+        use crate::class_diagram::InvalidRequest;
         let path = path.filter(|path| !path.is_empty());
         ensure!(
             (1..=100).contains(&limit)
@@ -10323,8 +11519,7 @@ impl Store {
                 InvalidRequest("Choose a workspace-relative class source path.")
             );
         }
-        self.with_evidence(|tx| {
-        let selected_revision = self.read_revision(tx, expected)?;
+        let selected_revision = self.read_revision_for(tx, expected, pre_h)?;
         let revision = selected_revision.pin;
         let (mut warnings, truncated) = class_metadata(tx, &selected_revision)
             .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
@@ -10340,7 +11535,14 @@ impl Store {
             ORDER BY CASE WHEN lower(c.name)=lower(?3) THEN 0 ELSE 1 END,c.qualified_name,c.path,c.id LIMIT ?4 OFFSET ?5")?;
         let ids = stmt
             .query_map(
-                params![path, pattern, query, (limit + 1) as i64, offset as i64, selected_revision.key],
+                params![
+                    path,
+                    pattern,
+                    query,
+                    (limit + 1) as i64,
+                    offset as i64,
+                    selected_revision.key
+                ],
                 |r| r.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -10350,7 +11552,9 @@ impl Store {
         let mut bytes = 0;
         let mut byte_limited = false;
         for id in ids.iter().take(limit) {
-            let Some((class, size, clipped)) = presentation_class(self, tx, id, &selected_revision)? else {
+            let Some((class, size, clipped)) =
+                presentation_class(self, tx, id, &selected_revision)?
+            else {
                 // Consume an individually oversized row so pagination always progresses.
                 consumed += 1;
                 byte_limited = true;
@@ -10386,9 +11590,12 @@ impl Store {
         {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM revision_documents WHERE revision_id=?2 AND path=?1)",
-                params![selected, selected_revision.key], |r| r.get(0),
+                params![selected, selected_revision.key],
+                |r| r.get(0),
             )?;
-            if exists { paths.insert(selected); }
+            if exists {
+                paths.insert(selected);
+            }
         }
         self.attest_selected_classes_for(tx, &paths, &selected_revision)?;
         Ok(ClassPage {
@@ -10399,60 +11606,76 @@ impl Store {
             warnings,
             require_index: false,
         })
-            })
     }
+
     /// Bounded one-hop relation reads and seed resolution share a revision-pinned
     /// read transaction. No filesystem access or graph/provider augmentation.
     pub fn class_diagram_at(
         &self,
         request: &crate::class_diagram::ClassDiagramRequest,
     ) -> Result<crate::class_diagram::ClassDiagram> {
-        use crate::class_diagram::{self, InvalidRequest};
         request.validate()?;
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, Some(request.expected_revision))?;
-            let revision = selected.pin;
-            let (warnings, truncated) = class_metadata(tx, &selected)
-                .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
-            let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
-            // Explicitly selected measured declarations are independent roots, never
-            // connected by lexical type-name matches or candidate relationships.
-            let mut seeds = vec![seed.symbol.id.clone()];
-            let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
-            for expanded in &request.expanded {
-                let (class, _) = resolve_class(self, tx, expanded, &selected)?;
-                if !classes.contains_key(&class.symbol.id) {
-                    ensure!(
-                        classes.len() < class_diagram::MAX_NODES,
-                        InvalidRequest("Too many selected classes.")
-                    );
-                    seeds.push(class.symbol.id.clone());
-                    classes.insert(class.symbol.id.clone(), class);
-                }
-            }
-            let paths: BTreeSet<_> = classes
-                .values()
-                .map(|class| class.symbol.path.as_str())
-                .collect();
-            self.attest_selected_classes_for(tx, &paths, &selected)?;
-            class_diagram::project(
-                revision,
-                &seeds,
-                &classes,
-                vec![],
-                vec![],
-                warnings,
-                truncated || clipped,
-            )
-        })
+        self.with_evidence(|tx| self.class_diagram_in(tx, request, false))
     }
+    fn class_diagram_in(
+        &self,
+        tx: &Connection,
+        request: &crate::class_diagram::ClassDiagramRequest,
+        pre_h: bool,
+    ) -> Result<crate::class_diagram::ClassDiagram> {
+        use crate::class_diagram::{self, InvalidRequest};
+        let selected = self.read_revision_for(tx, Some(request.expected_revision), pre_h)?;
+        let revision = selected.pin;
+        let (warnings, truncated) = class_metadata(tx, &selected)
+            .map_err(|error| self.report_selected_failure(selected_integrity(error)))?;
+        let (seed, clipped) = resolve_class(self, tx, &request.seed, &selected)?;
+        // Explicitly selected measured declarations are independent roots, never
+        // connected by lexical type-name matches or candidate relationships.
+        let mut seeds = vec![seed.symbol.id.clone()];
+        let mut classes = BTreeMap::from([(seed.symbol.id.clone(), seed)]);
+        for expanded in &request.expanded {
+            let (class, _) = resolve_class(self, tx, expanded, &selected)?;
+            if !classes.contains_key(&class.symbol.id) {
+                ensure!(
+                    classes.len() < class_diagram::MAX_NODES,
+                    InvalidRequest("Too many selected classes.")
+                );
+                seeds.push(class.symbol.id.clone());
+                classes.insert(class.symbol.id.clone(), class);
+            }
+        }
+        let paths: BTreeSet<_> = classes
+            .values()
+            .map(|class| class.symbol.path.as_str())
+            .collect();
+        self.attest_selected_classes_for(tx, &paths, &selected)?;
+        class_diagram::project(
+            revision,
+            &seeds,
+            &classes,
+            vec![],
+            vec![],
+            warnings,
+            truncated || clipped,
+        )
+    }
+
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<Symbol>> {
         Ok(self.symbols_at(query, limit)?.1)
     }
     pub fn symbols_at(&self, query: &str, limit: usize) -> Result<(IndexPin, Vec<Symbol>)> {
         ensure!(query.len() <= 8192, "search query too long");
-        self.with_evidence(|tx| {
-        let revision = self.read_status(tx)?.revision;
+        self.with_evidence(|tx| self.symbols_in(tx, query, limit, false))
+    }
+    fn symbols_in(
+        &self,
+        tx: &Connection,
+        query: &str,
+        limit: usize,
+        pre_h: bool,
+    ) -> Result<(IndexPin, Vec<Symbol>)> {
+        let selected = self.read_revision_for(tx, None, pre_h)?;
+        let revision = selected.pin;
         let selected_paths: BTreeSet<String> = tx.prepare("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=(SELECT 'pin:v1:'||index_generation||':'||index_revision FROM index_metadata WHERE singleton=1) AND m.graph_projection_id=n.projection_id WHERE instr(lower(n.name),lower(?1)) > 0 OR instr(lower(n.id),lower(?1)) > 0 ORDER BY CASE WHEN lower(n.name)=lower(?1) THEN 0 WHEN instr(lower(n.name),lower(?1))=1 THEN 1 ELSE 2 END,n.name,n.id LIMIT ?2")?
             .query_map(params![query,limit.min(150) as i64],|r|r.get::<_,String>(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -10468,11 +11691,11 @@ impl Store {
             .collect::<Result<Vec<Symbol>>>()?;
         let paths: BTreeSet<_> = values.iter().map(|node| node.path.as_str()).collect();
         for path in paths {
-            self.attest_selected_document(tx, path)?;
+            self.attest_selected_document_for(tx, path, &selected)?;
         }
         Ok((revision, values))
-            })
     }
+
     pub fn symbol(&self, id: &str) -> Result<Option<Symbol>> {
         Ok(self.symbol_at(id, None)?.map(|(_, v)| v))
     }
@@ -10484,19 +11707,32 @@ impl Store {
         id: &str,
         expected_revision: Option<IndexPin>,
     ) -> Result<Option<(IndexPin, Symbol)>> {
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected_revision)?;
-            let revision = selected.pin;
-            let selected_path: Option<String> = tx
+        self.with_evidence(|tx| self.symbol_in(tx, id, expected_revision, false))
+    }
+    fn symbol_in(
+        &self,
+        tx: &Connection,
+        id: &str,
+        expected_revision: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<(IndexPin, Symbol)>> {
+        let selected = self.read_revision_for(tx, expected_revision, pre_h)?;
+        let revision = selected.pin;
+        let selected_path: Option<String> = tx
                 .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![id, selected.key], |r| r.get(0))
                 .optional()?;
-            if let Some(path) = selected_path {
-                self.attest_selected_document_for(tx, &path, &selected)?;
-            }
-            let node: Option<Symbol> = one_at(tx, "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", id, &selected.key)?;
-            Ok(node.map(|node| (revision, node)))
-        })
+        if let Some(path) = selected_path {
+            self.attest_selected_document_for(tx, &path, &selected)?;
+        }
+        let node: Option<Symbol> = one_at(
+            tx,
+            "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1",
+            id,
+            &selected.key,
+        )?;
+        Ok(node.map(|node| (revision, node)))
     }
+
     fn selected_source_row_for(
         &self,
         db: &Connection,
@@ -10652,6 +11888,52 @@ impl Store {
         }
         Ok((revision, workspace_root))
     }
+    fn tree_metadata_in(
+        &self,
+        tx: &Connection,
+        root: &Path,
+        items: &mut [crate::file_tree::Entry],
+        pre_h: bool,
+    ) -> Result<(IndexPin, String, TreeOverlays)> {
+        let revision = self.read_status_for(tx, pre_h)?.revision;
+        let workspace = Path::new(&self.workspace_root);
+        let mut valid_stmt = tx.prepare(
+                "SELECT NOT EXISTS(SELECT 1 FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND json_valid(n.payload)=0) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+            )?;
+        let mut count_stmt = tx.prepare(
+                "SELECT (SELECT count(*) FROM graph_nodes n WHERE n.projection_id=m.graph_projection_id AND CASE WHEN json_valid(n.payload) THEN json_extract(n.payload,'$.kind') IN ('function','method') ELSE 0 END) FROM revision_documents m JOIN index_metadata active_manifest ON active_manifest.singleton=1 AND m.revision_id='pin:v1:'||active_manifest.index_generation||':'||active_manifest.index_revision WHERE m.path=?1",
+            )?;
+        let mut overlays = Vec::new();
+        for (index, item) in items
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.kind == "file")
+        {
+            let absolute = root.join(&item.path);
+            let Ok(relative) = absolute.strip_prefix(workspace) else {
+                continue;
+            };
+            let Some(relative) = relative.to_str() else {
+                continue;
+            };
+            let valid: Option<bool> = valid_stmt
+                .query_row([relative], |row| row.get(0))
+                .optional()
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            let Some(valid) = valid else { continue };
+            if !valid {
+                return Err(self.report_selected_failure(
+                    SelectedIntegrity("incompatible_index: selected tree node JSON invalid".into())
+                        .into(),
+                ));
+            }
+            let count: i64 = count_stmt
+                .query_row([relative], |row| row.get(0))
+                .map_err(|error| self.report_selected_failure(error.into()))?;
+            overlays.push((index, relative.to_owned(), usize::try_from(count)?));
+        }
+        Ok((revision, self.workspace_root.clone(), overlays))
+    }
     pub fn files_at(
         &self,
         expected: Option<IndexPin>,
@@ -10662,76 +11944,91 @@ impl Store {
             (1..=200).contains(&limit) && offset <= i64::MAX as usize,
             "invalid catalog pagination"
         );
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected)?;
-            let revision = selected.pin;
-            let mut stmt = tx.prepare(
-                "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
+        self.with_evidence(|tx| self.files_in(tx, expected, offset, limit, false))
+    }
+    fn files_in(
+        &self,
+        tx: &Connection,
+        expected: Option<IndexPin>,
+        offset: usize,
+        limit: usize,
+        pre_h: bool,
+    ) -> Result<serde_json::Value> {
+        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let revision = selected.pin;
+        let mut stmt = tx.prepare(
+            "SELECT m.path,d.language,m.graph_projection_id FROM revision_documents m
                  JOIN document_versions d ON d.id=m.document_version_id
                  WHERE m.revision_id=?3 ORDER BY m.path LIMIT ?1 OFFSET ?2",
-            )?;
-            let source_rows: Vec<(String, String, String)> = stmt
-                .query_map(
-                    params![(limit + 1) as i64, offset as i64, selected.key],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )?
-                .collect::<rusqlite::Result<_>>()?;
-            let mut items = Vec::new();
-            for (path, language, projection_id) in source_rows {
-                self.attest_selected_document_for(tx, &path, &selected)?;
-                let methods: i64 = tx.query_row(
-                    "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
+        )?;
+        let source_rows: Vec<(String, String, String)> = stmt
+            .query_map(
+                params![(limit + 1) as i64, offset as i64, selected.key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut items = Vec::new();
+        for (path, language, projection_id) in source_rows {
+            self.attest_selected_document_for(tx, &path, &selected)?;
+            let methods: i64 = tx.query_row(
+                "SELECT count(*) FROM graph_nodes WHERE projection_id=?1
                     AND json_extract(payload,'$.kind') IN ('function','method')",
-                    [&projection_id],
-                    |r| r.get(0),
-                )?;
-                items.push(
-                    serde_json::json!({"path":path,"language":language,"methodCount":methods}),
-                );
-            }
-            let next = (items.len() > limit).then_some(offset + limit);
-            items.truncate(limit);
-            Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
-        })
+                [&projection_id],
+                |r| r.get(0),
+            )?;
+            items.push(serde_json::json!({"path":path,"language":language,"methodCount":methods}));
+        }
+        let next = (items.len() > limit).then_some(offset + limit);
+        items.truncate(limit);
+        Ok(serde_json::json!({"revision":revision,"items":items,"nextOffset":next}))
     }
+
     pub fn methods_at(
         &self,
         path: &str,
         expected: Option<IndexPin>,
     ) -> Result<Option<serde_json::Value>> {
-        self.with_evidence(|tx| {
-            let selected = self.read_revision(tx, expected)?;
-            let revision = selected.pin;
-            let projection_id: Option<String> = tx
-                .query_row(
-                    "SELECT m.graph_projection_id FROM revision_documents m
+        self.with_evidence(|tx| self.methods_in(tx, path, expected, false))
+    }
+    fn methods_in(
+        &self,
+        tx: &Connection,
+        path: &str,
+        expected: Option<IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let selected = self.read_revision_for(tx, expected, pre_h)?;
+        let revision = selected.pin;
+        let projection_id: Option<String> = tx
+            .query_row(
+                "SELECT m.graph_projection_id FROM revision_documents m
                      WHERE m.revision_id=?2 AND m.path=?1",
-                    params![path, selected.key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(projection_id) = projection_id else {
-                return Ok(None);
-            };
-            self.attest_selected_document_for(tx, path, &selected)?;
-            let mut stmt = tx.prepare(
-                "SELECT payload FROM graph_nodes WHERE projection_id=?1
+                params![path, selected.key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(projection_id) = projection_id else {
+            return Ok(None);
+        };
+        self.attest_selected_document_for(tx, path, &selected)?;
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM graph_nodes WHERE projection_id=?1
                 AND json_extract(payload,'$.kind') IN ('function','method')
                 ORDER BY json_extract(payload,'$.range.startByte'),id LIMIT 1001",
-            )?;
-            let mut items = Vec::new();
-            for payload in stmt.query_map([&projection_id], |r| r.get::<_, String>(0))? {
-                let symbol: Symbol = serde_json::from_str(&payload?)?;
-                items.push(serde_json::json!({"symbol":symbol,"consequential":true,
+        )?;
+        let mut items = Vec::new();
+        for payload in stmt.query_map([&projection_id], |r| r.get::<_, String>(0))? {
+            let symbol: Symbol = serde_json::from_str(&payload?)?;
+            items.push(serde_json::json!({"symbol":symbol,"consequential":true,
                     "reason":"Conservative heuristic: retained; triviality is not proven"}));
-            }
-            let truncated = items.len() > 1000;
-            items.truncate(1000);
-            Ok(Some(
-                serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
-            ))
-        })
+        }
+        let truncated = items.len() > 1000;
+        items.truncate(1000);
+        Ok(Some(
+            serde_json::json!({"revision":revision,"items":items,"truncated":truncated}),
+        ))
     }
+
     /// Only cached source and measured calls from the same snapshot are used.
     pub fn sequence_at(
         &self,
@@ -10739,45 +12036,53 @@ impl Store {
         expected: IndexPin,
         show_all: bool,
     ) -> Result<Option<crate::behavior::SequenceView>> {
-        self.with_evidence(|tx| {
-            let selected_revision = self.read_revision(tx, Some(expected))?;
-            let revision = selected_revision.pin;
-            let selected: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
+        self.with_evidence(|tx| self.sequence_in(tx, seed, expected, show_all, false))
+    }
+    fn sequence_in(
+        &self,
+        tx: &Connection,
+        seed: &str,
+        expected: IndexPin,
+        show_all: bool,
+        pre_h: bool,
+    ) -> Result<Option<crate::behavior::SequenceView>> {
+        let selected_revision = self.read_revision_for(tx, Some(expected), pre_h)?;
+        let revision = selected_revision.pin;
+        let selected: Option<(String, String)> = tx
+            .query_row(
+                "SELECT n.path,n.projection_id FROM graph_nodes n JOIN revision_documents m
                  ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id
                  WHERE n.id=?1",
-                    params![seed, selected_revision.key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let Some((path, graph_id)) = selected else {
-                return Ok(None);
-            };
-            self.attest_selected_document_for(tx, &path, &selected_revision)?;
-            let payload: String = tx.query_row(
-                "SELECT payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
-                params![graph_id, seed],
-                |r| r.get(0),
-            )?;
-            let symbol: Symbol = serde_json::from_str(&payload)?;
-            ensure!(
-                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
-                "invalid sequence symbol kind"
-            );
-            let file = self
-                .selected_source_row_for(tx, &path, &selected_revision)?
-                .context("sequence source missing")?;
-            let mut stmt = tx.prepare(
-                "SELECT payload FROM graph_calls WHERE projection_id=?1
+                params![seed, selected_revision.key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((path, graph_id)) = selected else {
+            return Ok(None);
+        };
+        self.attest_selected_document_for(tx, &path, &selected_revision)?;
+        let payload: String = tx.query_row(
+            "SELECT payload FROM graph_nodes WHERE projection_id=?1 AND id=?2",
+            params![graph_id, seed],
+            |r| r.get(0),
+        )?;
+        let symbol: Symbol = serde_json::from_str(&payload)?;
+        ensure!(
+            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method),
+            "invalid sequence symbol kind"
+        );
+        let file = self
+            .selected_source_row_for(tx, &path, &selected_revision)?
+            .context("sequence source missing")?;
+        let mut stmt = tx.prepare(
+            "SELECT payload FROM graph_calls WHERE projection_id=?1
                 ORDER BY json_extract(payload,'$.range.startByte'),id",
-            )?;
-            let calls: Vec<CallSite> = stmt
-                .query_map([&graph_id], |r| r.get::<_, String>(0))?
-                .map(|payload| Ok(serde_json::from_str(&payload?)?))
-                .collect::<Result<_>>()?;
-            crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
-        })
+        )?;
+        let calls: Vec<CallSite> = stmt
+            .query_map([&graph_id], |r| r.get::<_, String>(0))?
+            .map(|payload| Ok(serde_json::from_str(&payload?)?))
+            .collect::<Result<_>>()?;
+        crate::behavior::build_sequence(revision, &symbol, &file, &calls, show_all).map(Some)
     }
 
     fn read_graph_for(&self, db: &Connection, selected: &ReadRevision) -> Result<Graph> {
@@ -10936,7 +12241,16 @@ impl Store {
         query: &ViewQuery,
         expected_pin: Option<&IndexPin>,
     ) -> Result<Option<ViewResult>> {
-        let selected = self.read_revision(tx, expected_pin.copied())?;
+        self.query_view_in_for(tx, query, expected_pin, false)
+    }
+    fn query_view_in_for(
+        &self,
+        tx: &Connection,
+        query: &ViewQuery,
+        expected_pin: Option<&IndexPin>,
+        pre_h: bool,
+    ) -> Result<Option<ViewResult>> {
+        let selected = self.read_revision_for(tx, expected_pin.copied(), pre_h)?;
         let revision = selected.pin;
         let selected_path: Option<String> = tx
             .query_row("SELECT n.path FROM graph_nodes n JOIN revision_documents m ON m.revision_id=?2 AND m.graph_projection_id=n.projection_id WHERE n.id=?1", params![query.seed, selected.key], |r| {
@@ -11019,8 +12333,13 @@ impl Store {
         Ok(())
     }
 
-    fn selected_anchor_in(db: &Connection, store: &Self, target: &str) -> Result<DurableAnchor> {
-        let revision = store.read_revision(db, None)?;
+    fn selected_anchor_in(
+        db: &Connection,
+        store: &Self,
+        target: &str,
+        pre_h: bool,
+    ) -> Result<DurableAnchor> {
+        let revision = store.read_revision_for(db, None, pre_h)?;
         let selected: Option<(String, String)> = db
             .query_row(
                 "SELECT m.language,m.path FROM native_version_declarations d
@@ -11111,8 +12430,9 @@ impl Store {
         store: &Self,
         view: SavedViewRecord,
         pin: Option<IndexPin>,
+        pre_h: bool,
     ) -> Result<SavedViewState> {
-        let selected = store.read_revision(db, pin)?;
+        let selected = store.read_revision_for(db, pin, pre_h)?;
         let ids: BTreeSet<&String> = std::iter::once(&view.query.seed)
             .chain(view.pins.keys())
             .chain(view.hidden.iter())
@@ -11188,7 +12508,7 @@ impl Store {
         let pin = Self::saved_pin(&response, expected_pin)?;
         let states = views
             .into_iter()
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
             .collect::<Result<Vec<_>>>()?;
         self.finish_saved(&response, states)
     }
@@ -11211,7 +12531,7 @@ impl Store {
         };
         let pin = Self::saved_pin(&response, expected_pin)?;
         let state = view
-            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin)))
+            .map(|view| Self::resolve_view(&response.db, self, view, Some(pin), false))
             .transpose()?;
         self.finish_saved(&response, state)
     }
@@ -11234,11 +12554,12 @@ impl Store {
                     &response.db,
                     self,
                     &view.query.seed,
+                    false,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        let state = Self::resolve_view(&response.db, self, record, Some(pin))?;
+        let state = Self::resolve_view(&response.db, self, record, Some(pin), false)?;
         self.finish_saved(&response, state)
     }
     pub fn delete_view(&self, id: &str) -> Result<bool> {
@@ -11255,8 +12576,9 @@ impl Store {
         store: &Self,
         annotation: AnnotationRecord,
         pin: Option<IndexPin>,
+        pre_h: bool,
     ) -> Result<AnnotationState> {
-        let selected = store.read_revision(db, pin)?;
+        let selected = store.read_revision_for(db, pin, pre_h)?;
         let attachment =
             Self::anchor_attachment(db, store, annotation.anchor.as_deref(), &selected)?;
         let orphaned = attachment
@@ -11301,7 +12623,7 @@ impl Store {
         let pin = Self::saved_pin(&response, expected_pin)?;
         let states = annotations
             .into_iter()
-            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin)))
+            .map(|item| Self::resolve_annotation(&response.db, self, item, Some(pin), false))
             .collect::<Result<Vec<_>>>()?;
         self.finish_saved(&response, states)
     }
@@ -11335,11 +12657,12 @@ impl Store {
                     &response.db,
                     self,
                     &request.node_id,
+                    false,
                 )?)
                 .map_err(Into::into)
             },
         )?;
-        let state = Self::resolve_annotation(&response.db, self, record, Some(pin))?;
+        let state = Self::resolve_annotation(&response.db, self, record, Some(pin), false)?;
         self.finish_saved(&response, state)
     }
     pub fn delete_annotation(&self, id: &str) -> Result<bool> {
@@ -11427,6 +12750,151 @@ mod selected_manifest_query_plan_tests {
             !plan.iter().any(|step| step.starts_with("SCAN r")),
             "changing manifest scanned all revision headers: {plan:?}"
         );
+    }
+
+    #[test]
+    fn restricted_owner_uses_latest_committed_same_owner_head_without_selected_read() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("A.java");
+        fs::write(&source, "class A { int a() { return 1; } }\n").unwrap();
+        let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+        let options = IndexOptions::new(work.path().to_owned());
+        IndexJobCoordinator::prepare(&store, None)
+            .unwrap()
+            .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        let owner = store.leader_session().unwrap();
+        let epoch = Arc::new(AtomicU64::new(1));
+        store.bind_runtime_epoch(epoch.clone());
+        let a = store.evidence_response().unwrap();
+        store.remember_read_only_predecessor(&a, epoch).unwrap();
+        a.finish(()).unwrap();
+        drop(a);
+        fs::write(&source, "class A { int b() { return 2; } }\n").unwrap();
+        let b = IndexJobCoordinator::prepare_with_session(&store, None, owner.clone())
+            .unwrap()
+            .run_serving(&options, &Arc::new(AtomicBool::new(false)), |_| {})
+            .unwrap();
+        assert_eq!(
+            store
+                .read_only_predecessor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pin,
+            b
+        );
+        drop(owner);
+        let at = store.clone();
+        store.set_leader_before_metadata_hook_for_tests(move || {
+            let read = at
+                .restricted_predecessor_read()
+                .expect("latest B must be readable under proved successor EX");
+            assert_eq!(read.status().unwrap().revision, b);
+            assert!(read.require_mutation_ready().is_err());
+            read.finish(()).unwrap();
+        });
+        let new_owner = store.leader_session().unwrap();
+        assert!(store.verify_reconciled_leader_claim(&new_owner).is_err());
+    }
+
+    #[test]
+    fn restricted_owner_refuses_missing_corrupt_and_intervening_predecessors() {
+        use crate::index_coordinator::IndexJobCoordinator;
+        use crate::indexer::IndexOptions;
+        use std::{fs, sync::atomic::AtomicBool};
+
+        for damaged in [
+            "missing_marker",
+            "wrong_pin",
+            "intervening_owner",
+            "root_replaced",
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let work = tempfile::tempdir().unwrap();
+            fs::write(
+                work.path().join("A.java"),
+                "class A { int old() { return 1; } }\n",
+            )
+            .unwrap();
+            let initial = Store::open_for_tests(state.path(), work.path()).unwrap();
+            IndexJobCoordinator::prepare(&initial, None)
+                .unwrap()
+                .run(
+                    &IndexOptions::new(work.path().to_owned()),
+                    &Arc::new(AtomicBool::new(false)),
+                    |_| {},
+                )
+                .unwrap();
+            let incumbent = initial.leader_session().unwrap();
+            drop(initial);
+            let store = Store::open_for_tests(state.path(), work.path()).unwrap();
+            let evidence = store.evidence_response().unwrap();
+            store
+                .remember_read_only_predecessor(&evidence, Arc::new(AtomicU64::new(1)))
+                .unwrap();
+            drop(evidence);
+            drop(incumbent);
+            match damaged {
+                "missing_marker" => {
+                    store
+                        .cache_write()
+                        .unwrap()
+                        .execute("UPDATE index_metadata SET reconciled_incarnation=NULL", [])
+                        .unwrap();
+                }
+                "wrong_pin" => {
+                    store
+                        .cache_write()
+                        .unwrap()
+                        .execute("UPDATE index_metadata SET index_revision=0", [])
+                        .unwrap();
+                }
+                "intervening_owner" => {
+                    let intermediate = store.leader_session().unwrap();
+                    assert!(store.restricted_owner_associated());
+                    drop(intermediate);
+                    assert!(
+                        !store.restricted_owner_associated(),
+                        "abandoned EX remained held"
+                    );
+                }
+                "root_replaced" => {
+                    fs::rename(work.path(), work.path().with_extension("old")).unwrap();
+                    fs::create_dir(work.path()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let probe = store.clone();
+            let hook_seen = Arc::new(AtomicBool::new(false));
+            let seen = hook_seen.clone();
+            store.set_leader_before_metadata_hook_for_tests(move || {
+                seen.store(true, Ordering::Release);
+                assert!(
+                    probe.restricted_predecessor_read().is_err(),
+                    "{damaged}: unproved head was admitted before metadata validation"
+                );
+            });
+            let outcome = store.leader_session();
+            if damaged == "root_replaced" {
+                assert!(outcome.is_err());
+                assert!(!store.restricted_owner_associated());
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "{damaged}: second EX acquisition: {outcome:?}"
+                );
+                assert!(
+                    hook_seen.load(Ordering::Acquire),
+                    "{damaged}: metadata hook never ran"
+                );
+            }
+        }
     }
 
     #[test]
@@ -14889,6 +16357,33 @@ mod sqlite_deleted_witness_tests {
         assert!(
             !path.exists(),
             "capacity refusal must precede file creation"
+        );
+    }
+
+    #[test]
+    fn idle_retirement_defers_sqlite_witness_until_last_managed_connection_closes() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
+        let path = store.roots.index_db(&store.identity);
+        let live = open_index(&path, false).unwrap();
+        store.retire_checkout_sqlite_witnesses();
+        assert!(
+            sqlite_witnesses()
+                .lock()
+                .unwrap()
+                .by_path
+                .contains_key(&path),
+            "closing a check FD while SQLite owns an inode drops its process locks"
+        );
+        drop(live);
+        assert!(
+            !sqlite_witnesses()
+                .lock()
+                .unwrap()
+                .by_path
+                .contains_key(&path),
+            "last protected connection completes deferred release"
         );
     }
 

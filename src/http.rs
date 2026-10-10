@@ -32,7 +32,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -227,6 +227,8 @@ pub struct DaemonState {
     origins: Vec<String>,
     jobs: Mutex<Jobs>,
     queue_tick_started: AtomicBool,
+    checkout_runtime_stopped: AtomicBool,
+    checkout_takeover_h_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     maintenance_tick_started: AtomicBool,
     maintenance_telemetry: Mutex<MaintenanceTelemetry>,
     maintenance_error_limiter: Mutex<MaintenanceErrorLimiter>,
@@ -237,12 +239,17 @@ pub struct DaemonState {
     pending_requests: Mutex<Vec<String>>,
     job_progress: Mutex<BTreeMap<String, IndexProgress>>,
     native_stream: Mutex<()>,
+    maintenance_stream: Mutex<()>,
     leader_work: Mutex<
         Option<(
             std::sync::Weak<crate::store::topology::LeaderSession>,
             crate::index_coordinator::LeaderWork,
         )>,
     >,
+    causal_witness: Mutex<Option<Arc<crate::daemon::causal_witness::CausalWitness>>>,
+    causal_runtime: Mutex<Option<std::sync::Weak<crate::daemon::registry::CheckoutRuntime>>>,
+    causal_lineage_ordinal: Arc<AtomicU64>,
+    causal_h_reported: Mutex<Option<(uuid::Uuid, uuid::Uuid, u64)>>,
     recovery_retry_after: Mutex<Option<Instant>>,
     empty_takeover_retry: AtomicBool,
     retention_last_run: Mutex<Instant>,
@@ -390,6 +397,8 @@ pub fn new_with_dependency_options(
         acp,
         packets: Mutex::new(PacketCache::default()),
         queue_tick_started: AtomicBool::new(false),
+        checkout_runtime_stopped: AtomicBool::new(false),
+        checkout_takeover_h_hook: Mutex::new(None),
         maintenance_tick_started: AtomicBool::new(false),
         maintenance_telemetry: Mutex::new(MaintenanceTelemetry::default()),
         maintenance_error_limiter: Mutex::new(MaintenanceErrorLimiter::default()),
@@ -400,7 +409,12 @@ pub fn new_with_dependency_options(
         pending_requests: Mutex::new(Vec::new()),
         job_progress: Mutex::new(BTreeMap::new()),
         native_stream: Mutex::new(()),
+        maintenance_stream: Mutex::new(()),
         leader_work: Mutex::new(None),
+        causal_witness: Mutex::new(None),
+        causal_runtime: Mutex::new(None),
+        causal_lineage_ordinal: Arc::new(AtomicU64::new(0)),
+        causal_h_reported: Mutex::new(None),
         recovery_retry_after: Mutex::new(None),
         empty_takeover_retry: AtomicBool::new(false),
         retention_last_run: Mutex::new(Instant::now()),
@@ -421,6 +435,76 @@ pub fn new_with_dependency_options(
     }))
 }
 impl DaemonState {
+    /// Register a test-only, read-only witness after this checkout activates.
+    /// The reverse edge is weak: release may drop the runtime independently.
+    pub fn set_causal_witness_runtime(
+        &self,
+        reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
+        runtime: std::sync::Weak<crate::daemon::registry::CheckoutRuntime>,
+    ) {
+        *self.causal_witness.lock().unwrap() = Some(reporter);
+        *self.causal_runtime.lock().unwrap() = Some(runtime);
+    }
+
+    /// Called only after queue_tick returned and released its native/work locks.
+    fn report_causal_h_ready(self: &Arc<Self>) {
+        let runtime = self.causal_runtime.lock().unwrap().clone();
+        if let Some(runtime) = runtime.and_then(|runtime| runtime.upgrade()) {
+            runtime.report_causal_h_ready(self);
+        }
+    }
+
+    pub fn causal_lineage_for(
+        &self,
+        session: &Arc<crate::store::topology::LeaderSession>,
+    ) -> Option<crate::daemon::causal_witness::Lineage> {
+        let serving = self.serving_session.lock().unwrap();
+        if !serving
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, session))
+        {
+            return None;
+        }
+        let work = self.leader_work.lock().unwrap();
+        let (owner, scheduler) = work.as_ref()?;
+        owner
+            .upgrade()
+            .filter(|owner| Arc::ptr_eq(owner, session))?;
+        scheduler.causal_lineage()
+    }
+
+    pub fn causal_h_already_reported(
+        &self,
+        lineage: crate::daemon::causal_witness::Lineage,
+    ) -> bool {
+        self.causal_h_reported.lock().unwrap().as_ref()
+            == Some(&(
+                lineage.owner_incarnation,
+                lineage.watch_epoch,
+                lineage.ordinal,
+            ))
+    }
+
+    pub fn emit_causal_h_ready_once(
+        &self,
+        lineage: crate::daemon::causal_witness::Lineage,
+        pin: IndexPin,
+    ) {
+        let Some(reporter) = self.causal_witness.lock().unwrap().clone() else {
+            return;
+        };
+        let key = (
+            lineage.owner_incarnation,
+            lineage.watch_epoch,
+            lineage.ordinal,
+        );
+        let mut reported = self.causal_h_reported.lock().unwrap();
+        if reported.as_ref() != Some(&key) {
+            reporter.h_ready(lineage, pin);
+            *reported = Some(key);
+        }
+    }
+
     pub fn retain_serving_session(
         self: &Arc<Self>,
         session: Arc<crate::store::topology::LeaderSession>,
@@ -433,6 +517,61 @@ impl DaemonState {
         }
         self.start_queue_tick();
     }
+    /// Stop the native stream before idle release; no queue worker may keep
+    /// the old leader or watcher alive after this returns.
+    pub fn release_checkout_runtime(&self) {
+        self.checkout_runtime_stopped.store(true, Ordering::Release);
+        let _stream = self.native_stream.lock().unwrap();
+        let _maintenance = self.maintenance_stream.lock().unwrap();
+        self.replace_serving_session(None);
+        *self.root_loss_session.lock().unwrap() = None;
+    }
+
+    /// A verified owner is available only after its H has committed, or as an
+    /// independently verified follower. A stale follower during takeover is not
+    /// a ready checkout even if its old Arc remains in the runtime.
+    pub fn checkout_serving_owner(&self) -> Option<Arc<crate::store::topology::LeaderSession>> {
+        let owner = self.serving_session.lock().unwrap().clone()?;
+        owner.verify().ok()?;
+        Some(owner)
+    }
+
+    pub fn checkout_root_loss_retired(&self) -> bool {
+        self.store.root_path_replaced().is_ok_and(|lost| lost)
+            && self.serving_session.lock().unwrap().is_none()
+            && self.root_loss_session.lock().unwrap().is_none()
+    }
+
+    /// Deterministically pause a takeover after election but before mandatory H.
+    #[doc(hidden)]
+    pub fn set_checkout_takeover_h_hook_for_tests(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.checkout_takeover_h_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// A pending watcher hint (including the periodic inventory deadline) keeps
+    /// the selected checkout in the catching-up state until its tick acknowledges it.
+    pub fn checkout_watch_pending(&self) -> bool {
+        let pending = {
+            let work = self.leader_work.lock().unwrap();
+            work.as_ref().map(|(_, scheduler)| {
+                let options = self
+                    .store
+                    .recorded_index_options()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| self.options.clone());
+                scheduler.accepted_watch_intent(&options)
+            })
+        };
+        pending.unwrap_or_else(|| {
+            self.serving_session
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|session| session.is_leader())
+        })
+    }
+
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
     #[doc(hidden)]
@@ -486,6 +625,11 @@ impl DaemonState {
                 };
                 let worker = state.clone();
                 let result = tokio::task::spawn_blocking(move || worker.queue_tick()).await;
+                // The witness may read phase only after queue_tick released the
+                // native stream, watcher mutex and any SQLite statement.
+                if result.as_ref().is_ok_and(|outcome| outcome.is_ok()) {
+                    state.report_causal_h_ready();
+                }
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => best_effort_queue_stderr(
@@ -737,6 +881,13 @@ impl DaemonState {
     }
 
     fn maintenance_tick(&self) -> anyhow::Result<()> {
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _lane = self.maintenance_stream.lock().unwrap();
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         use crate::store::MaintenanceOutcome;
         if self.retention_last_run.lock().unwrap().elapsed() < Duration::from_secs(60) {
             return Ok(());
@@ -887,26 +1038,41 @@ impl DaemonState {
     }
 
     fn queue_tick(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(test)]
         self.test_queue_before_stream.run();
         let _stream = self.native_stream.lock().unwrap();
+        if self.checkout_runtime_stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         #[cfg(test)]
         self.test_queue_after_stream.run();
         // The old pathname must not reach a queue probe, recovery attempt or
         // capture after its root identity changes. Retire the watcher with its
         // leader session; the moved spelling opens independently.
         if self.store.root_path_replaced()? {
-            let retained = self.serving_session.lock().unwrap().clone();
-            if let Some(session) = retained.filter(|session| session.is_leader()) {
+            let retained = self
+                .serving_session
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|session| session.is_leader())
+                .or_else(|| self.store.restricted_owner_for_root_loss())
+                .or_else(|| self.store.orphan_root_loss_owner());
+            if let Some(session) = retained {
                 *self.root_loss_session.lock().unwrap() = Some(session);
             }
-            // Drop the watcher and serving owner before a possibly blocked
-            // requests.db write. Keep only the verified old-root EX authority
-            // for the idempotent queued/running -> root_changed transition.
+            // Transfer the sole restricted EX to root-loss authority BEFORE
+            // revoking its selected-read association. Accepted FIFO work must
+            // reach root_changed while an old-owner EX still exists.
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             let authority = self.root_loss_session.lock().unwrap().clone();
             if let Some(session) = authority {
                 self.store.fail_changed_root_requests(&session)?;
+                self.store.clear_orphan_root_loss_owner();
                 *self.root_loss_session.lock().unwrap() = None;
             }
             return Ok(());
@@ -1007,7 +1173,8 @@ impl DaemonState {
         }
         if self.store.is_recreate_pending() && (pending_local || durable_pending) {
             // The native stream excludes the tick while the old owner is removed.
-            // No retained SH guard may enter the nonblocking EX attempt.
+            // A restricted predecessor's EX must not pin exceptional recreation.
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             match self
                 .store
@@ -1037,11 +1204,17 @@ impl DaemonState {
         }
         let retained = self.serving_session.lock().unwrap().clone();
         if self.store.root_path_replaced()? {
-            if let Some(ref session) = retained
-                && session.is_leader()
-            {
+            let root_loss_owner = retained
+                .as_ref()
+                .filter(|session| session.is_leader())
+                .cloned()
+                .or_else(|| self.store.restricted_owner_for_root_loss())
+                .or_else(|| self.store.orphan_root_loss_owner());
+            if let Some(ref session) = root_loss_owner {
                 self.store.fail_changed_root_requests(session)?;
             }
+            self.store.clear_orphan_root_loss_owner();
+            self.store.revoke_restricted_predecessor();
             self.replace_serving_session(None);
             return Ok(());
         }
@@ -1101,23 +1274,49 @@ impl DaemonState {
                             .upgrade()
                             .is_some_and(|owner| Arc::ptr_eq(&owner, session))
                     }) {
-                        *work = Some((
-                            Arc::downgrade(session),
-                            crate::index_coordinator::LeaderWork::new(
-                                &self.store,
-                                session,
-                                &selected_options,
-                            )?,
-                        ));
+                        let mut scheduler = crate::index_coordinator::LeaderWork::new(
+                            &self.store,
+                            session,
+                            &selected_options,
+                        )?;
+                        if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
+                            scheduler.attach_causal_witness(
+                                reporter,
+                                session.incarnation(),
+                                self.causal_lineage_ordinal.clone(),
+                            );
+                        }
+                        *work = Some((Arc::downgrade(session), scheduler));
                     }
                     if let Some((_, scheduler)) = work.as_mut() {
-                        scheduler.reconcile_due(
+                        let accounted = scheduler.reconcile_due(
                             &self.store,
                             session,
                             &selected_options,
                             &Arc::new(AtomicBool::new(false)),
                             false,
                         )?;
+                        // ACK only a verified, acknowledged full inventory.
+                        // Neither a failed FIFO probe nor a newer accepted hint
+                        // can be called settled. The reporter only try_sends here.
+                        if accounted
+                            && let Some(reporter) = self.causal_witness.lock().unwrap().clone()
+                            && !scheduler.accepted_watch_intent(&selected_options)
+                            && matches!(self.store.earliest_unfinished_request(), Ok(None))
+                            && let (Some(lineage), Some(generation), Some(certified_pin)) = (
+                                scheduler.causal_lineage(),
+                                scheduler.accounted_watch_generation(),
+                                scheduler.accounted_watch_pin(),
+                            )
+                            && self.store.verify_leader_session(session).is_ok()
+                            && self
+                                .store
+                                .index_baseline()
+                                .is_ok_and(|pin| pin == certified_pin)
+                            && self.store.verify_leader_session(session).is_ok()
+                        {
+                            reporter.watch_ack(lineage, generation, certified_pin, true);
+                        }
                     }
                 }
             }
@@ -1139,6 +1338,8 @@ impl DaemonState {
                     (|| -> anyhow::Result<Arc<crate::store::topology::LeaderSession>> {
                         match self.store.leader_session() {
                             Ok(session) => {
+                                let mut root_loss_lease =
+                                    self.store.root_loss_owner_lease(&session);
                                 self.store.fail_changed_root_requests(&session)?;
                                 let coordinator =
                                 crate::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -1156,6 +1357,7 @@ impl DaemonState {
                                     &Arc::new(AtomicBool::new(false)),
                                     |_| {},
                                 )?;
+                                root_loss_lease.disarm();
                                 Ok(session)
                             }
                             Err(error)
@@ -1173,6 +1375,9 @@ impl DaemonState {
                             Err(error) => Err(error),
                         }
                     })();
+                // The restricted read association cannot retain a failed EX.
+                // Successful H already replaced it with strict current proof.
+                self.store.revoke_restricted_predecessor();
                 match takeover {
                     Ok(session) if session.is_leader() => {
                         self.replace_serving_session(Some(session));
@@ -1209,6 +1414,7 @@ impl DaemonState {
         self.queue_takeover_attempts.fetch_add(1, Ordering::AcqRel);
         match self.store.leader_session() {
             Ok(session) => {
+                let mut root_loss_lease = self.store.root_loss_owner_lease(&session);
                 // A new EX may not drain FIFO until its mandatory selected-head
                 // reconciliation has completed under this same incarnation.
                 let mut mandatory_reconcile_incomplete = true;
@@ -1233,6 +1439,9 @@ impl DaemonState {
                             session.clone(),
                         )?;
                     let before = self.store.index_baseline()?;
+                    if let Some(hook) = self.checkout_takeover_h_hook.lock().unwrap().take() {
+                        hook();
+                    }
                     if let Err(error) = coordinator.run(
                         &takeover_options,
                         &Arc::new(AtomicBool::new(false)),
@@ -1241,8 +1450,8 @@ impl DaemonState {
                         // No failed pre-COMMIT H (including a virgin-head H)
                         // may claim or terminal-fail Q1. Keep its durable FIFO
                         // row queued and drop this unreconciled EX/session.
-                        self.store.verify_leader_session(&session)?;
                         self.store.fail_changed_root_requests(&session)?;
+                        self.store.verify_leader_session(&session)?;
                         if self.store.index_baseline()? != before {
                             // A possibly committed revision is not inferred
                             // from a transient error; a new owner retries H.
@@ -1262,14 +1471,19 @@ impl DaemonState {
                     // serve. Retain it before drain commits a terminal ACK; a
                     // later drain error may still release it for safe reclamation.
                     self.replace_serving_session(Some(session.clone()));
-                    *self.leader_work.lock().unwrap() = Some((
-                        Arc::downgrade(&session),
-                        crate::index_coordinator::LeaderWork::new(
-                            &self.store,
-                            &session,
-                            &takeover_options,
-                        )?,
-                    ));
+                    let mut scheduler = crate::index_coordinator::LeaderWork::new(
+                        &self.store,
+                        &session,
+                        &takeover_options,
+                    )?;
+                    if let Some(reporter) = self.causal_witness.lock().unwrap().clone() {
+                        scheduler.attach_causal_witness(
+                            reporter,
+                            session.incarnation(),
+                            self.causal_lineage_ordinal.clone(),
+                        );
+                    }
+                    *self.leader_work.lock().unwrap() = Some((Arc::downgrade(&session), scheduler));
                     let processed = crate::index_coordinator::drain_one_request_observed(
                         &self.store,
                         &session,
@@ -1285,6 +1499,7 @@ impl DaemonState {
                     }
                     Ok(Some(processed))
                 })();
+                self.store.revoke_restricted_predecessor();
                 let recorded_completion = if outcome.is_ok() || mandatory_reconcile_incomplete {
                     Ok(false)
                 } else {
@@ -1300,6 +1515,7 @@ impl DaemonState {
                     // Only a completed mandatory inventory or a verified cached
                     // FIFO terminal result may retain this exact EX/session.
                     self.replace_serving_session(Some(session));
+                    root_loss_lease.disarm();
                 } else {
                     // RetryMandatory Ok(None) and every incomplete-H Err drop
                     // even a stale retained follower. No old EX/LeaderWork may
@@ -1471,6 +1687,9 @@ impl From<anyhow::Error> for ApiError {
         })) {
             return Self(StatusCode::CONFLICT, "storage_busy", "Storage is busy");
         }
+        if let Some(directory) = e.downcast_ref::<BrowseDirectoryError>() {
+            return browse_directory_error(&directory.0);
+        }
         if let Some(invalid) = e.downcast_ref::<crate::navigation::InvalidRequest>() {
             Self(
                 StatusCode::BAD_REQUEST,
@@ -1492,6 +1711,14 @@ impl From<anyhow::Error> for ApiError {
                 StatusCode::CONFLICT,
                 "revision_conflict",
                 "The index revision changed",
+            )
+        } else if e.to_string() == "packet_missing" {
+            missing()
+        } else if e.to_string() == "invalid_question_selection" {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_question_selection",
+                "Invalid question or selection",
             )
         } else if e.chain().any(|cause| {
             matches!(
@@ -1590,19 +1817,29 @@ async fn db<T: Send + 'static>(
         })?
         .map_err(Into::into)
 }
-async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) -> Response {
+async fn guard(State(s): State<Arc<DaemonState>>, req: Request, next: Next) -> Response {
+    guard_common(&s.token, &s.hosts, &s.origins, req, next).await
+}
+
+async fn guard_common(
+    token: &str,
+    hosts: &[String],
+    origins: &[String],
+    mut req: Request,
+    next: Next,
+) -> Response {
     let headers = req.headers();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let origin = headers.get(header::ORIGIN);
     let mut response = if headers.get_all(header::HOST).iter().count() != 1
-        || !host.is_some_and(|h| s.hosts.iter().any(|v| v == h))
+        || !host.is_some_and(|h| hosts.iter().any(|v| v == h))
     {
         error(StatusCode::FORBIDDEN, "invalid_host", "Host is not allowed")
     } else if headers.get_all(header::ORIGIN).iter().count() > 1
         || origin.is_some_and(|h| {
             !h.to_str()
                 .ok()
-                .is_some_and(|v| s.origins.iter().any(|o| o == v))
+                .is_some_and(|v| origins.iter().any(|o| o == v))
         })
     {
         error(
@@ -1616,7 +1853,7 @@ async fn guard(State(s): State<Arc<DaemonState>>, mut req: Request, next: Next) 
                 .get(header::AUTHORIZATION)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|h| h.strip_prefix("Bearer "))
-                .is_some_and(|t| bool::from(t.as_bytes().ct_eq(s.token.as_bytes()))))
+                .is_some_and(|t| bool::from(t.as_bytes().ct_eq(token.as_bytes()))))
     {
         error(
             StatusCode::UNAUTHORIZED,
@@ -2221,6 +2458,45 @@ struct TreeQuery {
     #[serde(default = "file_limit")]
     limit: usize,
 }
+#[derive(Debug)]
+struct BrowseDirectoryError(std::io::Error);
+impl std::fmt::Display for BrowseDirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("browse directory unavailable")
+    }
+}
+impl std::error::Error for BrowseDirectoryError {}
+
+fn browse_directory_error(e: &std::io::Error) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => ApiError(
+            StatusCode::NOT_FOUND,
+            "directory_missing",
+            "Directory no longer exists; refresh its parent",
+        ),
+        std::io::ErrorKind::PermissionDenied => ApiError(
+            StatusCode::FORBIDDEN,
+            "directory_forbidden",
+            "Permission denied while listing directory",
+        ),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_directory",
+            "Path must be a real directory; symlink traversal is not allowed",
+        ),
+        _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
+            StatusCode::FORBIDDEN,
+            "symlink_forbidden",
+            "Symlink traversal is not allowed",
+        ),
+        _ => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "directory_error",
+            "Directory could not be read; check permissions and refresh",
+        ),
+    }
+}
+
 async fn tree(
     State(s): State<Arc<DaemonState>>,
     query: Result<Query<TreeQuery>, axum::extract::rejection::QueryRejection>,
@@ -2237,33 +2513,7 @@ async fn tree(
         let (mut items, next_offset, truncated) = s
             .browser
             .list(&q.path, q.offset, q.limit)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => ApiError(
-                    StatusCode::NOT_FOUND,
-                    "directory_missing",
-                    "Directory no longer exists; refresh its parent",
-                ),
-                std::io::ErrorKind::PermissionDenied => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "directory_forbidden",
-                    "Permission denied while listing directory",
-                ),
-                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_directory",
-                    "Path must be a real directory; symlink traversal is not allowed",
-                ),
-                _ if e.raw_os_error() == Some(libc::ELOOP) => ApiError(
-                    StatusCode::FORBIDDEN,
-                    "symlink_forbidden",
-                    "Symlink traversal is not allowed",
-                ),
-                _ => ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "directory_error",
-                    "Directory could not be read; check permissions and refresh",
-                ),
-            })?;
+            .map_err(|e| browse_directory_error(&e))?;
         let (revision, indexed_workspace) = s.store.tree_metadata(&s.browser.root, &mut items)?;
         for item in items
             .iter_mut()
@@ -4248,10 +4498,19 @@ mod serving_holder_tests {
             "127.0.0.1:7331".parse().unwrap(),
         )
         .unwrap();
-        state.retain_serving_session(owner);
+        state.retain_serving_session_without_tick_for_tests(owner);
         let accepted = store.enqueue_request(&options, None).unwrap();
         store.fail_next_live_publish_commit_busy();
+        let retry_started = Instant::now();
         state.queue_tick().unwrap();
+        let retry_finished = Instant::now();
+        let scheduled_retry = *state.recovery_retry_after.lock().unwrap();
+        assert!(
+            scheduled_retry.is_some_and(|when| {
+                when >= retry_started && when <= retry_finished + Duration::from_millis(250)
+            }),
+            "BUSY requeue must schedule its bounded 250ms retry"
+        );
         let deferred = store.request_by_id(&accepted.id).unwrap().unwrap();
         assert_eq!(
             (deferred.seq, deferred.state.as_str()),
@@ -4259,13 +4518,8 @@ mod serving_holder_tests {
         );
         assert!(deferred.finished_at.is_none() && deferred.error_code.is_none());
         assert_eq!(store.index_baseline().unwrap(), old_pin);
-        assert!(
-            state
-                .recovery_retry_after
-                .lock()
-                .unwrap()
-                .is_some_and(|when| when > Instant::now())
-        );
+        *state.recovery_retry_after.lock().unwrap() =
+            Some(Instant::now() + Duration::from_secs(10));
         state.queue_tick().unwrap();
         assert_eq!(
             store.request_by_id(&accepted.id).unwrap().unwrap().state,
@@ -6642,5 +6896,1312 @@ mod maintenance_telemetry_tests {
         assert!(age >= 2_000 && max >= 2_000);
         assert_eq!((stats.successful_units, stats.preemptions), (1, 1));
         assert!(stats.deferred_since.is_none());
+    }
+}
+
+/// The socket-only daemon has no HTTP state. This router is constructed only
+/// after a validated explicit serve registration binds a loopback listener.
+type SelectedResponseHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct ProvisionedBrowser {
+    registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+    token: String,
+    hosts: Vec<String>,
+    origins: Vec<String>,
+    response_hook: Arc<Mutex<Option<SelectedResponseHook>>>,
+}
+
+impl ProvisionedBrowser {
+    pub fn new(
+        registry: Arc<tokio::sync::Mutex<crate::daemon::registry::CheckoutRegistry>>,
+        token: String,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            address.ip().is_loopback() && address.port() != 0,
+            "bound loopback address required"
+        );
+        anyhow::ensure!(valid_token(&token), "invalid bearer token");
+        let hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+        let origins = hosts.iter().map(|host| format!("http://{host}")).collect();
+        Ok(Self {
+            registry,
+            token,
+            hosts,
+            origins,
+            response_hook: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn set_selected_response_hook_for_tests(&self, hook: SelectedResponseHook) {
+        *self.response_hook.lock().unwrap() = Some(hook);
+    }
+
+    pub fn router(self) -> Router {
+        let state = Arc::new(self);
+        Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        include_str!("../web/index.html"),
+                    )
+                }),
+            )
+            .route(
+                "/app.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/app.js"),
+                    )
+                }),
+            )
+            .route(
+                "/shell.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/shell.js"),
+                    )
+                }),
+            )
+            .route(
+                "/style.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/style.css"),
+                    )
+                }),
+            )
+            .route(
+                "/classes.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/classes.js"),
+                    )
+                }),
+            )
+            .route(
+                "/classes.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/classes.css"),
+                    )
+                }),
+            )
+            .route(
+                "/navigation.css",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                        include_str!("../web/navigation.css"),
+                    )
+                }),
+            )
+            .route(
+                "/navigation.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/navigation.js"),
+                    )
+                }),
+            )
+            .route(
+                "/sequence.js",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                        include_str!("../web/sequence.js"),
+                    )
+                }),
+            )
+            .route(
+                "/fonts/jetbrains-mono-latin.woff2",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "font/woff2")],
+                        &include_bytes!("../web/fonts/jetbrains-mono-latin.woff2")[..],
+                    )
+                }),
+            )
+            .route(
+                "/fonts/space-grotesk-latin.woff2",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "font/woff2")],
+                        &include_bytes!("../web/fonts/space-grotesk-latin.woff2")[..],
+                    )
+                }),
+            )
+            .route(
+                "/fonts/JetBrainsMono-OFL.txt",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        include_str!("../web/fonts/JetBrainsMono-OFL.txt"),
+                    )
+                }),
+            )
+            .route(
+                "/fonts/SpaceGrotesk-OFL.txt",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        include_str!("../web/fonts/SpaceGrotesk-OFL.txt"),
+                    )
+                }),
+            )
+            .route("/favicon.ico", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({"ok":true,"version":env!("CARGO_PKG_VERSION")})) }),
+            )
+            .route(
+                "/api/checkouts",
+                get(|State(state): State<Arc<Self>>| async move {
+                    Json(json!({"checkouts":state.registry.lock().await.browser_checkouts()}))
+                }),
+            )
+            .route(
+                "/api/daemon/status",
+                get(|State(state): State<Arc<Self>>| async move {
+                    let registry = state.registry.lock().await;
+                    Json(json!({"activeCheckouts":registry.active_count()}))
+                }),
+            )
+            .route(
+                "/api/checkouts/{root_key}/{*suffix}",
+                get(provisioned_core)
+                    .post(provisioned_core)
+                    .put(provisioned_core)
+                    .delete(provisioned_core),
+            )
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                provision_guard,
+            ))
+            .with_state(state)
+    }
+}
+
+async fn provision_guard(
+    State(state): State<Arc<ProvisionedBrowser>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    guard_common(&state.token, &state.hosts, &state.origins, req, next).await
+}
+
+/// The provisioned listener has one selection boundary for core checkout routes.
+/// The direct single-checkout router stays available to standalone clients.
+async fn provisioned_core(
+    State(browser): State<Arc<ProvisionedBrowser>>,
+    Path((root_key, suffix)): Path<(String, String)>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
+    use crate::daemon::registry::SelectionError;
+    let identity = {
+        let mut registry = browser.registry.lock().await;
+        match registry.browser_identity(&root_key) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                return browser_selection_error(reason);
+            }
+        }
+    };
+    let root = identity.root.to_string_lossy().to_string();
+    let runtime = {
+        let mut registry = browser.registry.lock().await;
+        match registry.browser_request_at(&identity, Instant::now()) {
+            Ok(_) => registry.activate(&root_key).map_err(|_| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store_unavailable",
+                    "Storage is unavailable",
+                )
+            }),
+            Err(SelectionError::CheckoutCapacity) => Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "checkout_capacity",
+                "Checkout capacity reached",
+            )),
+            Err(error) => Err(ApiError::from(anyhow::anyhow!("{}", error.reason()))),
+        }
+    };
+    let answer: Result<(Response, bool), ApiError> = match runtime {
+        Err(error) => Err(error),
+        Ok(runtime) => {
+            let hook = browser.response_hook.lock().unwrap().clone();
+            let result =
+                provisioned_core_answer(&runtime, &method, &suffix, &uri, body, hook.clone()).await;
+            if let Some(hook) = hook {
+                hook("after_handler");
+            }
+            result
+        }
+    };
+    let (mut response, catching_up) = match answer {
+        Ok(pair) => pair,
+        Err(error) => {
+            let catching_up = browser
+                .registry
+                .lock()
+                .await
+                .runtime(&root_key)
+                .is_none_or(|runtime| runtime.catching_up());
+            (error.into_response(), catching_up)
+        }
+    };
+    if identity.verify_readonly().is_err() {
+        let outcome = response
+            .headers()
+            .get("X-Baleyg-Mutation-Outcome")
+            .and_then(|value| value.to_str().ok());
+        response = match outcome {
+            Some(outcome) => selected_mutation_error(
+                ApiError(
+                    StatusCode::CONFLICT,
+                    "root_changed",
+                    "Selected checkout changed",
+                ),
+                outcome,
+            ),
+            None => ApiError::from(anyhow::anyhow!("root_changed: selected checkout changed"))
+                .into_response(),
+        };
+    }
+    if let Ok(value) = root.parse() {
+        response.headers_mut().insert("X-Baleyg-Workspace", value);
+    }
+    response.headers_mut().insert(
+        "X-Baleyg-Catching-Up",
+        if catching_up { "true" } else { "false" }.parse().unwrap(),
+    );
+    response
+}
+
+fn browser_selection_error(reason: crate::daemon::registry::SelectionError) -> Response {
+    let status = match reason {
+        crate::daemon::registry::SelectionError::NotCheckout
+        | crate::daemon::registry::SelectionError::NotAbsolute => StatusCode::BAD_REQUEST,
+        crate::daemon::registry::SelectionError::IdentityChanged => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(json!({"error":{"code":"workspace_selection_failed", "reason":reason.reason(), "message":"Checkout selection failed"}}))).into_response()
+}
+
+async fn selected_evidence<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, ApiError::from).await
+}
+
+async fn selected_question<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(T, bool), ApiError> {
+    selected_evidence_map(runtime, hook, work, question_error).await
+}
+
+async fn selected_evidence_map<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+    map_error: fn(anyhow::Error) -> ApiError,
+) -> Result<(T, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        let result = work(&response)?;
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        Ok::<_, anyhow::Error>((response.finish(result)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(map_error)
+}
+
+async fn selected_provider_read<T: Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<(T, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response().map_err(ApiError::from)?;
+        let value = work(&response)?;
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        Ok((response.finish(value).map_err(ApiError::from)?, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+}
+
+fn selected_catalog(
+    state: &DaemonState,
+    revision: IndexPin,
+    id: &str,
+) -> Result<Arc<Catalog>, ApiError> {
+    state
+        .catalog_snapshot(revision)
+        .filter(|catalog| catalog.id == id)
+        .ok_or_else(dependency_stale)
+}
+
+async fn selected_provider_preflight(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    packet_id: Option<String>,
+) -> Result<(Option<Arc<QuestionPacket>>, IndexPin, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response().map_err(question_error)?;
+        response.require_mutation_ready().map_err(question_error)?;
+        let revision = response.status().map_err(question_error)?.revision;
+        let packet = if let Some(id) = packet_id {
+            let state = runtime.browser_scheduler().map_err(question_error)?;
+            let packet = state
+                .packets
+                .lock()
+                .unwrap()
+                .packets
+                .iter()
+                .find(|(packet, _)| packet.packet_id == id)
+                .map(|(packet, _)| packet.clone())
+                .ok_or_else(missing)?;
+            if packet.revision != revision {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "revision_conflict",
+                    "The index revision changed",
+                ));
+            }
+            response
+                .validate_selected_view(&packet.context, &packet.source_files)
+                .map_err(question_error)?;
+            Some(packet)
+        } else {
+            None
+        };
+        response.finish(()).map_err(question_error)?;
+        if let Some(hook) = hook {
+            hook("before_mutation");
+        }
+        response.finish(()).map_err(question_error)?;
+        Ok((packet, revision, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+}
+
+async fn selected_provider_postflight(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    revision: IndexPin,
+) -> Result<(), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, _) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        anyhow::ensure!(
+            response.status()?.revision == revision,
+            "revision conflict: provider basis changed"
+        );
+        response.finish(())
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(ApiError::from)
+}
+
+fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
+    let mut response = (
+        error.0,
+        Json(json!({
+            "error": {"code": error.1, "message": error.2},
+            "mutationOutcome": outcome
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+    response
+}
+
+/// Only a strict current head grants sidecar write eligibility. Once the
+/// sidecar is called, later failures carry an explicit committed/unknown
+/// outcome; they cannot claim that the write was rolled back.
+async fn selected_mutation<T: IntoResponse + Send + 'static>(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    hook: Option<SelectedResponseHook>,
+    preflight: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<()>
+    + Send
+    + 'static,
+    work: impl FnOnce(&crate::daemon::registry::CheckoutEvidence) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(Response, bool), ApiError> {
+    let runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let (response, catching_up) = runtime.evidence_response()?;
+        response.require_mutation_ready()?;
+        preflight(&response)?;
+        response.finish(())?;
+        if let Some(hook) = &hook {
+            hook("before_mutation");
+        }
+        response.finish(())?;
+        let result = work(&response);
+        if let Some(hook) = hook {
+            hook("before_read_finish");
+        }
+        let mut answer = match result {
+            Ok(value) => match response.finish(value) {
+                Ok(value) => value.into_response(),
+                Err(error) => selected_mutation_error(ApiError::from(error), "committed"),
+            },
+            Err(_) => selected_mutation_error(
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "outcome_unknown",
+                    "Write outcome is unknown; inspect the saved record before retrying",
+                ),
+                "unknown",
+            ),
+        };
+        if !answer.headers().contains_key("X-Baleyg-Mutation-Outcome") {
+            answer
+                .headers_mut()
+                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+        }
+        Ok::<_, anyhow::Error>((answer, catching_up))
+    })
+    .await
+    .map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "Operation failed",
+        )
+    })?
+    .map_err(ApiError::from)
+}
+
+async fn provisioned_core_answer(
+    runtime: &Arc<crate::daemon::registry::CheckoutRuntime>,
+    method: &axum::http::Method,
+    suffix: &str,
+    uri: &axum::http::Uri,
+    body: Bytes,
+    hook: Option<SelectedResponseHook>,
+) -> Result<(Response, bool), ApiError> {
+    use axum::http::Method;
+    match (method, suffix) {
+        (&Method::POST, "dependencies/refresh") => {
+            let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            if !request.as_object().is_some_and(|object| object.is_empty()) {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (_, revision, catching_up) =
+                selected_provider_preflight(runtime, hook, None).await?;
+            if state.dependency_options.is_none() {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "dependencies_disabled",
+                    "Dependency catalog is disabled",
+                ));
+            }
+            if state.dependencies.lock().unwrap().stopped {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "shutting_down",
+                    "Daemon is shutting down",
+                ));
+            }
+            // Check once more immediately before scheduling work. Once scheduled,
+            // a later root or head change cannot undo the requested refresh.
+            selected_provider_postflight(runtime, revision).await?;
+            state.start_dependency_index();
+            let mut response = match selected_provider_postflight(runtime, revision).await {
+                Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"loading"}))).into_response(),
+                Err(error) => selected_mutation_error(error, "committed"),
+            };
+            response
+                .headers_mut()
+                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+            Ok((response, catching_up))
+        }
+        _ if method == Method::POST
+            && suffix.starts_with("questions/")
+            && (suffix.ends_with("/jev-run") || suffix.ends_with("/acp-answer")) =>
+        {
+            let tail = suffix.strip_prefix("questions/").unwrap();
+            let (id, action) = tail.split_once('/').ok_or_else(missing)?;
+            if id.is_empty() || action.contains('/') {
+                return Err(missing());
+            }
+            let jev = action == "jev-run";
+            if jev {
+                if !body.is_empty() && body.as_ref() != b"{}" {
+                    return Err(invalid());
+                }
+            } else {
+                let request: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
+                if !request.as_object().is_some_and(|object| object.is_empty()) {
+                    return Err(invalid());
+                }
+            }
+            let state = runtime.browser_scheduler()?;
+            let (packet, revision, catching_up) =
+                selected_provider_preflight(runtime, hook, Some(id.to_owned())).await?;
+            let packet = packet.unwrap();
+            if jev {
+                let provider = state.provider.clone().ok_or(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "jev_disabled",
+                    "Live Jev is disabled",
+                ))?;
+                // No await before the final current-head check or the provider call.
+                selected_provider_postflight(runtime, revision).await?;
+                let result = provider.run(&packet).await;
+                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
+                }
+                let response = match result {
+                    Err(error) => live_jev_error(error).into_response(),
+                    Ok(result) => {
+                        let selection = result.selection.clone();
+                        let mut view = match planning::assemble(&packet, &selection, "liveJev") {
+                            Ok(view) => view,
+                            Err(error) => {
+                                return Ok((
+                                    selected_mutation_error(question_error(error), "unknown"),
+                                    catching_up,
+                                ));
+                            }
+                        };
+                        view.warnings.extend(result.warnings.clone());
+                        Json(json!({"selection":result.selection,"view":view,
+                            "attemptId":result.attempt_id,"latencyMs":result.latency_ms,
+                            "estimatedUsd":result.estimated_usd,"usage":result.usage,
+                            "warnings":result.warnings}))
+                        .into_response()
+                    }
+                };
+                let mut response = response;
+                let outcome = if response.status().is_success() {
+                    "committed"
+                } else {
+                    "unknown"
+                };
+                response
+                    .headers_mut()
+                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                Ok((response, catching_up))
+            } else {
+                let provider = state.acp.clone().ok_or(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "acp_disabled",
+                    "Live ACP is disabled",
+                ))?;
+                selected_provider_postflight(runtime, revision).await?;
+                let result = provider.run(&packet).await;
+                if let Err(error) = selected_provider_postflight(runtime, revision).await {
+                    return Ok((selected_mutation_error(error, "unknown"), catching_up));
+                }
+                let response = match result {
+                    Err(error) => acp_error(error).into_response(),
+                    Ok(result) => Json(
+                        json!({"packetId":packet.packet_id,"revision":packet.revision,
+                        "source":"liveAcp","attemptId":result.attempt_id,"answer":result.answer,
+                        "latencyMs":result.latency_ms,"estimatedUsd":result.estimated_usd}),
+                    )
+                    .into_response(),
+                };
+                let mut response = response;
+                let outcome = if response.status().is_success() {
+                    "committed"
+                } else {
+                    "unknown"
+                };
+                response
+                    .headers_mut()
+                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                Ok((response, catching_up))
+            }
+        }
+        (&Method::GET, "jev/status") | (&Method::GET, "acp/status") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let jev = suffix == "jev/status";
+            let (value, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                if jev {
+                    match &state.provider {
+                        Some(provider) => Ok(json!({"enabled":true,"budget":provider.budget().map_err(ApiError::from)?})),
+                        None => Ok(json!({"enabled":false,"budget":null})),
+                    }
+                } else {
+                    match &state.acp {
+                        Some(provider) => Ok(json!({"enabled":true,"status":provider.status().map_err(acp_error)?})),
+                        None => Ok(json!({"enabled":false,"status":null})),
+                    }
+                }
+            }).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let (index_state, catalog, mut warnings) = {
+                    let index = state.dependencies.lock().unwrap();
+                    (index.state, index.catalog.clone(), index.warnings.clone())
+                };
+                Ok(if let Some(catalog) = catalog {
+                    if catalog.workspace_revision == revision {
+                        json!({"state":index_state,"workspaceRevision":revision,
+                            "catalogId":catalog.id,"packages":catalog.packages,
+                            "symbolCount":catalog.symbols.len(),"warnings":catalog.warnings})
+                    } else {
+                        warnings.push("Workspace changed; refresh the dependency catalog".into());
+                        json!({"state":"failed","workspaceRevision":revision,
+                            "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+                    }
+                } else {
+                    json!({"state":index_state,"workspaceRevision":revision,
+                        "catalogId":null,"packages":[],"symbolCount":0,"warnings":warnings})
+                })
+            })
+            .await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies/symbols") => {
+            let Query(q) =
+                Query::<DependencySymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.catalog_id.is_empty()
+                || q.catalog_id.len() > 8192
+                || q.q.len() > 8192
+                || q.package_id.as_ref().is_some_and(|id| id.len() > 8192)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > 50_000
+            {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+                if q.package_id.as_ref().is_some_and(|id| !catalog.packages.iter().any(|p| &p.id == id)) { return Err(missing()); }
+                let search = q.q.to_lowercase();
+                let mut matches = catalog.symbols.iter().filter(|symbol| {
+                    q.package_id.as_ref().is_none_or(|id| &symbol.package_id == id)
+                    && (search.is_empty() || symbol.qualified_name.to_lowercase().contains(&search)
+                        || symbol.name.to_lowercase().contains(&search))
+                }).skip(q.offset);
+                let items: Vec<_> = matches.by_ref().take(q.limit).collect();
+                let next_offset = matches.next().map(|_| q.offset + items.len());
+                let payload = json!({"catalogId":catalog.id,"workspaceRevision":catalog.workspace_revision,
+                    "items":items,"nextOffset":next_offset});
+                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
+                Ok(payload)
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "dependencies/source") => {
+            let Query(q) =
+                Query::<DependencySourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.catalog_id.is_empty()
+                || q.catalog_id.len() > 8192
+                || q.source_ref.is_empty()
+                || q.source_ref.len() > 8192
+            {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let catalog = selected_catalog(&state, revision, &q.catalog_id)?;
+                let source = catalog.sources.get(&q.source_ref).ok_or_else(missing)?;
+                let text = source.directory.read_file(&source.path).map_err(rust_source_error)?;
+                let hash = hex::encode(Sha256::digest(text.as_bytes()));
+                if hash != source.hash { return Err(dependency_stale()); }
+                let package = catalog.packages.iter().find(|p| p.id == source.package_id).ok_or_else(missing)?;
+                let definitions: Vec<_> = catalog.symbols.iter().filter(|symbol| symbol.source_ref == q.source_ref)
+                    .map(|symbol| json!({"id":symbol.id,"name":symbol.name,"kind":symbol.kind,
+                        "parent":symbol.parent,"path":symbol.path,"range":symbol.range})).collect();
+                let file = SourceFile { path: source.path.clone(), hash: hash.clone(), language: "rust".into(), text };
+                let payload = json!({"id":q.source_ref,"rootId":package.id,"rootLabel":package.name,
+                    "path":source.path,"hash":hash,"file":file,"definitions":definitions,
+                    "warnings":["Definitional candidates only; not confirmed callees. Separate from the workspace graph and source-sharing scope."]});
+                if !state.catalog_snapshot(revision).is_some_and(|current| Arc::ptr_eq(&current, &catalog)) { return Err(dependency_stale()); }
+                Ok(payload)
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (payload, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                Ok(json!({"roots":state.rust_sources.iter().map(|r| json!({"id":r.label,"label":r.label,
+                    "path":r.directory.root.to_string_lossy()})).collect::<Vec<_>>() }))
+            }).await?;
+            Ok((Json(payload).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources/tree") => {
+            let Query(q) = Query::<RustTreeQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if !crate::file_tree::valid_path(&q.path)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > crate::file_tree::SCAN_LIMIT
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (page, catching_up) = selected_provider_read(runtime, hook, move |r| {
+                let revision = r.status().map_err(ApiError::from)?.revision;
+                let root = state
+                    .rust_sources
+                    .iter()
+                    .find(|root| root.label == q.root)
+                    .ok_or_else(missing)?;
+                let (items, next_offset, truncated) = root
+                    .directory
+                    .list(&q.path, q.offset, q.limit)
+                    .map_err(rust_source_error)?;
+                Ok(crate::file_tree::Page {
+                    root: root.directory.root.to_string_lossy().into_owned(),
+                    indexed_workspace: String::new(),
+                    path: q.path,
+                    revision,
+                    items,
+                    next_offset,
+                    truncated,
+                })
+            })
+            .await?;
+            Ok((Json(page).into_response(), catching_up))
+        }
+        (&Method::GET, "rust-sources/file") => {
+            let Query(q) = Query::<RustFileQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.path.is_empty()
+                || !crate::file_tree::valid_path(&q.path)
+                || !q.path.ends_with(".rs")
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (file, catching_up) = selected_provider_read(runtime, hook, move |_| {
+                let root = state
+                    .rust_sources
+                    .iter()
+                    .find(|root| root.label == q.root)
+                    .ok_or_else(missing)?;
+                root.snapshot(&q.path).map_err(rust_source_error)
+            })
+            .await?;
+            Ok((Json(file).into_response(), catching_up))
+        }
+        (&Method::GET, "status") => {
+            if uri.query().is_some() {
+                return Err(invalid());
+            }
+            let runtime = runtime.clone();
+            let (status, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                let mut status = response.status()?;
+                status.catching_up = catching_up;
+                if let Some(hook) = hook {
+                    hook("before_read_finish");
+                }
+                Ok::<_, anyhow::Error>((response.finish(status)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            Ok((Json(status).into_response(), catching_up))
+        }
+        (&Method::GET, "tree") => {
+            let Query(q) = Query::<TreeQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if !crate::file_tree::valid_path(&q.path)
+                || !(1..=200).contains(&q.limit)
+                || q.offset > crate::file_tree::SCAN_LIMIT
+            {
+                return Err(browse_invalid());
+            }
+            let state = runtime.browser_scheduler()?;
+            let (page, catching_up) = selected_evidence(runtime, hook, move |response| {
+                let (mut items, next_offset, truncated) = state
+                    .browser
+                    .list(&q.path, q.offset, q.limit)
+                    .map_err(BrowseDirectoryError)?;
+                let (revision, indexed_workspace) =
+                    response.tree_metadata(&state.browser.root, &mut items)?;
+                for item in items
+                    .iter_mut()
+                    .filter(|item| item.kind == "file" && item.indexed_path.is_none())
+                {
+                    let absolute = state.browser.root.join(&item.path);
+                    let reason = if !absolute.starts_with(&indexed_workspace) {
+                        "Outside indexed workspace"
+                    } else {
+                        match absolute.extension().and_then(|e| e.to_str()) {
+                            Some("ts" | "tsx") => "TypeScript indexing not supported yet",
+                            Some("js" | "mjs" | "cjs" | "rs" | "java" | "py") => {
+                                "Not indexed yet (may be excluded or size-limited)"
+                            }
+                            _ => "Unsupported source type",
+                        }
+                    };
+                    item.unindexed_reason = Some(reason.into());
+                }
+                Ok(crate::file_tree::Page {
+                    root: state.browser.root.to_string_lossy().into_owned(),
+                    indexed_workspace,
+                    path: q.path,
+                    revision,
+                    items,
+                    next_offset,
+                    truncated,
+                })
+            })
+            .await?;
+            Ok((Json(page).into_response(), catching_up))
+        }
+        (&Method::GET, "files") => {
+            let Query(q) = Query::<FilesQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if !(1..=200).contains(&q.limit) || q.offset > i64::MAX as usize {
+                return Err(browse_invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.files_at(pin, q.offset, q.limit))
+                    .await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "methods") => {
+            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| browse_invalid())?;
+            if q.path.is_empty()
+                || q.path.len() > 8192
+                || q.path.contains(['\0', '\\', ':'])
+                || q.path
+                    .split('/')
+                    .any(|p| p.is_empty() || p == "." || p == "..")
+            {
+                return Err(browse_invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.methods_at(&q.path, pin)).await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::GET, "classes") => {
+            let Query(q) = Query::<ClassesQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin.pin()?;
+            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+                r.classes_at(q.path.as_deref(), &q.q, pin, q.offset, q.limit)
+            })
+            .await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "symbols") => {
+            let Query(q) = Query::<SymbolsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.q.len() > 8192 || !(1..=150).contains(&q.limit) {
+                return Err(invalid());
+            }
+            let ((revision, items), catching_up) =
+                selected_evidence(runtime, hook, move |r| r.symbols_at(&q.q, q.limit)).await?;
+            Ok((
+                Json(json!({"revision":revision,"items":items})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::GET, "symbol") => {
+            let Query(q) = Query::<SymbolQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.id.is_empty() || q.id.len() > 8192 || q.id.contains('\0') {
+                return Err(invalid());
+            }
+            let pin = q.pin.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.symbol_at(&q.id, pin)).await?;
+            let (revision, symbol) = value.ok_or_else(missing)?;
+            Ok((
+                Json(json!({"revision":revision,"symbol":symbol})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "sequence") => {
+            let q: SequenceRequest = serde_json::from_slice(&body).map_err(|_| browse_invalid())?;
+            if q.seed.is_empty() || q.seed.len() > 8192 || q.seed.contains('\0') {
+                return Err(browse_invalid());
+            }
+            let (value, catching_up) = selected_evidence(runtime, hook, move |r| {
+                r.sequence_at(&q.seed, q.expected_revision, q.show_all)
+            })
+            .await?;
+            Ok((
+                Json(value.ok_or_else(missing)?).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "class-diagram") => {
+            let q: crate::class_diagram::ClassDiagramRequest =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.class_diagram_at(&q)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::POST, "navigation") => {
+            if body.len() > 32 * 1024 {
+                return Err(invalid());
+            }
+            let q: crate::navigation::NavigationRequest =
+                serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.navigation_at(&q)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "views") => {
+            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.saved_views_at(pin)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "annotations") => {
+            let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let pin = q.pin()?;
+            let (value, catching_up) =
+                selected_evidence(runtime, hook, move |r| r.saved_annotations_at(pin)).await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::POST, "questions/preview") => {
+            let request: QuestionRequest = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            request.validate().map_err(|_| invalid())?;
+            let state = runtime.browser_scheduler()?;
+            let (value, catching_up) = selected_question(runtime, hook, move |r| {
+                r.validate_pin(request.expected_revision)?;
+                let packet = planning::prepare_in(r, request)?;
+                let selection = planning::preview(&packet)?;
+                let view = planning::assemble(&packet, &selection, "localPreview")?;
+                let bytes = serde_json::to_vec(&packet)?.len();
+                anyhow::ensure!(
+                    bytes <= MAX_PACKET_BYTES,
+                    "complete question packet exceeds 1 MiB"
+                );
+                let result = QuestionPreview {
+                    packet: packet.clone(),
+                    selection,
+                    view,
+                };
+                state
+                    .packets
+                    .lock()
+                    .unwrap()
+                    .remember_fenced(Arc::new(packet), bytes, || r.finish(()))?;
+                Ok(result)
+            })
+            .await?;
+            Ok((Json(value).into_response(), catching_up))
+        }
+        (&Method::GET, "source") => {
+            let Query(q) = Query::<SourceQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            if q.path.is_empty()
+                || q.path.len() > 8192
+                || q.path.contains(['\0', '\\', ':'])
+                || q.path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(invalid());
+            }
+            let pin = q.pin.pin()?;
+            let runtime = runtime.clone();
+            let (file, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                let file = response.source_at(&q.path, pin)?;
+                Ok::<_, anyhow::Error>((response.finish(file)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            let (revision, file) = file.ok_or_else(missing)?;
+            Ok((
+                Json(json!({"revision":revision,"file":file})).into_response(),
+                catching_up,
+            ))
+        }
+        (&Method::POST, "query") => {
+            let Query(pin) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+            let expected = pin.pin()?;
+            let q: ViewQuery = serde_json::from_slice(&body).map_err(|_| invalid())?;
+            q.validate().map_err(|_| invalid())?;
+            let runtime = runtime.clone();
+            let (view, catching_up) = tokio::task::spawn_blocking(move || {
+                let (response, catching_up) = runtime.evidence_response()?;
+                let view = response.query_view_at(&q, expected.as_ref())?;
+                Ok::<_, anyhow::Error>((response.finish(view)?, catching_up))
+            })
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Operation failed",
+                )
+            })??;
+            Ok((Json(view.ok_or_else(missing)?).into_response(), catching_up))
+        }
+        _ if suffix.starts_with("views/") => {
+            let id = suffix.strip_prefix("views/").unwrap();
+            if id.contains('/') {
+                return Err(missing());
+            }
+            validate_record_id(id).map_err(|_| invalid())?;
+            match *method {
+                Method::GET => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?;
+                    let id = id.to_owned();
+                    let (value, catching_up) =
+                        selected_evidence(runtime, hook, move |r| r.saved_view_at(&id, pin))
+                            .await?;
+                    Ok((
+                        Json(value.ok_or_else(missing)?).into_response(),
+                        catching_up,
+                    ))
+                }
+                Method::PUT => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?.ok_or_else(invalid)?;
+                    let value: SavedViewRequest =
+                        serde_json::from_slice(&body).map_err(|_| invalid())?;
+                    if value.id != id {
+                        return Err(invalid());
+                    }
+                    value.validate().map_err(|_| invalid())?;
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_view_at(pin, &value).map(Json),
+                    )
+                    .await;
+                }
+                Method::DELETE => {
+                    let id = id.to_owned();
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_view(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
+                }
+                _ => Err(missing()),
+            }
+        }
+        _ if suffix.starts_with("annotations/") => {
+            let id = suffix.strip_prefix("annotations/").unwrap();
+            if id.contains('/') {
+                return Err(missing());
+            }
+            validate_record_id(id).map_err(|_| invalid())?;
+            match *method {
+                Method::PUT => {
+                    let Query(q) = Query::<PinQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+                    let pin = q.pin()?.ok_or_else(invalid)?;
+                    let value: AnnotationRequest =
+                        serde_json::from_slice(&body).map_err(|_| invalid())?;
+                    if value.id != id {
+                        return Err(invalid());
+                    }
+                    value.validate().map_err(|_| invalid())?;
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        move |r| {
+                            r.validate_pin(pin)?;
+                            anyhow::ensure!(
+                                r.status()?.revision == pin,
+                                "revision conflict: mutation requires head"
+                            );
+                            Ok(())
+                        },
+                        move |r| r.save_annotation_at(pin, &value).map(Json),
+                    )
+                    .await;
+                }
+                Method::DELETE => {
+                    let id = id.to_owned();
+                    return selected_mutation(
+                        runtime,
+                        hook,
+                        |_| Ok(()),
+                        move |r| r.delete_annotation(&id).map(|_| StatusCode::NO_CONTENT),
+                    )
+                    .await;
+                }
+                _ => Err(missing()),
+            }
+        }
+        _ if suffix.starts_with("questions/") => {
+            let tail = suffix.strip_prefix("questions/").unwrap();
+            let Some((id, action)) = tail.split_once('/') else {
+                return Err(missing());
+            };
+            if id.is_empty() || action.contains('/') {
+                return Err(missing());
+            }
+            if !matches!(
+                (method.clone(), action),
+                (Method::GET, "jev-request")
+                    | (Method::POST, "jev-response")
+                    | (Method::POST, "selection")
+            ) {
+                return Err(missing());
+            }
+            let state = runtime.browser_scheduler()?;
+            let id = id.to_owned();
+            let bytes = body.clone();
+            let action = action.to_owned();
+            let (result, catching_up) = selected_question(runtime, hook, move |r| {
+                let revision = r.status()?.revision;
+                let packet = state
+                    .packets
+                    .lock()
+                    .unwrap()
+                    .packets
+                    .iter()
+                    .find(|(packet, _)| packet.packet_id == id)
+                    .map(|(packet, _)| packet.clone())
+                    .ok_or_else(|| anyhow::anyhow!("question seed not found"))?;
+                anyhow::ensure!(
+                    revision == packet.revision,
+                    "revision conflict: cached packet changed"
+                );
+                r.validate_selected_view(&packet.context, &packet.source_files)?;
+                match action.as_str() {
+                    "jev-request" => Ok(serde_json::to_value(jev::request_for(&packet)?)?),
+                    "jev-response" => {
+                        let value: Value = serde_json::from_slice(&bytes)
+                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
+                        let selection = jev::parse_response(&packet, &value)?;
+                        let warnings = jev::response_warnings(&value);
+                        let mut view = planning::assemble(&packet, &selection, "importedJev")?;
+                        view.warnings.extend(warnings);
+                        Ok(json!({"selection":selection,"view":view}))
+                    }
+                    "selection" => {
+                        let selection: SelectionEnvelope = serde_json::from_slice(&bytes)
+                            .map_err(|_| anyhow::anyhow!("invalid_question_selection"))?;
+                        let view = planning::assemble(&packet, &selection, "manual")?;
+                        Ok(json!({"selection":selection,"view":view}))
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .await?;
+            Ok((Json(result).into_response(), catching_up))
+        }
+        (&Method::POST, "index") | (&Method::GET, "jobs/current") => {
+            let state = runtime.browser_scheduler()?;
+            let response = if method == Method::POST {
+                start_index(State(state), body).await?.into_response()
+            } else {
+                current_job(State(state)).await?.into_response()
+            };
+            Ok((response, runtime.catching_up()))
+        }
+        _ if suffix.starts_with("jobs/") => {
+            let state = runtime.browser_scheduler()?;
+            let tail = suffix.strip_prefix("jobs/").unwrap();
+            let response = if method == Method::GET && !tail.contains('/') {
+                job(State(state), Path(tail.to_owned()))
+                    .await?
+                    .into_response()
+            } else if method == Method::POST && tail.ends_with("/cancel") {
+                let id = tail.strip_suffix("/cancel").unwrap();
+                if id.contains('/') {
+                    return Err(missing());
+                }
+                cancel_job(State(state), Path(id.to_owned()))
+                    .await?
+                    .into_response()
+            } else {
+                return Err(missing());
+            };
+            Ok((response, runtime.catching_up()))
+        }
+        _ => Err(missing()),
     }
 }

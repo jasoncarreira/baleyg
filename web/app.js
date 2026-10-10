@@ -1,6 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let token = "", epoch = 0, querySerial = 0, sourceSerial = 0, searchSerial = 0;
+let token = "", epoch = 0, selectedRootKey = null, selectedWorkspaceRoot = null, checkoutBusy = false, checkouts = [], querySerial = 0, sourceSerial = 0, searchSerial = 0;
+const pendingRequests = new Set();
 let status = null, result = null, seed = null, views = [], annotations = [], editingView = null, editingNote = null;
 let statusSerial = 0, savedSerial = 0, statusRefreshDepth = 0, pairRefreshPending = false, pairRefreshObserved = null;
 let pairRefreshQueued = null, pairRefreshFollowup = false;
@@ -121,17 +122,31 @@ function button(text, action) {
 function describe(value) { return typeof value === "string" ? value : JSON.stringify(value, null, 2); }
 function aborted() { return new DOMException("Superseded request", "AbortError"); }
 function operationGuard() {
-  const session = epoch, queryAtStart = querySerial, questionAtStart = questionSerial;
+  const session = epoch, root = selectedRootKey, queryAtStart = querySerial, questionAtStart = questionSerial;
   const selectedSeed = seed, revision = status?.revision && IndexPin.copy(status.revision);
-  return () => session === epoch && queryAtStart === querySerial && questionAtStart === questionSerial && selectedSeed === seed && IndexPin.equal(revision, status?.revision);
+  return () => session === epoch && root === selectedRootKey && queryAtStart === querySerial && questionAtStart === questionSerial && selectedSeed === seed && IndexPin.equal(revision, status?.revision);
+}
+function selectedUrl(path, method, root) {
+  if (path === "/api/checkouts" || path === "/api/daemon/status") {
+    if (method !== "GET") throw new Error("Global API requests must be GET.");
+    return path;
+  }
+  const suffix = path.startsWith("/api/") ? path.slice(5) : "";
+  const route = suffix.split("?", 1)[0];
+  const simple = new Set(["status", "index", "tree", "files", "methods", "sequence", "classes", "class-diagram", "navigation", "symbols", "symbol", "source", "query", "views", "annotations", "jobs/current", "jev/status", "acp/status", "questions/preview", "dependencies", "dependencies/refresh", "dependencies/symbols", "dependencies/source", "rust-sources", "rust-sources/tree", "rust-sources/file"]);
+  const item = /^jobs\/[^/?]+(?:\/cancel)?$/.test(route) || /^(?:views|annotations)\/[^/?]+$/.test(route) || /^questions\/[^/?]+\/(?:jev-request|jev-response|jev-run|acp-answer|selection)$/.test(route);
+  if (!simple.has(route) && !item || /[#\s]/.test(suffix) || suffix.includes("//")) throw new Error("Unknown checkout API route.");
+  if (!root || !uniqueSelectableRoot(root)) throw new Error("Choose an available checkout first.");
+  return `/api/checkouts/${encodeURIComponent(root)}/${suffix}`;
 }
 async function api(path, method = "GET", body) {
-  const session = epoch, sourceAtStart = sourceSerial;
+  const session = epoch, root = selectedRootKey, sourceAtStart = sourceSerial;
+  const url = selectedUrl(path, method, root);
   const guarded = path === "/api/query" || path.startsWith("/api/query?") || path.startsWith("/api/questions/") || path.startsWith("/api/source?");
   const operationCurrent = operationGuard();
-  const current = () => session === epoch && (!guarded || (operationCurrent() && (!path.startsWith("/api/source?") || sourceAtStart === sourceSerial)));
+  const current = () => session === epoch && root === selectedRootKey && (!guarded || (operationCurrent() && (!path.startsWith("/api/source?") || sourceAtStart === sourceSerial)));
   let response, data, timer;
-  const controller = new AbortController();
+  const controller = new AbortController(); pendingRequests.add(controller);
   const timeoutError = new Error("Request timed out. No automatic retry was made. Refresh status before trying again.");
   timeoutError.name = "TimeoutError";
   const deadline = path.endsWith("/acp-answer") ? 150000 : 15000;
@@ -140,20 +155,24 @@ async function api(path, method = "GET", body) {
       timer = setTimeout(() => { reject(timeoutError); controller.abort(); }, deadline);
     });
     await Promise.race([timeout, (async () => {
-      response = await fetch(path, {method, cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal,
+      response = await fetch(url, {method, cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal,
         headers: {Authorization: `Bearer ${token}`, ...(body === undefined ? {} : {"Content-Type": "application/json"})},
         body: body === undefined ? undefined : JSON.stringify(body)});
       if (!current()) throw aborted();
       data = response.status === 204 ? null : await response.json();
     })()]);
   } catch (error) { if (!current()) throw aborted(); throw error; }
-  finally { clearTimeout(timer); }
+  finally { clearTimeout(timer); pendingRequests.delete(controller); }
   // Check before any HTTP error side effects, including invalidation on 409.
   if (!current()) throw aborted();
   if (!response.ok) {
     const error = new Error(data?.error?.message || `Request failed (${response.status})`);
     error.status = response.status;
     error.code = data?.error?.code;
+    error.reason = data?.error?.reason;
+    error.workspaceRoot = response.headers?.get?.("X-Baleyg-Workspace") || null;
+    if (error.status === 401 || error.status === 403) disconnect("Authentication failed. Connect with a daemon token again.");
+    else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
   }
   return data;
@@ -187,10 +206,29 @@ async function refreshStatus(followup = false) {
   statusRefreshDepth++;
   try {
   const serial = ++statusSerial, session = epoch;
-  let data = await api("/api/status");
+  let data;
+  try { data = await api("/api/status"); }
+  catch (error) {
+    if (error.code === "index_not_ready" && serial === statusSerial && session === epoch && selectedRootKey) {
+      const root = selectedRootKey, workspaceRoot = error.workspaceRoot || status?.workspaceRoot;
+      const listedRoot = selectedWorkspaceRoot;
+      resetCheckout();
+      selectedRootKey = root; selectedWorkspaceRoot = listedRoot;
+      $("checkout-select").value = root;
+      $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
+      $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
+      window.BaleygShell?.setConnected(true);
+      $("status").textContent = "No validated index head is available yet.";
+      $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
+      stale("Index not ready. Retry status after indexing starts.");
+    }
+    throw error;
+  }
   if (serial !== statusSerial || session !== epoch) return;
+  if (typeof data?.workspaceRoot !== "string" || !data.workspaceRoot) throw new Error("Selected checkout identity unavailable. Retry status.");
+  $("checkout-root").textContent = data.workspaceRoot;
   const workspaceChanged = status && status.workspaceRoot !== data.workspaceRoot;
-  const nextPin = IndexPin.copy(data.revision);
+  const nextPin = data.revision == null ? null : IndexPin.copy(data.revision);
   const browseChanged = !status || workspaceChanged || !IndexPin.equal(status.revision, nextPin);
   const hadStatus = !!status;
   if (status && browseChanged) { clearBrowse("Index changed. Choose a method from the refreshed files."); sourceCache.clear(); querySerial++; invalidateFocus("Index workspace or revision changed. Preview again."); clearSource(); }
@@ -208,18 +246,20 @@ async function refreshStatus(followup = false) {
   status = {...data, revision:nextPin};
   data = status;
   if (hadStatus && browseChanged && !workspaceChanged) { renderViews(); renderNotes(); }
-  window.BaleygShell?.updateWorkspace(status);
-  if (browseChanged) await loadTreeRoot();
+  window.BaleygShell?.updateWorkspace(nextPin ? status : null);
+  $("catching-up").hidden = data.catchingUp !== true || !nextPin;
+  if (browseChanged && nextPin) await loadTreeRoot();
   if (serial !== statusSerial || session !== epoch || status !== data) return;
   if (result && !IndexPin.equal(result.revision, status.revision)) renderResult();
   const stats = status.stats || {};
-  $("status").textContent = `${status.workspaceRoot} · Revision ${IndexPin.label(status.revision)} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
+  $("status").textContent = `${status.workspaceRoot} · ${status.revision ? `Revision ${IndexPin.label(status.revision)}` : "Index not ready"} · ${stats.files ?? 0} files · ${stats.symbols ?? 0} symbols · ${stats.calls ?? 0} calls · Semantic proof unavailable · SCIP (if present): display only · Indexed: ${status.indexedAt ? new Date(Number(status.indexedAt)).toLocaleString() : "not yet"}`;
   $("diagnostics").textContent = describe(status.diagnostics || []);
   $("stale").hidden = true;
+  if (!nextPin) stale("Index not ready. Retry status after this checkout finishes indexing.");
   if (changedCount(stats.changedFiles)) stale(`${changedCount(stats.changedFiles)} inputs differ from the imported SCIP manifest. Syntax remains source-only; imported SCIP is display metadata, never semantic proof.`);
   if (result && !IndexPin.equal(result.revision, status.revision)) stale("This view is from an older revision. Refresh status & view to update it.");
   // A rejected optional catalog must not recursively request status when status is unchanged.
-  if (browseChanged || !pairRefreshPending) void refreshDependencies();
+  if (nextPin && (browseChanged || !pairRefreshPending)) void refreshDependencies();
   } finally {
     statusRefreshDepth--;
     if (!statusRefreshDepth && pairRefreshQueued) {
@@ -305,45 +345,174 @@ $("token-file").addEventListener("change", async () => {
     $("error").textContent = "Could not load token file: " + (file.size > 1024 ? "file is too large." : "choose a readable daemon.token file."); $("error").hidden = false;
   } finally { if (serial === tokenFileSerial) input.value = ""; }
 });
+const validRootKey = key => typeof key === "string" && /^[0-9a-f]{64}$/.test(key);
+function checkoutOption(label, value) { const option = element("option", label); option.value = value; return option; }
+function resetCheckout() {
+  // Advance the generation before aborting or awaiting any request. Equal revision pairs are not identity.
+  epoch++; selectedRootKey = null; selectedWorkspaceRoot = null; checkoutBusy = false;
+  for (const controller of pendingRequests) controller.abort();
+  clearTimeout(pollTimer); pollTimer = null; statusSerial++; savedSerial++; querySerial++; searchSerial++;
+  pairRefreshPending = false; pairRefreshQueued = null;
+  clearDependencyCatalog(); clearExternalSources(); clearBrowse(); clearSource(); sourceCache.clear();
+  status = null; result = null; seed = null; job = null; waitingForJob = false;
+  acpStatusSerial++; acpStatus = null; acpRunning = false; $("acp-status").textContent = "ACP status unavailable.";
+  jevStatusSerial++; jevStatus = null; jevRunning = false; $("jev-status").textContent = "Live Jev status unavailable.";
+  invalidateFocus(); views = []; annotations = []; resetView(); resetNote();
+  ["symbols", "calls", "nodes", "views", "annotations"].forEach(id => $(id).replaceChildren());
+  ["status", "diagnostics", "job", "result-meta"].forEach(id => $(id).textContent = "");
+  $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
+  $("file-filter").value = ""; $("search").value = "";
+  $("stale").hidden = true; $("catching-up").hidden = true;
+  $("checkout-root").textContent = "No checkout selected";
+  $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
+  window.BaleygShell?.setConnected(false);
+}
+function disconnect(message) {
+  tokenFileSerial++; const forgotten = forgetStoredToken();
+  resetCheckout(); checkouts = []; token = "";
+  $("remember-token").checked = false; $("token-file").value = ""; $("token").value = "";
+  $("checkout-picker").hidden = true; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
+  $("logout").hidden = true; $("connect-form").hidden = false;
+  $("error").hidden = !message; $("error").textContent = message || "";
+  $("notice").textContent = message || (forgotten ? "Disconnected. Saved token and cached source cleared." : "Disconnected. Browser storage could not be cleared; clear this address’s site data to forget any saved token.");
+  $("token").focus();
+}
+function invalidateSelection(message) {
+  resetCheckout();
+  $("checkout-select").value = "";
+  $("checkout-state").textContent = message;
+  $("notice").textContent = message;
+  void loadCheckouts();
+}
+function selectable(row) {
+  return objectValue(row) && validRootKey(row.rootKey) && row.state === "available" && typeof row.workspaceRoot === "string" && row.workspaceRoot.startsWith("/");
+}
+function uniqueSelectableRoot(key) {
+  const matches = checkouts.filter(row => row.rootKey === key);
+  return matches.length === 1 && selectable(matches[0]);
+}
+async function loadCheckouts() {
+  const session = epoch;
+  $("checkout-state").textContent = "Loading checkouts…";
+  $("checkout-select").disabled = true; $("checkout-retry").hidden = true;
+  try {
+    const data = await api("/api/checkouts");
+    if (session !== epoch) return;
+    if (!Array.isArray(data?.checkouts)) throw new Error("Checkout list is invalid. Retry the list.");
+    const keys = data.checkouts.filter(row => objectValue(row) && typeof row.rootKey === "string").map(row => row.rootKey);
+    if (new Set(keys).size !== keys.length) throw new Error("Duplicate checkout root key. Retry the list.");
+    const next = data.checkouts.filter(row => objectValue(row) && validRootKey(row.rootKey) && typeof row.state === "string");
+    const selected = selectedRootKey && next.find(row => row.rootKey === selectedRootKey);
+    // A transient list read cannot revoke an explicit selection of the same listed root.
+    // Erase derived evidence and fence scoped requests until the list recovers.
+    const verifiedRoot = selectedWorkspaceRoot;
+    const sameRoot = selected && verifiedRoot && selected.workspaceRoot === verifiedRoot;
+    const busy = sameRoot && selected.state === "storage_busy";
+    const recovering = checkoutBusy && sameRoot && selectable(selected);
+    if (busy && !checkoutBusy) {
+      const key = selectedRootKey;
+      resetCheckout();
+      selectedRootKey = key; selectedWorkspaceRoot = verifiedRoot;
+      checkoutBusy = true;
+      $("checkout-root").textContent = verifiedRoot;
+    }
+    checkouts = next;
+    if (selectedRootKey && (!sameRoot || (!busy && !selectable(selected)))) {
+      invalidateSelection("Selected checkout is no longer available. Choose again."); return;
+    }
+    const select = $("checkout-select"), choice = selectedRootKey || "";
+    select.replaceChildren(checkoutOption("Choose a checkout", ""));
+    for (const row of checkouts) {
+      const option = checkoutOption(`${row.workspaceRoot || row.rootKey} · ${row.state}`, row.rootKey);
+      option.disabled = !selectable(row); select.append(option);
+    }
+    select.value = choice;
+    select.disabled = !checkouts.some(selectable);
+    $("checkout-state").textContent = busy ? "Selected checkout is temporarily busy. Retry the checkout list."
+      : !checkouts.length ? "No checkouts found. Register a checkout, then retry."
+      : !checkouts.some(selectable) ? "No available checkouts. Unavailable or corrupt entries cannot be selected. Retry the list."
+      : choice ? "Checkout selected." : "Choose a checkout to inspect. No checkout is selected automatically.";
+    $("checkout-retry").hidden = !busy && checkouts.length > 0 && checkouts.every(selectable);
+    if (recovering) await selectCheckout(choice);
+    return true;
+  } catch (error) {
+    if (session !== epoch || error.name === "AbortError") return;
+    if (selectedRootKey) resetCheckout();
+    checkouts = []; $("checkout-select").replaceChildren(checkoutOption("Choose a checkout", ""));
+    $("checkout-select").disabled = true; $("checkout-retry").hidden = false;
+    $("checkout-state").textContent = `Checkout list unavailable: ${error.message} Retry the list.`;
+    return false;
+  }
+}
+async function loadDaemonStatus() {
+  const session = epoch;
+  try {
+    const data = await api("/api/daemon/status");
+    if (session === epoch) $("daemon-state").textContent = Number.isSafeInteger(data?.activeCheckouts) ? `${data.activeCheckouts} active checkouts` : "Daemon status unavailable.";
+  } catch (error) { if (session === epoch && error.name !== "AbortError") $("daemon-state").textContent = `Daemon status unavailable: ${error.message}`; }
+}
+async function selectCheckout(key) {
+  resetCheckout();
+  $("checkout-select").value = key;
+  if (!uniqueSelectableRoot(key)) {
+    $("checkout-select").value = ""; $("checkout-state").textContent = "Choose an available checkout."; return;
+  }
+  selectedRootKey = key;
+  selectedWorkspaceRoot = checkouts.find(row => row.rootKey === key).workspaceRoot;
+  $("error").hidden = true; $("error").textContent = "";
+  $("checkout-root").textContent = "Verifying selected checkout…";
+  $("checkout-state").textContent = "Loading selected checkout…";
+  $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
+  window.BaleygShell?.setConnected(true);
+  const session = epoch;
+  try {
+    await refreshStatus();
+    if (session !== epoch) return;
+    await loadSaved(); await refreshJevStatus(); await refreshAcpStatus();
+    job = await api("/api/jobs/current").catch(error => { if (error.name !== "AbortError") throw error; return null; });
+    if (session !== epoch) return;
+    waitingForJob = !!job && activeJob(job);
+    if (job) { showJob(); schedulePoll(); }
+    $("checkout-state").textContent = "Checkout ready.";
+    $("notice").textContent = "Browse folders below. Indexed files expand to methods.";
+  } catch (error) {
+    if (session !== epoch || error.name === "AbortError") return;
+    const cold = error.code === "index_not_ready";
+    $("checkout-root").textContent = error.workspaceRoot || status?.workspaceRoot || "Selected checkout · verified root unavailable until status responds";
+    $("checkout-state").textContent = cold ? "Index not ready. Retry status after indexing starts." : `Checkout unavailable: ${error.message} Retry status; your selection is unchanged.`;
+    $("status").textContent = cold ? "No validated index head is available yet." : "Selected checkout status unavailable.";
+    $("refresh").disabled = false;
+    $("stale").hidden = false; $("stale").textContent = $("checkout-state").textContent;
+  }
+}
+$("checkout-select").addEventListener("change", event => { void selectCheckout(event.target.value); });
+$("checkout-retry").addEventListener("click", async () => {
+  const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
+  if (listed && token && $("remember-token").checked) {
+    try { localStorage.setItem(tokenStorageKey, token); }
+    catch (_) { $("checkout-state").textContent += " Browser storage is unavailable; token was not saved."; }
+  }
+});
 form("connect-form", async () => {
   const supplied = $("token").value.trim();
   if (!safeTokenText(supplied)) throw new Error("Paste a daemon token or load daemon.token first.");
   tokenFileSerial++; token = supplied; $("token").value = "";
-  try {
-    await refreshStatus(); await loadSaved(); await refreshJevStatus(); await refreshAcpStatus();
-    job = await api("/api/jobs/current").catch(() => null); waitingForJob = !!job && activeJob(job);
-    if (job) { showJob(); schedulePoll(); }
-    $("error").hidden = true; $("error").textContent = "";
-    $("workspace").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
-    window.BaleygShell?.setConnected(true);
-    let remembered = false, storageFailed = false;
-    if ($("remember-token").checked) {
-      try { localStorage.setItem(tokenStorageKey, token); remembered = true; }
-      catch (_) { storageFailed = true; }
-    } else { forgetStoredToken(); }
-    $("notice").textContent = "Connected. Browse folders below. Indexed files expand to methods."
-      + (remembered ? " Token saved on this browser." : storageFailed ? " Browser storage is unavailable; token was not saved." : "");
-    $("file-filter").focus();
-  } catch (error) {
-    if (error.status === 401 || error.status === 403) forgetStoredToken();
-    $("token").value = token; token = ""; throw error;
-  }
+  $("error").hidden = true; $("error").textContent = "";
+  $("checkout-picker").hidden = false; $("connect-form").hidden = true; $("logout").hidden = false;
+  const [listed] = await Promise.all([loadCheckouts(), loadDaemonStatus()]);
+  if (!token) return;
+  let remembered = false, storageFailed = false;
+  if (listed && $("remember-token").checked) {
+    try { localStorage.setItem(tokenStorageKey, token); remembered = true; }
+    catch (_) { storageFailed = true; }
+  } else if (listed) forgetStoredToken();
+  $("notice").textContent = listed ? "Connected. Choose a checkout before browsing."
+    + (remembered ? " Token saved on this browser." : storageFailed ? " Browser storage is unavailable; token was not saved." : "")
+    : "Checkout list unavailable. Retry the list; no checkout has been selected.";
+  $("checkout-select").focus();
 });
-$("logout").addEventListener("click", () => {
-  window.BaleygShell?.setConnected(false);
-  tokenFileSerial++; const forgotten = forgetStoredToken(); $("remember-token").checked = false; $("token-file").value = "";
-  clearDependencyCatalog(); clearExternalSources(); clearBrowse(); statusSerial++; epoch++; querySerial++; searchSerial++; clearTimeout(pollTimer); token = ""; status = null; result = null; seed = null; job = null; waitingForJob = false;
-  acpStatusSerial++; acpStatus = null; acpRunning = false; $("acp-status").textContent = "ACP status unavailable.";
-  jevStatusSerial++; jevStatus = null; jevRunning = false; $("jev-status").textContent = "Live Jev status unavailable.";
-  invalidateFocus(); views = []; annotations = []; sourceCache.clear(); clearSource(); resetView(); resetNote();
-  ["symbols", "calls", "nodes", "views", "annotations"].forEach(id => $(id).replaceChildren());
-  ["status", "diagnostics", "job", "result-meta"].forEach(id => $(id).textContent = "");
-  $("seed").textContent = "Select a symbol to inspect its immediate interactions.";
-  $("file-filter").value = ""; $("search").value = ""; $("view-title").value = ""; $("token").value = "";
-  $("workspace").hidden = true; $("logout").hidden = true; $("connect-form").hidden = false;
-  $("error").hidden = true; $("notice").textContent = forgotten ? "Disconnected. Saved token and cached source cleared." : "Disconnected. Browser storage could not be cleared; clear this address’s site data to forget any saved token.";
-  $("index").disabled = false; $("cancel").hidden = true; $("token").focus();
-});
+$("logout").addEventListener("click", () => disconnect());
+
 form("search-form", async () => {
   const serial = ++searchSerial;
   $("search-state").textContent = "Searching…";

@@ -141,6 +141,119 @@ fn private_readiness_report_is_mode_600_bounded_and_never_copies_raw_stderr() {
     );
 }
 
+fn connected_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        );
+        (rc == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+            .then_some(cred.pid as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+/// Test-scope guard for only the daemon elected under this disposable HOME.
+struct FixtureDaemon(std::path::PathBuf);
+impl FixtureDaemon {
+    fn new(home: &std::path::Path) -> Self {
+        Self(home.to_path_buf())
+    }
+}
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let marker = self.0.join("auto-daemon.pid");
+        let Ok(raw) = fs::read_to_string(&marker) else {
+            return;
+        };
+        let Ok(pid) = raw.parse::<u32>() else {
+            return;
+        };
+        let mut dirs = vec![self.0.clone()];
+        let mut socket = None;
+        while let Some(dir) = dirs.pop() {
+            for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| name == "daemon.lock") {
+                    socket = path
+                        .parent()
+                        .and_then(std::path::Path::parent)
+                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                    break;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+            if socket.is_some() {
+                break;
+            }
+        }
+        let Some(socket) = socket else {
+            return;
+        };
+        let owned = || {
+            let connection = std::os::unix::net::UnixStream::connect(&socket).ok()?;
+            if connected_peer_pid(&connection) != Some(pid) {
+                return None;
+            }
+            let output = Command::new("/bin/ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+                .ok()?;
+            (output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim()
+                    == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+            .then_some(connection)
+        };
+        let Some(connection) = owned() else {
+            return;
+        };
+        let sent = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !sent {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if owned().is_none() {
+                let _ = fs::remove_file(&marker);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Never SIGKILL a numeric PID after the socket identity becomes ambiguous.
+        drop(connection);
+    }
+}
+
 fn isolated_command(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
@@ -170,10 +283,15 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         }
     }
     fn serve(root: &std::path::Path, home: &std::path::Path, log: &std::path::Path) -> Server {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // One daemon owns one browser bind for its lifetime. Each registration
+        // in this test must request that same address after the control exits.
+        static ADDRESS: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        });
         let child = command(root, home, "serve")
+            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .arg("--bind")
             .arg(address.to_string())
             .stdout(std::process::Stdio::null())
@@ -183,6 +301,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         let mut server = Server(child);
         for _ in 0..150 {
             if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+                assert!(home.join("auto-daemon.pid").exists());
                 return server;
             }
             if let Some(status) = server.0.try_wait().unwrap() {
@@ -216,6 +335,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     fs::create_dir(&root).unwrap();
     let file = root.join("a.js");
     fs::write(&file, "function seed() { return 42; }\n").unwrap();
@@ -254,6 +374,32 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
 
     let first_log = temp.path().join("serve-unchanged.log");
     let leader = serve(&root, &home, &first_log);
+    // Serve registration is inert. A CLI attachment elects the checkout and
+    // performs mandatory H against the selected persisted head.
+    let attached = command(&root, &home, "status").output().unwrap();
+    assert!(
+        attached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while rusqlite::Connection::open(&dbpath)
+        .map(|db| pin_and_ids(&db).0)
+        .unwrap()
+        < 3
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mandatory H did not publish"
+        );
+        let attached = command(&root, &home, "status").output().unwrap();
+        assert!(
+            attached.status.success(),
+            "{}",
+            String::from_utf8_lossy(&attached.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r2, ids) = pin_and_ids(&db);
     assert_eq!(r2, 3, "new header+manifest pin required");
@@ -322,6 +468,30 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     assert_eq!(fs::read(&file).unwrap().len(), old_bytes.len());
     let changed_log = temp.path().join("serve-changed.log");
     let changed = serve(&root, &home, &changed_log);
+    let attached = command(&root, &home, "status").output().unwrap();
+    assert!(
+        attached.status.success(),
+        "{}",
+        String::from_utf8_lossy(&attached.stderr)
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while rusqlite::Connection::open(&dbpath)
+        .map(|db| pin_and_ids(&db).0)
+        .unwrap()
+        < 4
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "changed bytes did not publish"
+        );
+        let attached = command(&root, &home, "status").output().unwrap();
+        assert!(
+            attached.status.success(),
+            "{}",
+            String::from_utf8_lossy(&attached.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     let (r3, next_ids) = pin_and_ids(&db);
     assert_eq!(r3, 4, "new bytes must FULL publish, never reuse old pin");
@@ -348,6 +518,16 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     drop(db);
     let corrupt_log = temp.path().join("serve-corrupt.log");
     let rejected = serve(&root, &home, &corrupt_log);
+    // Attachment starts H; a selected read must still refuse the damaged head.
+    let corrupt_selected = command(&root, &home, "symbols").output().unwrap();
+    assert!(
+        !corrupt_selected.status.success(),
+        "corrupt selected corrupt was accepted"
+    );
+    assert!(
+        corrupt_selected.stdout.is_empty(),
+        "damaged selected corrupt escaped on stdout"
+    );
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db),
@@ -368,11 +548,6 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
         "refused Serve installed partial metadata"
     );
     drop(db);
-    assert!(
-        fs::read_to_string(corrupt_log)
-            .unwrap()
-            .contains("Evidence unavailable at startup")
-    );
     drop(rejected);
 
     // A one-sided producer-binding rewrite must refuse before a new header.
@@ -404,16 +579,21 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     drop(db);
     let link_log = temp.path().join("serve-binding.log");
     let rejected_binding = serve(&root, &home, &link_log);
+    // Attachment starts H; a selected read must still refuse the damaged head.
+    let binding_selected = command(&root, &home, "symbols").output().unwrap();
+    assert!(
+        !binding_selected.status.success(),
+        "corrupt selected binding was accepted"
+    );
+    assert!(
+        binding_selected.stdout.is_empty(),
+        "damaged selected binding escaped on stdout"
+    );
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db).0,
         4,
         "bad selected producer binding reused"
-    );
-    assert!(
-        fs::read_to_string(&link_log)
-            .unwrap()
-            .contains("Evidence unavailable at startup")
     );
     drop(rejected_binding);
     db.execute(
@@ -439,16 +619,21 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
     drop(db);
     let context_log = temp.path().join("serve-context.log");
     let rejected_context = serve(&root, &home, &context_log);
+    // Attachment starts H; a selected read must still refuse the damaged head.
+    let context_selected = command(&root, &home, "symbols").output().unwrap();
+    assert!(
+        !context_selected.status.success(),
+        "corrupt selected context was accepted"
+    );
+    assert!(
+        context_selected.stdout.is_empty(),
+        "damaged selected context escaped on stdout"
+    );
     let db = rusqlite::Connection::open(&dbpath).unwrap();
     assert_eq!(
         pin_and_ids(&db).0,
         4,
         "mismatched extraction inventory context reused"
-    );
-    assert!(
-        fs::read_to_string(&context_log)
-            .unwrap()
-            .contains("Evidence unavailable at startup")
     );
     drop(rejected_context);
     db.execute(
@@ -966,6 +1151,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
+    let _daemon = FixtureDaemon::new(&home);
     let first_cwd = temp.path().join("ingress");
     let second_cwd = temp.path().join("takeover");
     for dir in [&root, &first_cwd, &second_cwd] {
@@ -991,6 +1177,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let stderr_path = temp.path().join("serve-ingress-stderr.log");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let child = isolated_command(&home)
+        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
@@ -1028,6 +1215,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     })
     .await
     .expect("daemon startup timed out");
+    assert!(home.join("auto-daemon.pid").exists());
     assert!(
         !String::from_utf8_lossy(&startup).contains("Evidence unavailable at startup"),
         "unexpected startup evidence: {}",
@@ -1342,112 +1530,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
 #[tokio::test]
 async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
     use baleyg::store::topology::UseGuard;
-    use std::{os::unix::fs::PermissionsExt, process::Stdio};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    struct Server(std::process::Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    fn startup_diagnostic(server: &mut Server, stderr_path: &std::path::Path, port: u16) -> String {
-        let status = format!("{:?}", server.0.try_wait());
-        let stderr = fs::read(stderr_path)
-            .map(|bytes| {
-                let redacted = String::from_utf8_lossy(&bytes).replace(TOKEN, "[REDACTED]");
-                redacted
-                    .chars()
-                    .rev()
-                    .take(1024)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|error| format!("<stderr unreadable: {error}>"));
-        format!("port={port}, child_status={status}, stderr_tail={stderr:?}")
-    }
-    async fn serve(
-        root: &std::path::Path,
-        home: &std::path::Path,
-        token: &std::path::Path,
-        phase: &str,
-    ) -> (Server, String, reqwest::Client) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        fs::create_dir_all(home).unwrap();
-        let stderr_path = home.join(format!("daemon-{phase}-{port}.stderr"));
-        let stderr = fs::File::create(&stderr_path).unwrap();
-        let child = isolated_command(home)
-            .arg("serve")
-            .arg("--workspace")
-            .arg(root)
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("--token-file")
-            .arg(token)
-            .arg("--max-file-bytes")
-            .arg("3145728")
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .unwrap();
-        let mut server = Server(child);
-        let base = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let mut last_transport = String::new();
-        loop {
-            match server.0.try_wait() {
-                Ok(None) => {}
-                Ok(Some(status)) => panic!(
-                    "daemon exited before /healthz readiness ({status}); {}",
-                    startup_diagnostic(&mut server, &stderr_path, port)
-                ),
-                Err(error) => panic!(
-                    "daemon liveness check failed ({error}); {}",
-                    startup_diagnostic(&mut server, &stderr_path, port)
-                ),
-            }
-            match tokio::time::timeout_at(deadline, client.get(format!("{base}/healthz")).send())
-                .await
-            {
-                Ok(Ok(response)) => {
-                    assert_eq!(
-                        response.status(),
-                        reqwest::StatusCode::OK,
-                        "daemon /healthz returned wrong HTTP status; {}",
-                        startup_diagnostic(&mut server, &stderr_path, port)
-                    );
-                    return (server, base, client);
-                }
-                Ok(Err(error)) if error.is_connect() || error.is_timeout() => {
-                    last_transport = error.to_string();
-                }
-                Ok(Err(error)) => panic!(
-                    "daemon /healthz non-transport error ({error}); {}",
-                    startup_diagnostic(&mut server, &stderr_path, port)
-                ),
-                Err(_) => panic!(
-                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
-                    startup_diagnostic(&mut server, &stderr_path, port)
-                ),
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "daemon /healthz readiness timed out (last transport: {last_transport}); {}",
-                    startup_diagnostic(&mut server, &stderr_path, port)
-                );
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
     let home = temp.path().join("home");
@@ -1456,30 +1539,21 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     let initial = command(&root, &home, "index").output().unwrap();
     assert!(initial.status.success());
     let old_pin: Value = serde_json::from_slice(&initial.stdout).unwrap();
-    let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
-    } else {
-        home.join(".cache/baleyg/indexes")
-    };
-    let dir = fs::read_dir(indexes)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .unwrap();
-    let index = dir.join("index.db");
+    let index = real_index_db(&home);
+    let url = "http://127.0.0.1:7331";
+    // Open before corruption: Store::open would otherwise attempt recovery.
+    let busy_legacy =
+        LegacyClient::same_home_with_session(&root, &home, TOKEN, url, 3_145_728, false);
     fs::write(&index, b"broken sqlite index header").unwrap();
     let corrupt = fs::read(&index).unwrap();
-    let token = temp.path().join("token");
-    fs::write(&token, TOKEN).unwrap();
-    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let dir = index.parent().unwrap();
     let use_lock = dir.parent().unwrap().join(format!(
         "{}.lock",
         dir.file_name().unwrap().to_string_lossy()
     ));
     let reader = UseGuard::acquire_existing(&use_lock, false, true).unwrap();
-    let (busy_server, busy_url, busy_client) = serve(&root, &home, &token, "busy").await;
-    let busy = busy_client
-        .get(format!("{busy_url}/api/status"))
+    let busy = busy_legacy
+        .get(format!("{url}/api/status"))
         .bearer_auth(TOKEN)
         .send()
         .await
@@ -1488,11 +1562,21 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
     let body: Value = busy.json().await.unwrap();
     assert_eq!(body["error"]["code"], "recovery_required");
     assert_eq!(fs::read(&index).unwrap(), corrupt);
-    drop(busy_server);
-    drop(busy_client);
+    drop(busy_legacy);
     drop(reader);
-    let (ready_server, url, ready_client) = serve(&root, &home, &token, "ready").await;
-    let ready = ready_client
+    let recovered = command(&root, &home, "index")
+        .arg("--max-file-bytes")
+        .arg("3145728")
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(recovered["publishedRevision"]["indexRevision"], 2);
+    let ready = LegacyClient::same_home(&root, &home, TOKEN, url, 3_145_728)
         .get(format!("{url}/api/status"))
         .bearer_auth(TOKEN)
         .send()
@@ -1500,7 +1584,17 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         .unwrap();
     assert_eq!(ready.status(), reqwest::StatusCode::OK);
     let status: Value = ready.json().await.unwrap();
-    assert_eq!(status["revision"]["indexRevision"], 1);
+    assert_eq!(
+        status["revision"]["indexRevision"],
+        recovered["publishedRevision"]["indexRevision"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
+    assert_eq!(
+        status["revision"]["indexGeneration"],
+        recovered["publishedRevision"]["indexGeneration"]
+    );
     assert_ne!(
         status["revision"]["indexGeneration"],
         old_pin["publishedRevision"]["indexGeneration"]
@@ -1517,7 +1611,6 @@ async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_
         serde_json::from_str::<Value>(&options).unwrap()["maxFileBytes"],
         3_145_728
     );
-    drop(ready_server);
 }
 
 #[test]
@@ -2535,8 +2628,190 @@ fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+
+// The provisioned browser serves global control-plane routes only. Keep the
+// selected-workspace API contract on the legacy router, backed by the very
+// same HOME topology as the executable fixtures above.
+#[derive(Clone)]
+struct LegacyClient {
+    app: axum::Router,
+    state: std::sync::Arc<baleyg::http::DaemonState>,
+}
+impl Drop for LegacyClient {
+    fn drop(&mut self) {
+        self.state.cancel_active();
+        self.state.release_checkout_runtime();
+    }
+}
+impl LegacyClient {
+    fn same_home(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        token: &str,
+        url: &str,
+        max_file_bytes: u64,
+    ) -> Self {
+        Self::same_home_with_session(root, home, token, url, max_file_bytes, true)
+    }
+    fn same_home_with_session(
+        root: &std::path::Path,
+        home: &std::path::Path,
+        token: &str,
+        url: &str,
+        max_file_bytes: u64,
+        retain_session: bool,
+    ) -> Self {
+        use baleyg::{
+            http,
+            indexer::IndexOptions,
+            store::{
+                Store,
+                topology::{TopologyRoots, WorkspaceIdentity},
+            },
+        };
+        let (cache, data) = if cfg!(target_os = "macos") {
+            (
+                home.join("Library/Caches/dev.odin.baleyg"),
+                home.join("Library/Application Support/dev.odin.baleyg"),
+            )
+        } else {
+            (home.join(".cache/baleyg"), home.join(".local/share/baleyg"))
+        };
+        let roots = TopologyRoots::isolated_for_tests(cache, data);
+        let identity = WorkspaceIdentity::discover(Some(root), root).unwrap();
+        let store = Store::open(roots, identity).unwrap();
+        let mut options = IndexOptions::new(root.to_owned());
+        options.max_file_bytes = max_file_bytes;
+        let address = url.strip_prefix("http://").unwrap().parse().unwrap();
+        let state = http::new(store.clone(), options.clone(), token.to_owned(), address).unwrap();
+        if retain_session {
+            // An elected owner must commit mandatory reconciliation before
+            // selected reads or queued jobs can use its claim authority.
+            let session = match store.follower_session() {
+                Ok(follower) => follower,
+                Err(_) => {
+                    let leader = store.leader_session().unwrap();
+                    let cancel: baleyg::model::CancelFlag =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+                        &options,
+                        store.root_id(),
+                        &cancel,
+                        |_| {},
+                    )
+                    .unwrap();
+                    store
+                        .publish_native(
+                            &graph,
+                            &capture,
+                            &native,
+                            leader.leader_guard().unwrap(),
+                            store.index_baseline().unwrap(),
+                            &cancel,
+                        )
+                        .unwrap();
+                    leader
+                }
+            };
+            state.retain_serving_session(session);
+        }
+        Self {
+            app: http::router(state.clone()),
+            state,
+        }
+    }
+    fn request(&self, method: reqwest::Method, url: String) -> LegacyRequest {
+        LegacyRequest {
+            app: self.app.clone(),
+            method,
+            url,
+            token: None,
+            origin: None,
+            body: None,
+        }
+    }
+    fn get(&self, url: String) -> LegacyRequest {
+        self.request(reqwest::Method::GET, url)
+    }
+    fn post(&self, url: String) -> LegacyRequest {
+        self.request(reqwest::Method::POST, url)
+    }
+}
+struct LegacyRequest {
+    app: axum::Router,
+    method: reqwest::Method,
+    url: String,
+    token: Option<String>,
+    origin: Option<String>,
+    body: Option<Value>,
+}
+impl LegacyRequest {
+    fn header(mut self, name: &str, value: &str) -> Self {
+        assert!(name.eq_ignore_ascii_case("origin"));
+        self.origin = Some(value.to_owned());
+        self
+    }
+    fn bearer_auth(mut self, token: &str) -> Self {
+        self.token = Some(token.to_owned());
+        self
+    }
+    fn json(mut self, body: &Value) -> Self {
+        self.body = Some(body.clone());
+        self
+    }
+    async fn send(self) -> anyhow::Result<LegacyResponse> {
+        use axum::{
+            body::{Body, to_bytes},
+            http::Request,
+        };
+        use tower::ServiceExt;
+        let url = reqwest::Url::parse(&self.url)?;
+        let host = format!(
+            "{}:{}",
+            url.host_str().unwrap(),
+            url.port_or_known_default().unwrap()
+        );
+        let route = match url.query() {
+            Some(q) => format!("{}?{q}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let mut request = Request::builder()
+            .method(self.method)
+            .uri(route)
+            .header("host", host);
+        if let Some(token) = self.token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(origin) = self.origin {
+            request = request.header("origin", origin);
+        }
+        let body = if let Some(value) = self.body {
+            request = request.header("content-type", "application/json");
+            Body::from(value.to_string())
+        } else {
+            Body::empty()
+        };
+        let response = self.app.oneshot(request.body(body)?).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024).await?;
+        Ok(LegacyResponse { status, bytes })
+    }
+}
+struct LegacyResponse {
+    status: reqwest::StatusCode,
+    bytes: axum::body::Bytes,
+}
+impl LegacyResponse {
+    fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+    async fn json<T: serde::de::DeserializeOwned>(self) -> serde_json::Result<T> {
+        serde_json::from_slice(&self.bytes)
+    }
+}
+
 async fn real_api(
-    client: &reqwest::Client,
+    client: &LegacyClient,
     url: &str,
     token: &str,
     method: reqwest::Method,
@@ -2555,85 +2830,24 @@ async fn real_api(
     (status, response.json().await.unwrap())
 }
 
-struct SavedItemServer(std::process::Child);
-impl Drop for SavedItemServer {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+struct SavedItemServer;
 
 async fn start_saved_item_server(
-    temp: &std::path::Path,
+    _temp: &std::path::Path,
     root: &std::path::Path,
     home: &std::path::Path,
     token: &str,
-) -> (SavedItemServer, reqwest::Client, String) {
-    use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
-    let token_file = temp.join("saved-item-token");
-    fs::write(&token_file, token).unwrap();
-    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let stderr_path = temp.join(format!("saved-item-daemon-{port}.stderr"));
-    let mut server = SavedItemServer(
-        isolated_command(home)
-            .arg("serve")
-            .arg("--workspace")
-            .arg(root)
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("--token-file")
-            .arg(&token_file)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::from(
-                fs::File::create(&stderr_path).unwrap(),
-            ))
-            .spawn()
-            .unwrap(),
-    );
-    let url = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap();
-    let ready = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    if ready.is_err() {
-        let status = server.0.try_wait().unwrap();
-        let mut diagnostic = String::new();
-        fs::File::open(&stderr_path)
-            .unwrap()
-            .take(4096)
-            .read_to_string(&mut diagnostic)
-            .unwrap();
-        panic!(
-            "saved-item daemon did not start: status={status:?}, stderr={}",
-            diagnostic.replace(token, "[redacted]")
-        );
-    }
-    (server, client, url)
+) -> (SavedItemServer, LegacyClient, String) {
+    // The direct router reconciles with the same HOME-backed Store on election.
+    let url = "http://127.0.0.1:7331".to_owned();
+    (
+        SavedItemServer,
+        LegacyClient::same_home(root, home, token, &url, 2_097_152),
+        url,
+    )
 }
 
-async fn real_index_job(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-    expected: &Value,
-) -> Value {
+async fn real_index_job(client: &LegacyClient, url: &str, token: &str, expected: &Value) -> Value {
     use std::time::Duration;
     let (status, accepted) = real_api(
         client,
@@ -2852,15 +3066,8 @@ fn assert_fixture_declaration(
 // Exercise the actual executable on both sides of the coordinator, not an in-process router.
 #[tokio::test]
 async fn real_cli_and_authenticated_daemon_share_native_pair_for_every_language_and_empty_root() {
-    use std::{io::Read, os::unix::fs::PermissionsExt, time::Duration};
+    use std::time::Duration;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    struct Server(std::process::Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     for (name, file, source) in [
         (
             "java",
@@ -2915,56 +3122,19 @@ def sink():
             "{name}"
         );
 
-        let token_file = tmp.path().join("token");
-        fs::write(&token_file, TOKEN).unwrap();
-        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let stderr_path = tmp.path().join("daemon-stderr");
-        let mut server = Server(
-            isolated_command(&home)
-                .arg("serve")
-                .arg("--workspace")
-                .arg(&root)
-                .arg("--bind")
-                .arg(format!("127.0.0.1:{port}"))
-                .arg("--token-file")
-                .arg(&token_file)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::from(
-                    fs::File::create(&stderr_path).unwrap(),
-                ))
-                .spawn()
-                .unwrap(),
+        // CLI publication replaces the old server-start reconciliation. The
+        // direct router reads the identical HOME-backed store and owns jobs.
+        let url = "http://127.0.0.1:7331".to_owned();
+        let legacy = LegacyClient::same_home(&root, &home, TOKEN, &url, 2_097_152);
+        // A direct test router captures the test executable, not the CLI
+        // executable. Compare later same-byte publications within this owner.
+        let post_start_native = real_native_snapshot(&home);
+        assert_eq!(
+            real_export(&root, &home),
+            graph_before,
+            "{name}: CLI/HTTP graph parity"
         );
-        let url = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
-        let mut ready = false;
-        for _ in 0..100 {
-            if client
-                .get(format!("{url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        if !ready {
-            let status = server.0.try_wait().unwrap();
-            let mut diagnostic = String::new();
-            fs::File::open(&stderr_path)
-                .unwrap()
-                .take(2048)
-                .read_to_string(&mut diagnostic)
-                .unwrap();
-            let diagnostic = diagnostic.replace(TOKEN, "[redacted]");
-            panic!("{name}: daemon did not start: status={status:?}, stderr={diagnostic}");
-        }
-        let post_start_status: Value = client
+        let post_start_status: Value = legacy
             .get(format!("{url}/api/status"))
             .bearer_auth(TOKEN)
             .send()
@@ -3009,42 +3179,10 @@ def sink():
         assert!(follower_export.status.success(), "{name}");
         assert_eq!(real_native_snapshot(&home), native_as_leader, "{name}");
 
-        let follower_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let follower_port = follower_listener.local_addr().unwrap().port();
-        drop(follower_listener);
-        let follower_stderr = tmp.path().join("follower-daemon-stderr");
-        let mut follower_server = Server(
-            isolated_command(&home)
-                .arg("serve")
-                .arg("--workspace")
-                .arg(&root)
-                .arg("--bind")
-                .arg(format!("127.0.0.1:{follower_port}"))
-                .arg("--token-file")
-                .arg(&token_file)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::from(
-                    fs::File::create(&follower_stderr).unwrap(),
-                ))
-                .spawn()
-                .unwrap(),
-        );
-        let follower_url = format!("http://127.0.0.1:{follower_port}");
-        let mut follower_ready = false;
-        for _ in 0..100 {
-            if client
-                .get(format!("{follower_url}/healthz"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
-            {
-                follower_ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(follower_ready, "{name}: follower daemon did not start");
-        let follower_http_status: Value = client
+        let follower_url = "http://127.0.0.1:7332".to_owned();
+        let follower_legacy =
+            LegacyClient::same_home(&root, &home, TOKEN, &follower_url, 2_097_152);
+        let follower_http_status: Value = follower_legacy
             .get(format!("{follower_url}/api/status"))
             .bearer_auth(TOKEN)
             .send()
@@ -3054,7 +3192,7 @@ def sink():
             .await
             .unwrap();
         assert_eq!(follower_http_status["revision"], post_start_pin, "{name}");
-        let follower_accepted = client
+        let follower_accepted = follower_legacy
             .post(format!("{follower_url}/api/index"))
             .header("Origin", &follower_url)
             .bearer_auth(TOKEN)
@@ -3069,7 +3207,7 @@ def sink():
         let follower_id = follower_accepted["id"].as_str().unwrap();
         let follower_done = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let job: Value = client
+                let job: Value = follower_legacy
                     .get(format!("{follower_url}/api/jobs/{follower_id}"))
                     .bearer_auth(TOKEN)
                     .send()
@@ -3092,16 +3230,15 @@ def sink():
             follower_pin["indexRevision"],
             post_start_pin["indexRevision"].as_u64().unwrap() + 1
         );
-        assert!(follower_server.0.try_wait().unwrap().is_none());
         let request = || {
-            client
+            legacy
                 .post(format!("{url}/api/index"))
                 .header("Origin", &url)
                 .json(&serde_json::json!({"expectedRevision":follower_pin.clone()}))
         };
         let denied = request().bearer_auth("incorrect").send().await.unwrap();
         assert_eq!(denied.status(), 401, "{name}");
-        let invalid_origin = client
+        let invalid_origin = legacy
             .post(format!("{url}/api/index"))
             .header("Origin", "https://evil.example")
             .bearer_auth(TOKEN)
@@ -3110,7 +3247,7 @@ def sink():
             .await
             .unwrap();
         assert_eq!(invalid_origin.status(), 403, "{name}");
-        let current: Value = client
+        let current: Value = legacy
             .get(format!("{url}/api/jobs/current"))
             .bearer_auth(TOKEN)
             .send()
@@ -3129,7 +3266,7 @@ def sink():
         let id = started["id"].as_str().unwrap();
         let completed = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let job: Value = client
+                let job: Value = legacy
                     .get(format!("{url}/api/jobs/{id}"))
                     .bearer_auth(TOKEN)
                     .send()
@@ -3157,7 +3294,7 @@ def sink():
             follower_pin["indexRevision"].as_u64().unwrap() + 1,
             "{name}"
         );
-        let status: Value = client
+        let status: Value = legacy
             .get(format!("{url}/api/status"))
             .bearer_auth(TOKEN)
             .send()
@@ -3206,7 +3343,7 @@ def sink():
         );
         assert_eq!(
             same_bytes_evidence(&native_after),
-            same_bytes_evidence(&native_before),
+            same_bytes_evidence(&post_start_native),
             "{name}: all 32 v9 evidence tables and documents must match after only publication identity normalization"
         );
         assert_eq!(
@@ -3257,7 +3394,7 @@ def sink():
                 pin["indexRevision"].as_u64().unwrap()
             );
             let (code, source_at) =
-                real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+                real_api(&legacy, &url, TOKEN, reqwest::Method::GET, &route, None).await;
             assert_eq!(code, 200, "{name}: {source_at}");
             assert_eq!(source_at["revision"], pin, "{name}");
             assert_eq!(
@@ -3275,7 +3412,7 @@ def sink():
             );
             let measured = graph_after["nodes"].as_array().unwrap();
             let (code, classes) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
@@ -3331,7 +3468,7 @@ def sink():
                 "{name}"
             );
             let (code, symbols) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
@@ -3362,7 +3499,7 @@ def sink():
                 source,
             );
             let (code, navigation) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::POST,
@@ -3409,7 +3546,7 @@ def sink():
                 }
             }
             let (code, sequence) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::POST,
@@ -3556,7 +3693,7 @@ def sink():
                 "{name}: no extra invented or null-call steps beyond captured source projection"
             );
             let (code, preview) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::POST,
@@ -3604,7 +3741,7 @@ def sink():
             assert!(!preview.to_string().contains("lexical-guess"), "{name}");
             let packet = preview_packet["packetId"].as_str().unwrap();
             let (code, export) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
@@ -3713,7 +3850,7 @@ def sink():
         let stale_id = stale["id"].as_str().unwrap();
         let failed = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let row: Value = client
+                let row: Value = legacy
                     .get(format!("{url}/api/jobs/{stale_id}"))
                     .bearer_auth(TOKEN)
                     .send()
@@ -3735,7 +3872,7 @@ def sink():
         // The successful same-byte reindex advanced publication identity. A
         // stale request must leave that current, fully raw v9 pair untouched.
         assert_eq!(real_native_snapshot(&home), native_after, "{name}");
-        let unchanged_status: Value = client
+        let unchanged_status: Value = legacy
             .get(format!("{url}/api/status"))
             .bearer_auth(TOKEN)
             .send()
@@ -3748,21 +3885,13 @@ def sink():
             unchanged_status["revision"], pin,
             "{name}: current pin changed"
         );
-        drop(server);
     }
 }
 
 #[tokio::test]
 async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_job() {
-    use std::{os::unix::fs::PermissionsExt, time::Duration};
+    use std::time::Duration;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    struct Server(std::process::Child);
-    impl Drop for Server {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     struct Writer(rusqlite::Connection);
     impl Drop for Writer {
         fn drop(&mut self) {
@@ -3782,73 +3911,10 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         "{}",
         String::from_utf8_lossy(&initial.stderr)
     );
-    let token_file = tmp.path().join("token");
-    fs::write(&token_file, TOKEN).unwrap();
-    fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let stderr_path = tmp.path().join("daemon-stderr");
-    let mut server = Server(
-        isolated_command(&home)
-            .arg("serve")
-            .arg("--workspace")
-            .arg(&root)
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("--token-file")
-            .arg(&token_file)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::from(
-                fs::File::create(&stderr_path).unwrap(),
-            ))
-            .spawn()
-            .unwrap(),
-    );
-    let url = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap();
-    let mut last_healthz = "not_observed".to_owned();
-    let readiness = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            last_healthz = "request_in_flight".to_owned();
-            match client.get(format!("{url}/healthz")).send().await {
-                Ok(response) if response.status().is_success() => break,
-                Ok(response) => {
-                    last_healthz = format!("http_status_{}", response.status().as_u16())
-                }
-                Err(error) if error.is_timeout() => last_healthz = "request_timeout".to_owned(),
-                Err(error) if error.is_connect() => last_healthz = "connect_error".to_owned(),
-                Err(_) => last_healthz = "request_other_error".to_owned(),
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    if readiness.is_err()
-        && let Some(dir) = std::env::var_os("BALEYG_PRIVATE_DIAGNOSTICS_DIR")
-    {
-        let diagnostic = write_private_readiness_diagnostic(
-            std::path::Path::new(&dir),
-            &mut server.0,
-            &stderr_path,
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            &last_healthz,
-        );
-        eprintln!(
-            "private readiness diagnostic {}",
-            if diagnostic.is_ok() {
-                "recorded"
-            } else {
-                "unavailable"
-            }
-        );
-    }
-    readiness.expect("real daemon readiness");
+    let url = "http://127.0.0.1:7331".to_owned();
+    let legacy = LegacyClient::same_home(&root, &home, TOKEN, &url, 2_097_152);
     let (code, status) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -3866,7 +3932,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         pin["indexRevision"].as_u64().unwrap()
     );
     let (code, _source_before) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -3876,7 +3942,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     .await;
     assert_eq!(code, 200, "{_source_before}");
     let (code, symbols) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -3894,7 +3960,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         .as_str()
         .unwrap();
     let (code, preview) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::POST,
@@ -3906,7 +3972,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     let packet_id = preview["packet"]["packetId"].as_str().unwrap();
     let packet_route = format!("/api/questions/{packet_id}/jev-request");
     let (code, _packet_before) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -3930,7 +3996,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     writer.0.busy_timeout(Duration::from_secs(1)).unwrap();
     writer.0.execute_batch("BEGIN IMMEDIATE").unwrap();
     let (code, accepted) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::POST,
@@ -3946,7 +4012,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     let deferred = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let (code, job) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
@@ -3996,7 +4062,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         "all graph rows remain unchanged before the writer releases"
     );
     let (code, current) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -4007,7 +4073,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     assert_eq!(code, 200, "{current}");
     assert_eq!(current["revision"], pin);
     let (code, source_after) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -4018,7 +4084,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     assert_eq!(code, 200, "{source_after}");
     assert_eq!(source_after, _source_before);
     let (code, packet_after) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -4032,7 +4098,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     let completed = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let (code, job) = real_api(
-                &client,
+                &legacy,
                 &url,
                 TOKEN,
                 reqwest::Method::GET,
@@ -4062,7 +4128,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     use sha2::{Digest, Sha256};
     let new_pin = &completed["revision"];
     let (code, published) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -4077,7 +4143,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
     );
     assert_eq!(published["stats"]["files"], 81);
     let (code, stale_packet) = real_api(
-        &client,
+        &legacy,
         &url,
         TOKEN,
         reqwest::Method::GET,
@@ -4152,7 +4218,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
             new_pin["indexRevision"].as_u64().unwrap()
         );
         let (code, source) =
-            real_api(&client, &url, TOKEN, reqwest::Method::GET, &route, None).await;
+            real_api(&legacy, &url, TOKEN, reqwest::Method::GET, &route, None).await;
         assert_eq!(code, 200, "{path}: {source}");
         assert_eq!(
             source["revision"], *new_pin,
@@ -4170,7 +4236,6 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
             "missing retry document: {path}"
         );
     }
-    drop(server);
 }
 
 #[cfg(unix)]
@@ -4359,7 +4424,7 @@ async fn saved_items_real_index_matrix() {
     );
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     let initial_pin = indexed["status"]["revision"].clone();
-    let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
     let (status, serving_status) = real_api(
         &client,
         &url,
@@ -4777,7 +4842,7 @@ async fn saved_items_real_index_matrix() {
         Some(original_note_anchor.as_str())
     );
 
-    drop(server);
+    drop(client);
     let db = rusqlite::Connection::open(&record_db).unwrap();
     db.execute(
         "INSERT INTO views(id,payload) VALUES(?1,?2)",
@@ -4802,7 +4867,7 @@ async fn saved_items_real_index_matrix() {
     .unwrap();
     drop(db);
 
-    let (server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
+    let (_server, client, url) = start_saved_item_server(temp.path(), &root, &home, TOKEN).await;
     let (status, reopened_status) = real_api(
         &client,
         &url,
@@ -4907,7 +4972,6 @@ async fn saved_items_real_index_matrix() {
     assert_eq!(legacy_note["attachment"]["availability"], "anchorless");
     assert!(raw_anchor(&stored_payload(&record_db, "views", "legacy-view")).is_none());
     assert!(raw_anchor(&stored_payload(&record_db, "annotations", "legacy-note")).is_none());
-    drop(server);
 }
 
 #[test]

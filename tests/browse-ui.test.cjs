@@ -12,6 +12,8 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return {promise, resolve, reject};
 }
+const ROOT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SCOPED = `/api/checkouts/${ROOT}`;
 function harness(windowOptions = {}) {
   const elements = new Map(), blobs = [], downloads = [], timers = new Map();
   let nextTimer = 0;
@@ -34,7 +36,23 @@ function harness(windowOptions = {}) {
     fetch() { throw new Error("Unexpected request"); }});
   const run = code => vm.runInContext(code, context);
   run(source);
-  run(`token = 'synthetic'; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  run(`token = 'synthetic'; selectedRootKey = '${ROOT}'; checkouts = [{rootKey:'${ROOT}',workspaceRoot:'/synthetic',state:'available',active:false}]; seed = 'root'; status = {revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}};`);
+  // The app receives the production scoped URL; legacy suffixes below remain the
+  // fixture handlers' semantic route names, never an unscoped network fallback.
+  let handler = context.fetch;
+  const networkUrls = [];
+  Object.defineProperty(context, "fetch", {configurable:true, get:() => request, set(fn) {handler = fn;}});
+  const request = (url, ...args) => {
+    networkUrls.push(url);
+    if (url === "/api/checkouts" || url === "/api/daemon/status") {
+      assert.equal(args[0]?.method, "GET");
+      return handler(url, ...args);
+    }
+    assert.ok(url.startsWith(`${SCOPED}/`), `Unexpected unscoped or wrong-root request: ${url}`);
+    const result = handler("/api" + url.slice(SCOPED.length), ...args);
+    if (!url.startsWith(`${SCOPED}/status`)) return result;
+    return Promise.resolve(result).then(reply => reply.ok ? {...reply, json:async () => ({workspaceRoot:"/synthetic", ...await reply.json()})} : reply);
+  };
   const preserveNewFocus = () => {
     run(`querySerial++; questionSerial++; status = {revision:{...status.revision,indexRevision:status.revision.indexRevision+1}};
       packet = {packetId:'new'}; focused = {marker:'new'};
@@ -46,7 +64,7 @@ function harness(windowOptions = {}) {
     assert.equal(get("focus-state").textContent, "new valid focus");
     assert.equal(get("error").hidden, true);
   };
-  return {context, run, get, blobs, downloads, timers, preserveNewFocus, assertPreserved};
+  return {context, run, get, blobs, downloads, timers, networkUrls, preserveNewFocus, assertPreserved};
 }
 
 
@@ -440,9 +458,12 @@ for(const invalidation of ["clearBrowse()", "status={revision:{indexGeneration:'
 test("successful reconnect clears an earlier authentication error", async () => {
   const h=harness(); h.get('error').hidden=false; h.get('error').textContent='Bearer authentication required';
   h.get('token').value='synthetic';
+  h.context.fetch = async url => url === "/api/checkouts" ? response({checkouts:[{rootKey:ROOT,workspaceRoot:"/synthetic",state:"available",active:false}]})
+    : url === "/api/daemon/status" ? response({activeCheckouts:0}) : response(null);
   h.run('refreshStatus=async()=>{}; loadSaved=async()=>{}; refreshJevStatus=async()=>{}; refreshAcpStatus=async()=>{}');
   h.get('connect-form').listeners.submit({preventDefault(){}});
   await new Promise(resolve=>setImmediate(resolve));
+  h.get('checkout-select').value=ROOT; await h.get('checkout-select').listeners.change({target:h.get('checkout-select')});
   assert.equal(h.get('error').hidden,true); assert.equal(h.get('error').textContent,'');
   assert.equal(h.get('workspace').hidden,false);
 });
@@ -655,7 +676,7 @@ test("non-revision 409 preserves the loaded tree and reports its exact error", a
   assert.equal(requests.filter(url => url === "/api/status").length, 0);
   await h.run("refreshStatus()");
   assert.match(text(h.get("file-tree")), /README.md/);
-  assert.equal(requests.filter(url => url.startsWith("/api/tree")).length, 1);
+  assert.equal(requests.filter(url => url.startsWith("/api/tree")).length, 2);
 });
 
 test("revision_conflict reloads the complete new pair after clearing browse", async () => {
