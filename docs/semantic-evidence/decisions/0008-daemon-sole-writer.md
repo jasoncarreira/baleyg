@@ -67,7 +67,8 @@ When a daemon instance activates a checkout, **or a running daemon detects that 
 A crash at any point simply repeats these steps on the next activation. No **durable** cross-process handoff or quarantine state is kept, and no owner lease. A live daemon still blocks H and claims until the queue outcome is verified, or until recovery restarts.
 
 **What a crash guarantees:**
-- **Every accepted request ID reaches exactly one durable terminal result** (`done` or `failed`).
+- **Every accepted request ID reaches exactly one durable terminal result** (`done` or `failed`) **for as long as its queue exists.**
+- The queue (`requests.db`) lives in the derived index directory. When GC deletes an eligible index under Decision 0006 §2 (root missing or replaced, or 30 days unopened), any request still pending in that queue is abandoned with it. A later lookup of that ID returns a typed `not_found`. Decision 0006's GC policy is unchanged; in practice, those requests could never run (root gone) or have had no waiter for 30 days.
 - This is not a promise of one execution or one revision: a crash between committing an index revision and completing the queue row can redo the work, which can produce an additional revision.
 - FIFO order and pin correctness still hold. A completed row's pin names a committed, validated revision, and no row is claimed out of order.
 
