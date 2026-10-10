@@ -665,16 +665,32 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
     drop(db);
     drop(leader);
 
-    for closed in [
-        store.status().unwrap_err(),
-        store.class_diagram_at(&q).unwrap_err(),
-        store.graph().unwrap_err(),
-    ] {
-        assert!(
-            closed.to_string().contains("incompatible_index"),
-            "{closed:#}"
-        );
-    }
+    assert_eq!(
+        store.status().unwrap().revision,
+        prior,
+        "removing the forged trigger restores coherent old A reads"
+    );
+    let restored = store.evidence_response().unwrap();
+    assert_eq!(restored.status().unwrap().revision, prior);
+    let restored_page = serde_json::to_value(
+        restored
+            .classes_at(Some("Types.java"), "", Some(prior), 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored_page, page,
+        "committed old A page must match original"
+    );
+    assert!(
+        !restored_page.to_string().contains("\"Added\""),
+        "failed publication must not expose an uncommitted class"
+    );
+    assert_eq!(
+        serde_json::to_value(restored.class_diagram_at(&q).unwrap()).unwrap(),
+        before
+    );
+    restored.finish(()).unwrap();
 
     let control = store.index_baseline().unwrap();
     assert_eq!(control, prior);
@@ -1292,13 +1308,17 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "incompatible_index");
     assert!(body.get("items").is_none());
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let corrupt = response
+        .classes_at(None, "A", Some(pin), 0, 100)
+        .unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        corrupt.to_string().contains("incompatible_index"),
+        "{corrupt:#}"
     );
+    response.finish(()).unwrap();
 
     // The diagram endpoint independently reports selected class decode corruption.
     let (dir, store, graph, app, _session) = setup();
@@ -1321,13 +1341,17 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "incompatible_index");
     assert!(body.get("nodes").is_none());
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let corrupt = response
+        .class_diagram_at(&request(class_id.clone(), &store))
+        .unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        corrupt.to_string().contains("incompatible_index"),
+        "{corrupt:#}"
     );
+    response.finish(()).unwrap();
 
     // A selected method seed reaches only the resolver's persisted Symbol decode.
     let (dir, store, graph, app, _session) = setup();
@@ -1349,13 +1373,17 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "incompatible_index");
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let corrupt = response
+        .class_diagram_at(&request(method_id.clone(), &store))
+        .unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        corrupt.to_string().contains("incompatible_index"),
+        "{corrupt:#}"
     );
+    response.finish(()).unwrap();
 
     // Valid top-level JSON with a non-object member is refused before clipped JSON1.
     let (dir, store, graph, app, _session) = setup();
@@ -1377,13 +1405,17 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"]["code"], "incompatible_index");
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let corrupt = response
+        .classes_at(None, "A", Some(pin), 0, 100)
+        .unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        corrupt.to_string().contains("incompatible_index"),
+        "{corrupt:#}"
     );
+    response.finish(()).unwrap();
 
     // A genuine request-domain failure stays HTTP 400 and does not close the Store.
     let (_dir, store, graph, app, _session) = setup();
