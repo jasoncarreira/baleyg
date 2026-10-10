@@ -1,6 +1,6 @@
 # Trellis interface direction
 
-Approved by the user from `~/Downloads/Trellis UI.html`. The reference is a visual/interaction
+Approved by the user from `~/Downloads/Baleyg UI.html`. The reference is a visual/interaction
 model, not evidence of implemented compiler, agent, terminal or class-diagram capabilities.
 
 ## Planned unified workbench

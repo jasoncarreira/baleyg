@@ -6,7 +6,7 @@
       "index_phases_ms": {},
       "label": "serve-first-ready",
       "phase_visibility": "Serve callback suppresses index-phase markers",
-      "readiness_output": "Trellis: http://127.0.0.1:62682/\nState: <private-scratch>/private-home/Library/Caches/dev.squashmerge.trellis\nToken file: <private-scratch>/serve-token\nRefresh is explicit. No repository commands run.\nLive inference disabled. Offline preview/export/import only.\n"
+      "readiness_output": "Baleyg: http://127.0.0.1:62682/\nState: <private-scratch>/private-home/Library/Caches/dev.odin.baleyg\nToken file: <private-scratch>/serve-token\nRefresh is explicit. No repository commands run.\nLive inference disabled. Offline preview/export/import only.\n"
     },
     {
       "elapsed_s": 0.0087,
