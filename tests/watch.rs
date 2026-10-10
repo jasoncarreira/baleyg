@@ -1377,11 +1377,19 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                 // status snapshot and the final catching-up probe.
                 if body["catchingUp"] == false {
                     let current = cli(&root, &home, "status").output().unwrap();
-                    assert!(
-                        current.status.success(),
-                        "settled old response lacks a decodable current head: {:?}",
-                        current.stderr
-                    );
+                    if !current.status.success() {
+                        let error = String::from_utf8_lossy(&current.stderr);
+                        assert!(
+                            error.trim_start().starts_with("Error: storage_busy:"),
+                            "settled old response lacks a decodable current head: {error}"
+                        );
+                        assert!(
+                            Instant::now() < ready_deadline,
+                            "current-head BUSY outlived the request-free H deadline: {error}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     let current: serde_json::Value =
                         serde_json::from_slice(&current.stdout).unwrap();
                     assert_eq!(
