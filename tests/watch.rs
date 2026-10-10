@@ -1372,12 +1372,34 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Some(revision) if revision == prior_revision => {
-                // A coherent predecessor is readable even before another owner
-                // acquires EX. It must remain catching up until H and work settle.
-                assert_eq!(
-                    body["catchingUp"], true,
-                    "prior pin cannot be fully settled"
-                );
+                // A coherent predecessor is readable without a live EX. Freshness
+                // is sampled separately from that pin: H may commit between the
+                // status snapshot and the final catching-up probe.
+                if body["catchingUp"] == false {
+                    let current = cli(&root, &home, "status").output().unwrap();
+                    assert!(
+                        current.status.success(),
+                        "settled old response lacks a decodable current head: {:?}",
+                        current.stderr
+                    );
+                    let current: serde_json::Value =
+                        serde_json::from_slice(&current.stdout).unwrap();
+                    assert_eq!(
+                        current["revision"]["indexGeneration"],
+                        old["revision"]["indexGeneration"]
+                    );
+                    assert!(
+                        current["revision"]["indexRevision"]
+                            .as_u64()
+                            .is_some_and(|revision| revision > prior_revision),
+                        "settled old response requires a newly committed H head: {body:?} {current:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        body["catchingUp"], true,
+                        "freshness must be a boolean: {body:?}"
+                    );
+                }
                 // A changed durable marker is not a live lease: a later retry
                 // may also fail and release EX before this status sample.
                 assert!(
