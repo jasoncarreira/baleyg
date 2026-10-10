@@ -131,9 +131,10 @@ fn first_index_is_invisible_until_validated_and_synced() {
     assert!(!dir.join("index.db").exists());
     assert_eq!(staged_files(&dir), vec![staged.clone()]);
     assert!(fs::metadata(&staged).unwrap().len() > 0);
-    let rival = Store::open_for_tests(state.path(), workspace.path()).unwrap_err();
+    let rival = Store::open_for_tests(state.path(), workspace.path());
     release.send(()).unwrap();
     let store = opener.join().unwrap().unwrap();
+    let rival = rival.unwrap_err();
     let refusal = rival.to_string();
     assert!(
         refusal == "storage_busy" || refusal.starts_with("storage_busy:"),
