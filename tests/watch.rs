@@ -1378,20 +1378,8 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                     body["catchingUp"], true,
                     "prior pin cannot be fully settled"
                 );
-                let marker = fs::read(&leader_lock).unwrap();
-                if marker != new_marker {
-                    // Once a different successor owns the marker, its EX must
-                    // remain held until mandatory H commits or fails.
-                    let probe = fs::OpenOptions::new()
-                        .read(true)
-                        .open(&leader_lock)
-                        .unwrap();
-                    assert_ne!(
-                        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                        0,
-                        "changed takeover marker without live successor EX"
-                    );
-                }
+                // A changed durable marker is not a live lease: a later retry
+                // may also fail and release EX before this status sample.
                 assert!(
                     Instant::now() < ready_deadline,
                     "repaired successor never committed H: prior_pin={:?} body={body:?} rows={:?} stderr={:?}",
