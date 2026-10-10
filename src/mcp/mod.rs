@@ -80,7 +80,7 @@ mod tests {
         let context =
             OpenedWorkspace::new(WorkspaceIdentity::discover(Some(&root), temp.path()).unwrap());
         assert_eq!(context.check(), Ok(()));
-        let marker = root.join(".git/baleyg/workspace-id");
+        let marker = root.join(".git/trellis/workspace-id");
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(context.check(), Err(IdentityError::StoreUnavailable));
         assert!(!marker.exists());
@@ -121,10 +121,10 @@ fn catching_up(
 /// Normal MCP calls do not connect to or wait for a test socket.
 fn phase_hook(stage: &str) -> std::io::Result<()> {
     use std::io::{Read, Write};
-    if std::env::var("BALEYG_TEST_MCP_PHASE").ok().as_deref() != Some(stage) {
+    if std::env::var("TRELLIS_TEST_MCP_PHASE").ok().as_deref() != Some(stage) {
         return Ok(());
     }
-    let path = std::env::var_os("BALEYG_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
+    let path = std::env::var_os("TRELLIS_TEST_MCP_PHASE_SOCKET").ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "missing MCP fixture socket",

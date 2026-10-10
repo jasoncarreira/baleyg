@@ -30,7 +30,7 @@ const example = fileURLToPath(
   ),
 );
 async function copyFixture() {
-  const parent = await mkdtemp(join(tmpdir(), "baleyg-publication-"));
+  const parent = await mkdtemp(join(tmpdir(), "trellis-publication-"));
   const root = join(parent, "example");
   await cp(example, root, { recursive: true });
   return {
@@ -300,7 +300,7 @@ test("publication: manifest paths, hashes and canonical bytes are checked withou
 
 test("CLI generate and check admit the directory's profile and language, like discovery", async () => {
   const parent = await realpath(
-    await mkdtemp(join(tmpdir(), "baleyg-cli-admission-")),
+    await mkdtemp(join(tmpdir(), "trellis-cli-admission-")),
   );
   try {
     const root = join(parent, "python");

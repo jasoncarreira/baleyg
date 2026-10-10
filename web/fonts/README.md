@@ -1,6 +1,6 @@
 # Local interface fonts
 
-Latin WOFF2 assets taken from the user-provided `Baleyg UI.html` design reference.
+Latin WOFF2 assets taken from the user-provided `Trellis UI.html` design reference.
 They are served locally; no font requests go to a CDN.
 
 - JetBrains Mono — JetBrains Mono Project Authors. `JetBrainsMono-OFL.txt`.

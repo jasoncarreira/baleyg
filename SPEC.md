@@ -1,4 +1,4 @@
-# Baleyg — Architecture Spec
+# Trellis — Architecture Spec
 
 **Status:** implemented Rust daemon and embedded browser with JavaScript/Rust/Java/Python syntax extraction, static sequences and Java/Python class diagrams. JavaScript SCIP import is implemented. Multi-language semantic import, the stdio MCP server, per-checkout indexes with real-time native refresh, coding-agent ACP sessions and diagram artifacts below are accepted direction, not shipped features; mechanics of the index/MCP topology remain proposed until Stage 1 of the semantic-index program ratifies them. The existing one-shot ACP answer adapter is separate. **Direction reviewed:** 2026-09-23.
 
@@ -13,7 +13,7 @@ matching main selections on two questions and a pruning/completeness tradeoff on
 third. These are call-selection sketches, not validated sequence diagrams; the broader
 evaluation is still pending.
 
-Baleyg is a diagram-first read surface over a codebase, usable by people and pluggable
+Trellis is a diagram-first read surface over a codebase, usable by people and pluggable
 coding agents through MCP. Agents may run directly in a terminal, optionally managed by
 Herdr, or connect through an optional ACP client/session surface, primarily for Mimir. Point it at a repository and get a readable class diagram; click a
 method and get a static sequence diagram. The future product vision adds a database connection
@@ -28,17 +28,17 @@ memory, and the eye traded for sight.
 
 ### Reconciliation and precedence (2026-09-20)
 
-This revision explicitly supersedes the earlier ACP-only / Baleyg-supervises-every-agent
+This revision explicitly supersedes the earlier ACP-only / Trellis-supervises-every-agent
 architecture and the earlier claim that LSP is reserved exclusively for writing.
 Sections 4, 6, 8 and 12 are the current agent/semantic integration direction:
 
 - MCP is the common portable tool contract for **direct terminal/Herdr agents and ACP agents**.
   Neither Herdr nor Mimir is required. ACP is a supported peer connection mode, not the
   universal agent runtime or the only way tools can be used.
-- Baleyg may implement an ACP client UI and supervise an adapter it explicitly starts.
+- Trellis may implement an ACP client UI and supervise an adapter it explicitly starts.
   That is not a new agent reasoning harness. External agents and Herdr panes keep their
   existing lifecycle owner. Mimir's single-client/provider-profile constraints still apply.
-- Agents reach Baleyg through `baleyg mcp`, a stdio MCP server the agent client launches in the
+- Agents reach Trellis through `trellis mcp`, a stdio MCP server the agent client launches in the
   checkout it works in. Each checkout, including every Git worktree, has its own index: a pure cache
   outside the checkout, keyed by the checkout's path. A shared per-file fact cache makes new and moved
   checkouts cheap to index. The first catalog is four read-only tools over syntax-tier evidence. There
@@ -158,7 +158,7 @@ The file viewer is read-only with syntax highlighting and jump-to-symbol.
 the code disagree, the code wins and the model re-derives.
 
 The index exists because the codebase, as a pile of files, cannot answer the questions
-Baleyg asks:
+Trellis asks:
 
 - **There is no query language over a codebase.** "Which types in this package
   transitively reach the payment gateway" is a traversal, and traversals need a
@@ -222,23 +222,23 @@ reconsider.
 
 ## 4. Processes and connection modes
 
-The core owns Baleyg's stores, query services and UI events. It supervises only processes
-that Baleyg explicitly launches, such as a future ACP adapter. It does **not** own every
-agent, shell or Herdr pane associated with a project. `baleyg mcp` processes are owned by the
+The core owns Trellis's stores, query services and UI events. It supervises only processes
+that Trellis explicitly launches, such as a future ACP adapter. It does **not** own every
+agent, shell or Herdr pane associated with a project. `trellis mcp` processes are owned by the
 agent clients that launch them and exit with those clients; they need no supervisor. The browser
-daemon and any `baleyg mcp` process share each index through SQLite: whichever holds the leader lock
+daemon and any `trellis mcp` process share each index through SQLite: whichever holds the leader lock
 watches and writes; the others read and queue explicit index requests to it.
 
 ```mermaid
 flowchart LR
-  UI[Baleyg browser] -->|explicit requests| CORE[Baleyg core]
+  UI[Trellis browser] -->|explicit requests| CORE[Trellis core]
   CORE -->|evidence and artifact events| UI
   CORE --> M[(Per-checkout index and out-of-tree durable data)]
-  DIRECT[Direct agent: embedded or external terminal] -->|launches, stdio MCP| MCP[baleyg mcp, one per agent session]
+  DIRECT[Direct agent: embedded or external terminal] -->|launches, stdio MCP| MCP[trellis mcp, one per agent session]
   UI <-->|authenticated terminal stream| PTY[Owned PTY service]
   PTY -->|explicit launch only| DIRECT
   HERDR[Agent in optional Herdr pane] -->|same MCP contract| MCP
-  UI -->|optional ACP session controls| ACP[Baleyg ACP client adapter]
+  UI -->|optional ACP session controls| ACP[Trellis ACP client adapter]
   ACP -->|negotiated ACP| HARNESS[Existing harness or Mimir proxy]
   HARNESS -->|same tools via admitted local bridge| MCP
   MCP -->|read-only SQLite snapshots| M
@@ -246,13 +246,13 @@ flowchart LR
   CORE -. optional metadata association .-> HM[Herdr adapter]
 ```
 
-**Direct mode.** The user launches an MCP-capable agent in a Baleyg terminal tab, a normal
-terminal or Herdr and configures Baleyg's MCP server. No ACP client, agent registry, Baleyg-owned PTY or Herdr
+**Direct mode.** The user launches an MCP-capable agent in a Trellis terminal tab, a normal
+terminal or Herdr and configures Trellis's MCP server. No ACP client, agent registry, Trellis-owned PTY or Herdr
 connection is required. The existing harness owns its agent lifecycle and write/command policy.
 
-**ACP mode.** Baleyg may offer a client/session UI to launch or connect to an explicitly
+**ACP mode.** Trellis may offer a client/session UI to launch or connect to an explicitly
 configured ACP adapter, primarily Mimir. ACP carries prompts, progress, cancellation and
-negotiated permission requests. The same Baleyg MCP tools remain the code/diagram interface.
+negotiated permission requests. The same Trellis MCP tools remain the code/diagram interface.
 Client-hosted tools for a remote Mimir brain need its reviewed provider extension; arbitrary
 MCP servers cannot simply be added to today's fixed Hands profile. Do not attach a second
 observer/client beside an existing Mimir ACP client when the daemon admits only one.
@@ -263,11 +263,11 @@ Do not scrape terminal text as a tool protocol, steal focus, invent supported ag
 close/restart external processes. A discovered workspace is not an indexing or access grant.
 
 **Accepted target UI: one workbench.** Keep diagrams and source in the main area, with docked,
-resizable terminal tabs so the user can watch and operate agents without leaving Baleyg. ACP
+resizable terminal tabs so the user can watch and operate agents without leaving Trellis. ACP
 conversation/tool/approval tabs belong in the same workbench but are not fake terminal streams.
 External terminals remain supported; embedding is not a requirement for the MCP server.
 
-A direct agent launched from Baleyg gets a real PTY and bounded/backpressured browser rendering
+A direct agent launched from Trellis gets a real PTY and bounded/backpressured browser rendering
 (for example, a local xterm.js client with a Rust PTY host). A Herdr-managed terminal may be
 embedded only through a supported, tested attach/stream interface; metadata subscriptions,
 `pane.read` snapshots and `pane.send_input` alone do not establish a faithful interactive PTY.
@@ -278,7 +278,7 @@ IPC, output history and resize/input queues must be bounded. Authenticate termin
 verify Host/Origin, exclude credentials from URLs/logs, and require an explicit grant for input.
 Treat terminal control sequences as untrusted: clipboard writes, external links and other side
 effects need a deliberate policy. Browser refresh/disconnect must not silently destroy a session;
-terminate is a separate explicit operation limited to processes Baleyg owns. Source/diagram
+terminate is a separate explicit operation limited to processes Trellis owns. Source/diagram
 selection or publication must not start inference, read source, or execute commands. Cancellation
 revokes future operations but cannot undo completed effects or unsend disclosed source.
 See the [terminal workbench contract](docs/terminal-workbench-contract.md).
@@ -469,7 +469,7 @@ Freshness must cover source bytes and the relevant tool/config/dependency basis,
 SHA: dirty trees, non-Git roots and unchanged files with changed dependencies exist. Retain producer
 version, language/encoding metadata, manifest hashes and admitted root mapping. Reject mismatched,
 malformed, oversized or unsupported artifacts before publication. Do not download tools on opening
-Baleyg or silently retry a build to resolve missing evidence.
+Trellis or silently retry a build to resolve missing evidence.
 
 Stale semantic evidence must be rejected or downgraded visibly, preserving syntax-only browsing.
 The current system uses explicit full refresh. The accepted direction adds a file watcher that refreshes
@@ -557,7 +557,7 @@ producer tools. Automatic producer scheduling stays off.
 - **Cleanup.** Automatic for derived state: indexes for vanished or long-unused paths (only when no
   process has them open) and fact-cache entries beyond a size cap are deleted by the leader at most
   daily. Durable records are created only on first write and never deleted automatically; orphaned
-  ones are reported, and `baleyg forget` deletes one explicitly. Ledgers are never touched.
+  ones are reported, and `trellis forget` deletes one explicitly. Ledgers are never touched.
 
 ### 7.3 Storage
 
@@ -595,16 +595,16 @@ building on it. LSIF is superseded by SCIP.
 the original ACP-only launcher/registry topology and its prototype `query_graph`, `get_symbol`,
 `emit_diagram` names, and the later owner-grant pilot. The [local topology](docs/local-topology.md),
 [integration plan](docs/agent-integration-plan.md) and [MCP contract](docs/mcp-readonly-pilot-contract.md)
-define the portable `baleyg_*` names. These tools and the general coding-agent client are not
+define the portable `trellis_*` names. These tools and the general coding-agent client are not
 implemented yet.
 
 ### 8.1 Direct agents, including embedded terminals
 
-An agent can run in an ordinary terminal, in a Baleyg-owned terminal tab, or in an optional
-Herdr pane. Configure the proposed `baleyg mcp` stdio server through that agent's supported
+An agent can run in an ordinary terminal, in a Trellis-owned terminal tab, or in an optional
+Herdr pane. Configure the proposed `trellis mcp` stdio server through that agent's supported
 MCP settings; the agent client launches it in the checkout it works in, and the server serves that
-checkout only. Baleyg need not become its ACP client or its reasoning harness. A user may
-continue to launch agents outside Baleyg; tools and published diagrams work the same way.
+checkout only. Trellis need not become its ACP client or its reasoning harness. A user may
+continue to launch agents outside Trellis; tools and published diagrams work the same way.
 
 The target workbench includes terminal tabs alongside diagrams and source (§4). MCP and PTY
 transport are independent: terminal output is not a substitute for validated tool results.
@@ -614,18 +614,18 @@ not an assumption that local stdio or localhost is reachable from its machine.
 
 ### 8.2 ACP client sessions, primarily Mimir
 
-Baleyg may provide an ACP conversation/session surface and start a configured local adapter
+Trellis may provide an ACP conversation/session surface and start a configured local adapter
 when explicitly requested. That adapter can connect to the existing Mimir runtime/proxy, or
 another ACP-compatible harness. Reuse the harness's agent loop, provider routing and permission
-policy instead of implementing another loop in Baleyg.
+policy instead of implementing another loop in Trellis.
 
 Negotiate actual protocol/capabilities and test the selected adapter version. Supply the same
-Baleyg tool contract through the agent's **admitted** MCP configuration/provider mechanism.
+Trellis tool contract through the agent's **admitted** MCP configuration/provider mechanism.
 Do not assert that every ACP peer accepts arbitrary `mcpServers`, supports identical transports,
 or implements a particular ACP major version because a registry lists it.
 
 Mimir currently admits one fixed five-tool Hands profile and one ACP client per daemon home.
-First-class client-hosted Baleyg tools require a versioned Mimir provider extension. Baleyg can
+First-class client-hosted Trellis tools require a versioned Mimir provider extension. Trellis can
 be the chosen ACP client, but must not silently establish a second observer alongside an editor.
 Switching client ownership or adding multiplexing is separate explicit work. Mimir's generic
 MCP client on the daemon host is useful only when that is the intended data/tool host.
@@ -637,9 +637,9 @@ fake tool calls. `_meta` correlation is not a replacement for a versioned tool s
 
 ### 8.3 Tool authority and first pilot
 
-The first catalog is `baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and
-`baleyg_read_source`, served by `baleyg mcp` over stdio (MCP `2026-07-28`). The first release of
-`baleyg_inspect` offers `declaration` and `outgoing_calls` over syntax-tier evidence;
+The first catalog is `trellis_workspace_describe`, `trellis_find_symbols`, `trellis_inspect` and
+`trellis_read_source`, served by `trellis mcp` over stdio (MCP `2026-07-28`). The first release of
+`trellis_inspect` offers `declaration` and `outgoing_calls` over syntax-tier evidence;
 later stages ratify and add `incoming_calls` and other views, plus semantic evidence.
 Every result reports its basis
 `{indexGeneration, indexRevision}` and per-item tier and freshness; pins are optional, carry the
@@ -662,10 +662,10 @@ separate OS account or sandbox, not a narrower MCP catalog.
 
 Configure adapters as explicit data: command/profile, transport, workspace binding, supported
 capabilities and negotiated version. Never execute an agent-supplied launch command or silently
-install a harness. Baleyg supervises only its own explicitly launched children; attach/detach
+install a harness. Trellis supervises only its own explicitly launched children; attach/detach
 must not kill externally owned agents, Herdr sessions or remote Mimir daemons.
 
-Do not automatically declare filesystem/terminal capabilities just because Baleyg has a source
+Do not automatically declare filesystem/terminal capabilities just because Trellis has a source
 viewer or terminal UI. Each advertised ACP capability needs an implemented and approved provider,
 with its own scope, cancellation and permission behavior. Mimir Hands authorization, operator
 approval and taint checks remain additional gates. Read/disclosure, artifact write/publication,
@@ -674,7 +674,7 @@ repository edit, command execution, indexing and runtime control are separate pe
 ### 8.5 Diagram output
 
 Agents use typed tools, not parsed chat text. Deterministic evidence views are generated by
-Baleyg projectors; agent-authored explanatory/proposed graphs have a separate validated schema
+Trellis projectors; agent-authored explanatory/proposed graphs have a separate validated schema
 and visible attribution/assumptions. No agent can promote its own edges to measured facts.
 Artifacts use idempotent creation, version/CAS checks and explicit local publication. The browser
 receives an inbox event/deep link; publication must not steal focus, run a provider, or fetch source.
@@ -789,7 +789,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 
 | Slice | Runnable acceptance |
 | --- | --- |
-| A. Per-checkout read-only MCP | `baleyg mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the leader; no ACP, Herdr, registry or grants required |
+| A. Per-checkout read-only MCP | `trellis mcp` over stdio in any checkout or worktree; describe/find/inspect/read with revision pins; real-time native refresh by the leader; no ACP, Herdr, registry or grants required |
 | B. Bounded snapshot text search | Literal scan over cached payloads with separate byte/time/result budgets, cancellation and explicit partial results; no FTS assumption |
 | C. Versioned diagram artifacts | Evidence view or clearly authored draft -> CAS update -> local publish -> user opens deep link; stale source stays honest |
 | D. Unified workbench terminals | Real PTY tab for a user-launched direct agent, the same MCP tools, bounded terminal stream and explicit lifecycle/input permissions |
@@ -798,7 +798,7 @@ an ACP harness registry. It distinguishes the small first tool pilot from the ta
 | G. Multi-language semantic import | Java then independently gated Rust/Python artifacts; exact snapshot/range joins, provenance and dispatch-safe traversal |
 
 Some slices can proceed in parallel once their contracts settle. The semantic-index program
-([#8](https://github.com/jasoncarreira/baleyg/issues/8)) sequences slices A and G: slice A ships
+([#8](https://github.com/SquashMerge/trellis/issues/8)) sequences slices A and G: slice A ships
 with syntax-tier evidence right after the graph core, and slice G then enriches the same tools. SCIP does not
 require an MCP/ACP agent, and the read-only MCP surface does not require semantic resolution,
 embedded terminals, a project registry, snapshot search or paid inference. Embedded terminals

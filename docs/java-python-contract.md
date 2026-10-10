@@ -4,9 +4,9 @@ Status: implemented and locally validated. See [support](java-python-support.md)
 [public validation summary](java-python-validation.json). Deployment-specific evidence is not included.
 
 Support Java/Python parsing and the file → method → static sequence workflow.
-Modify Baleyg only. Any inspected repository is read-only input: never run Gradle/Maven/Python imports/package scripts,
+Modify Trellis only. Any inspected repository is read-only input: never run Gradle/Maven/Python imports/package scripts,
 install its dependencies, invoke providers, write source, change Git, or run its tests.
-Existing Baleyg development builds/tests are permitted. Root owns Cargo grammar additions.
+Existing Trellis development builds/tests are permitted. Root owns Cargo grammar additions.
 
 Ownership:
 - java-parser: src/indexer_java.rs, src/behavior_java.rs, tests/java_indexer.rs, tests/java_behavior.rs

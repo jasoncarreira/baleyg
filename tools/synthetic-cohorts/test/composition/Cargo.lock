@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "baleyg_synthetic_composition_test"
+name = "trellis_synthetic_composition_test"
 version = "0.1.0"
 dependencies = [
  "tree-sitter",

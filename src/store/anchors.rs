@@ -5,8 +5,8 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-const HEADER_DOMAIN: &[u8] = b"baleyg.header.v1\0";
-const GROUP_DOMAIN: &[u8] = b"baleyg.sibling-group.v1\0";
+const HEADER_DOMAIN: &[u8] = b"trellis.header.v1\0";
+const GROUP_DOMAIN: &[u8] = b"trellis.sibling-group.v1\0";
 
 pub fn header_hash(header: &Header) -> Result<String> {
     let value = serde_json::to_value(header)?;

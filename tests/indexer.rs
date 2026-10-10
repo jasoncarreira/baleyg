@@ -1,11 +1,11 @@
-use baleyg::{
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-};
 use std::{
     fs,
     path::Path,
     sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
+    indexer::{IndexOptions, index_workspace},
+    model::*,
 };
 fn cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
@@ -89,7 +89,7 @@ fn discovery_ignores_secrets_builds_and_symlinks() {
         "dist",
         "build",
         "target",
-        ".baleyg",
+        ".trellis",
         "ignored",
     ] {
         fs::create_dir(p.join(name)).unwrap();
@@ -153,7 +153,7 @@ fn declaration_ids_survive_body_only_change_but_calls_are_revision_local() {
 
 #[test]
 fn graph_ids_and_ranges_are_exact_native_artifact_projection() {
-    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    use trellis::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     for (path, source) in [
         ("T.java", "class T { void go() { obj.foo(); } }"),
@@ -274,7 +274,7 @@ fn scip_label_requires_exact_captured_hash_and_name_token_and_never_supplies_ide
 
 #[test]
 fn root_dependency_drift_changes_native_revision_not_stable_or_occurrence_ids() {
-    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    use trellis::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "main.js", "function same() { foo(); }");
     let root_id = WorkspaceIdentity::discover(Some(d.path()), d.path())
@@ -334,7 +334,7 @@ fn python_assignment_rhs_calls_remain_owned_by_enclosing_function() {
 
 #[test]
 fn rust_impl_and_trait_methods_keep_measured_method_kind_and_free_functions() {
-    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    use trellis::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     let source = "trait Work { fn required(&self); fn defaulted(&self) { fallback(); } }\nstruct T; impl Work for T { fn required(&self) { helper(); } }\nfn free() { helper(); }\n";
     write(d.path(), "main.rs", source);
@@ -392,7 +392,7 @@ fn rust_impl_and_trait_methods_keep_measured_method_kind_and_free_functions() {
 
 #[test]
 fn initializer_calls_keep_executable_owner_and_control_guard_in_four_languages() {
-    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    use trellis::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     for (path, source) in [
         (
@@ -780,7 +780,7 @@ fn identity_aliases_and_nonregular_sources_fail_admission() {
 
 #[test]
 fn stable_capture_counts_one_open_read_hash_per_source_and_verifies_unchanged() {
-    use baleyg::capture::{Capture, SourceOperations};
+    use trellis::capture::{Capture, SourceOperations};
     let d = tempfile::tempdir().unwrap();
     write(d.path(), "one.js", "f();");
     write(d.path(), "two.py", "def f(): pass\n");
@@ -857,7 +857,7 @@ fn declared_inputs_and_root_refuse_cutoff_drift() {
 
 #[test]
 fn hard_linked_nonsource_inputs_share_immutable_bytes() {
-    use baleyg::capture::Capture;
+    use trellis::capture::Capture;
     let d = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(d.path()).unwrap();
     let root = root.as_path();
@@ -881,7 +881,7 @@ fn hard_linked_nonsource_inputs_share_immutable_bytes() {
 
 #[test]
 fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_executable() {
-    use baleyg::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
+    use trellis::{indexer::index_workspace_with_native, store::topology::WorkspaceIdentity};
     let d = tempfile::tempdir().unwrap();
     let samples = [
         (
@@ -1007,7 +1007,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
         );
     }
     let state = tempfile::tempdir().unwrap();
-    let store = baleyg::store::Store::open_for_tests(state.path(), d.path()).unwrap();
+    let store = trellis::store::Store::open_for_tests(state.path(), d.path()).unwrap();
     let session = store.leader_session().unwrap();
     let pin = publish_bundle(
         &store,
@@ -1072,7 +1072,7 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
             let request = serde_json::from_value(serde_json::json!({
                 "seed": n.id, "question": "Which exact source declares this name?", "expectedRevision": pin
             })).unwrap();
-            let packet = baleyg::planning::prepare(&store, request).unwrap();
+            let packet = trellis::planning::prepare(&store, request).unwrap();
             assert_eq!(
                 packet.context.nodes,
                 vec![n.clone()],
@@ -1096,15 +1096,15 @@ fn four_language_noncallable_native_declarations_keep_exact_kind_and_are_not_exe
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},
@@ -1118,7 +1118,7 @@ fn publish_bundle(
 
 #[test]
 fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         index_coordinator::IndexJobCoordinator,
         indexer::{CapturedChange, index_workspace_bundle, measure_captured_change},
@@ -1320,7 +1320,7 @@ fn admitted_body_edit_measures_only_changed_document_not_unrelated_lookup_owners
 
 #[test]
 fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         indexer::{CapturedChange, measure_captured_change},
     };
@@ -1406,12 +1406,12 @@ fn captured_classifier_falls_back_on_each_unproved_surface_effect() {
 
 #[test]
 fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint() {
-    use baleyg::{
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use trellis::{
         indexer::{index_workspace_bundle, measure_document_fingerprint},
         store::topology::WorkspaceIdentity,
     };
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
     for (language, path, source) in [
         ("javascript", "main.js", "function f(){ return 1; }\n"),
         ("java", "Main.java", "class Main { int f(){ return 1; } }\n"),
@@ -1525,7 +1525,7 @@ fn measured_scip_label_and_cutoff_change_projection_but_not_native_fingerprint()
 
 #[test]
 fn full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_and_projection() {
-    use baleyg::{
+    use trellis::{
         indexer::{index_workspace_bundle, measure_document_fingerprint},
         store::topology::WorkspaceIdentity,
     };
@@ -1591,7 +1591,7 @@ fn full_reuse_fingerprint_authenticates_bytes_admission_producer_coverage_owner_
 
 #[test]
 fn captured_optional_labels_are_projection_only_but_admission_or_toolchain_changes_fallback() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         indexer::{CapturedChange, measure_captured_change},
     };
@@ -1632,7 +1632,7 @@ fn captured_optional_labels_are_projection_only_but_admission_or_toolchain_chang
 
 #[test]
 fn optional_native_input_aliases_force_full_native_fallback() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         indexer::{CapturedChange, measure_captured_change, measure_captured_native_change},
         store::topology::WorkspaceIdentity,
@@ -1693,7 +1693,7 @@ fn optional_native_input_aliases_force_full_native_fallback() {
 
 #[test]
 fn optional_executable_alias_keeps_authenticated_native_role_without_editing_binary() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         indexer::{CapturedChange, measure_captured_change},
     };
@@ -1719,11 +1719,11 @@ fn optional_executable_alias_keeps_authenticated_native_role_without_editing_bin
 
 #[test]
 fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
-    use baleyg::watch::WatchSignals;
     use notify::{
         Event, EventKind,
         event::{ModifyKind, RenameMode},
     };
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
     let takeover = watcher.drain();
@@ -1753,8 +1753,8 @@ fn watcher_coalesces_renames_and_retains_signals_until_verified_ack() {
 
 #[test]
 fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
-    use baleyg::watch::WatchSignals;
     use notify::{Event, EventKind, event::ModifyKind};
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
     if !watcher.watching() {
@@ -1780,7 +1780,7 @@ fn watcher_promotes_ignore_unknown_and_bulk_changes_to_full_inventory() {
 
 #[test]
 fn explicit_unchanged_capture_freshly_hashes_every_source() {
-    use baleyg::{
+    use trellis::{
         capture::Capture,
         indexer::{CapturedChange, measure_captured_change},
     };
@@ -1802,7 +1802,7 @@ fn explicit_unchanged_capture_freshly_hashes_every_source() {
 
 #[test]
 fn watcher_registration_failure_keeps_full_inventory_active() {
-    use baleyg::watch::WatchSignals;
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     let mut watcher = WatchSignals::new(root.path().join("missing-root"), None, None);
     assert!(watcher.degraded());
@@ -1818,11 +1818,11 @@ fn watcher_registration_failure_keeps_full_inventory_active() {
 
 #[test]
 fn watcher_callback_filters_capture_read_access_without_rediscovering_work() {
-    use baleyg::watch::WatchSignals;
     use notify::{
         Event, EventKind,
         event::{AccessKind, AccessMode},
     };
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
     let mut watcher = WatchSignals::new(root.path().to_owned(), None, None);
@@ -1856,8 +1856,8 @@ fn watcher_callback_filters_capture_read_access_without_rediscovering_work() {
 
 #[test]
 fn watcher_bounded_callback_overflow_and_runtime_error_force_full() {
-    use baleyg::watch::WatchSignals;
     use notify::{Event, EventKind, event::ModifyKind};
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
     let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
@@ -1888,9 +1888,9 @@ fn watcher_bounded_callback_overflow_and_runtime_error_force_full() {
 
 #[test]
 fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
-    use baleyg::watch::WatchSignals;
     use notify::{Event, EventKind, event::ModifyKind};
     use std::time::{Duration, Instant};
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
     let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
@@ -1919,8 +1919,8 @@ fn watcher_has_quiet_and_absolute_deadlines_without_blocking_drain() {
 
 #[test]
 fn watcher_queued_burst_on_one_path_stays_partial_until_ack() {
-    use baleyg::watch::WatchSignals;
     use notify::{Event, EventKind, event::ModifyKind};
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     write(root.path(), "source.js", "f();");
     let mut watcher = WatchSignals::synthetic_for_tests(root.path().to_owned(), None, None);
@@ -1942,8 +1942,8 @@ fn watcher_queued_burst_on_one_path_stays_partial_until_ack() {
 
 #[test]
 fn optional_input_and_symlink_suffix_force_full_reconcile() {
-    use baleyg::watch::WatchSignals;
     use notify::{Event, EventKind, event::ModifyKind};
+    use trellis::watch::WatchSignals;
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("ignored")).unwrap();
     write(root.path(), "ignored/.ignore", "presentation.js\n");
@@ -1978,8 +1978,8 @@ fn optional_input_and_symlink_suffix_force_full_reconcile() {
 
 #[test]
 fn failed_capture_does_not_ack_relevant_input_cutoff_or_absent_input() {
-    use baleyg::{capture::Capture, watch::WatchSignals};
     use notify::{Event, EventKind, event::ModifyKind};
+    use trellis::{capture::Capture, watch::WatchSignals};
     for absent_at_admission in [false, true] {
         let root = tempfile::tempdir().unwrap();
         write(root.path(), "source.js", "f();");

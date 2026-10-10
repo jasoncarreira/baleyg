@@ -118,7 +118,7 @@ fn certainly_excluded(
             }
             parts.push(part.to_string_lossy().into_owned());
             match part.to_str() {
-                Some(".git" | "node_modules" | ".venv" | ".baleyg") => excluded = true,
+                Some(".git" | "node_modules" | ".venv" | ".trellis") => excluded = true,
                 Some("target" | "dist" | "build") => {
                     // Capture admits Java output subtrees below src/main,
                     // src/test and src/testFixtures/java. Any uncertain shape
@@ -514,7 +514,7 @@ mod ingress_tests {
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();
-        let executable = target.join("baleyg");
+        let executable = target.join("trellis");
         let other = target.join("scratch.js");
         fs::write(&executable, "binary").unwrap();
         fs::write(&other, "noise").unwrap();

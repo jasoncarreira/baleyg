@@ -1,11 +1,11 @@
 mod common;
-use baleyg::{
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use trellis::{
     answer::*,
     indexer::{IndexOptions, index_workspace_bundle},
     planning::*,
 };
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
 
 const CODE: &str = "function seed(flag) {\n  if (flag) first();\n  else second();\n  third(); fourth(); fifth(); sixth(); seventh();\n}\n// unique-full-source-tail-λ\n";
 fn packet(code: &str) -> QuestionPacket {
@@ -256,8 +256,8 @@ async fn first_question_preview_rejects_same_pin_forged_graph_callee_before_pack
         body::{Body, to_bytes},
         http::Request,
     };
-    use baleyg::{http, indexer::index_workspace_bundle};
     use tower::ServiceExt;
+    use trellis::{http, indexer::index_workspace_bundle};
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");

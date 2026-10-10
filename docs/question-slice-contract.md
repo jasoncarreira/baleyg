@@ -73,7 +73,7 @@ this relative score to choose budget membership, then renders the selected calls
 order. It never promotes supporting/incidental/uncertain labels. Scores are not calibrated
 confidence. Unscored local/manual selections keep source-order fallback.
 
-Provider exports use lossless `state.encoding = "baleyg-evidence-tables-v1"`: explicit
+Provider exports use lossless `state.encoding = "trellis-evidence-tables-v1"`: explicit
 column/row tables, identity dictionary and range columns. Native packets are unchanged;
 independent test decoding proves exact reconstruction. Each question also names the
 literal user question, human call identity and display eligibility. Full sources remain

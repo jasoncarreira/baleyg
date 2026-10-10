@@ -1,6 +1,6 @@
 # Automatic library catalog (Rust first)
 
-Baleyg discovers included Rust/Cargo libraries from the selected workspace and indexes local
+Trellis discovers included Rust/Cargo libraries from the selected workspace and indexes local
 declarations automatically. There are no downloads, Cargo invocations, build scripts, proc macros,
 or provider calls during library indexing. The shared catalog/API is ecosystem-neutral, but the
 first discovery adapter supports Rust/Cargo on the existing Unix secure filesystem reader.

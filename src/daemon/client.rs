@@ -921,7 +921,7 @@ mod relay_failure_tests {
             ),
         ] {
             let request = json!({"jsonrpc":"2.0","id":"validation",
-                "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+                "method":"tools/call","params":{"name":"trellis_workspace_describe",
                 "arguments":{"schemaVersion":1,"workspace":selection},
                 "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities":{}}}});
@@ -944,7 +944,7 @@ mod relay_failure_tests {
             );
         }
         let legacy = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}});
+            "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}});
         let reply = mcp_failure(&legacy, "daemon_unavailable", &workspace);
         assert_eq!(reply["result"]["structuredContent"]["requestId"], 2);
         assert_eq!(

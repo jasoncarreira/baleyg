@@ -88,13 +88,13 @@ test("example source bytes, immutable IDs and per-document occurrences", () => {
     records.declarations.find(
       (row) => row.revisionId === "r2" && row.name === "same",
     ).syntaxId,
-    "sid:v1:2f420adfd3ee5d0fb3cc49cad3a76625",
+    "sid:v1:4ceebb0a4e64a3950e7fe18ce2ec10d5",
   );
   assert.equal(
     records.declarations.find(
       (row) => row.revisionId === "r2" && row.name === "change",
     ).syntaxId,
-    "sid:v1:f2b6e998da22cfa687148e62362a00e4",
+    "sid:v1:f46279b6b2d3b40bda9d0f9ad9f289ab",
   );
   const unchangedCall = (revisionId) =>
     records.calls.find(
@@ -104,7 +104,7 @@ test("example source bytes, immutable IDs and per-document occurrences", () => {
     );
   assert.equal(
     unchangedCall("r2").id,
-    "occ:v2:fc90c768b3c1881e75447f9a9837f921",
+    "occ:v2:fe3eb5ddef64ba3c8e6011f4c08258a4",
   );
   // Decision 0003: byte-identical unchanged.js keeps its occurrence ID across
   // revisions, while each record and its proof remain revision-scoped.
@@ -337,13 +337,13 @@ test("authored graph answers select latest declaration proofs, never old occurre
   assert.deepEqual(
     result("history-foreign").nodes.map((node) => node.declaration.syntaxId),
     [
-      "sid:v1:e976f46fdd13c71c3616d596ff531f3e",
-      "sid:v1:c0834332f03e9a936f94aa462d15d1e2",
+      "sid:v1:c3675e9d70639d85c68167b265ef5c2f",
+      "sid:v1:1f8d90bd409d6d82fe4d5acb0f819a09",
     ],
   );
   assert.equal(
     result("history-foreign").edges[0].to,
-    "sid:v1:c0834332f03e9a936f94aa462d15d1e2",
+    "sid:v1:1f8d90bd409d6d82fe4d5acb0f819a09",
   );
   assert.equal(result("history-foreign").edges[0].visit, "new");
   assert.equal(

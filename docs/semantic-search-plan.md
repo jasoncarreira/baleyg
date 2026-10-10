@@ -106,7 +106,7 @@ every chunk below it.
 - **Boosts:** the same module as the caller's current file, public over private, production over
   test code.
 - **Optional Jev rerank (opt-in, off by default).** Jev is a single-forward-pass relevance
-  decision model that Baleyg already calls for live sequence-diagram call selection
+  decision model that Trellis already calls for live sequence-diagram call selection
   ([live Jev](live-jev.md)). A rerank stage would send the query and the top ~50 hybrid candidates
   (symbol card plus a bounded code excerpt each) for one relevance judgment per candidate, and
   reorder by that judgment. This is the per-candidate judgment that
@@ -214,7 +214,7 @@ every chunk below it.
 - After #67 (the durable queue and incremental publication), so updates are incremental from the
   start.
 - Independent of #58 (SCIP import): chunks and cards come from the native syntax tier.
-- Ideally in place before the planned agent benchmark (with and without Baleyg). Exploration is
+- Ideally in place before the planned agent benchmark (with and without Trellis). Exploration is
   where agents spend most of their search calls.
 
 A likely split when scheduled:

@@ -2,13 +2,6 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use baleyg::{
-    daemon::{
-        BrowserProvisioner,
-        registry::{BrowserOptions, CheckoutOptions, CheckoutRegistry},
-    },
-    store::topology::WorkspaceIdentity,
-};
 use std::{
     fs,
     path::Path,
@@ -17,6 +10,13 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tower::ServiceExt;
+use trellis::{
+    daemon::{
+        BrowserProvisioner,
+        registry::{BrowserOptions, CheckoutOptions, CheckoutRegistry},
+    },
+    store::topology::WorkspaceIdentity,
+};
 
 fn checkout(root: &Path) -> WorkspaceIdentity {
     fs::create_dir_all(root.join(".git")).unwrap();
@@ -683,7 +683,7 @@ async fn bare_relative_token_file_is_anchored_to_working_directory() {
         .unwrap();
     assert_eq!(fs::read_to_string(&token).unwrap().len(), 64);
     // A bare filename resolves against the current working directory too.
-    let bare = format!("baleyg-token-{}", uuid::Uuid::new_v4());
+    let bare = format!("trellis-token-{}", uuid::Uuid::new_v4());
     let mut second = BrowserProvisioner::new();
     second
         .register_serve(
@@ -704,7 +704,7 @@ async fn registry_lock_covers_validation_through_commit() {
     let temp = tempfile::tempdir().unwrap();
     let identity = checkout(&temp.path().join("checkout"));
     let registry = Arc::new(Mutex::new(CheckoutRegistry::with_roots(
-        baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        trellis::store::topology::TopologyRoots::isolated_for_tests(
             temp.path().join("cache"),
             temp.path().join("data"),
         ),

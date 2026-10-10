@@ -6,7 +6,7 @@ Reference read: [Source code hierarchy](https://www.jetbrains.com/help/idea/view
 Adopt the interaction principles, not every feature at once:
 
 - Keep a selected root visible and expand individual branches deliberately.
-- Distinguish incoming callers from outgoing callees. Current Baleyg traversal is outgoing
+- Distinguish incoming callers from outgoing callees. Current Trellis traversal is outgoing
   only; label it accurately rather than implying both directions are implemented.
 - Keep method names prominent, path/type metadata secondary, and source navigation immediate.
 - Preserve exact call-site evidence even when a future display groups repeated method calls.

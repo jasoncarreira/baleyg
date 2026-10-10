@@ -1,14 +1,14 @@
 mod common;
-use baleyg::{
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-};
 use protobuf::Message;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
     sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
+    indexer::{IndexOptions, index_workspace},
+    model::*,
 };
 fn run(o: &IndexOptions) -> Graph {
     index_workspace(o, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap()
@@ -214,7 +214,7 @@ fn chained_calls_have_unique_range_ids_and_publish() {
         &graph,
         d.path(),
         &store.leader().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
         },
@@ -224,15 +224,15 @@ fn chained_calls_have_unique_range_ids_and_publish() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

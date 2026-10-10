@@ -1,11 +1,11 @@
 //! Synthetic protocol fixtures only: not recorded model runs or quality evidence.
 mod common;
-use baleyg::{
+use serde_json::{Value, json};
+use trellis::{
     indexer::{IndexOptions, index_workspace_bundle},
     jev::{parse_response, request_for, response_warnings},
     planning::{QuestionPacket, QuestionRequest, prepare},
 };
-use serde_json::{Value, json};
 #[path = "common/jev_wire.rs"]
 mod jev_wire;
 use jev_wire::decode_packet;
@@ -388,7 +388,7 @@ fn display_score_uses_essential_probability_not_confidence_or_label() {
     );
     assert_eq!(
         selection.decisions[0].relevance,
-        baleyg::planning::Relevance::Supporting
+        trellis::planning::Relevance::Supporting
     );
     assert_eq!(selection.decisions[1].display_score, Some(0.7));
 }

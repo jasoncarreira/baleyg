@@ -23,14 +23,14 @@ function loadConfig() {
 }
 
 function makeFakeGh() {
-  const dir = mkdtempSync(join(tmpdir(), "baleyg-factory-gh-"));
+  const dir = mkdtempSync(join(tmpdir(), "trellis-factory-gh-"));
   const command = join(dir, "gh");
   writeFileSync(
     command,
     `#!/bin/sh
 printf '%s\n' "$@" > "$FAKE_GH_LOG"
 if [ "\${FAKE_GH_EXIT:-0}" -ne 0 ]; then exit "$FAKE_GH_EXIT"; fi
-printf '%s\n' '{"run_id":"123","number":123,"title":"Story","body":"Body","url":"https://github.com/jasoncarreira/baleyg/issues/123","state":"OPEN","labels":[],"assignees":[]}'
+printf '%s\n' '{"run_id":"123","number":123,"title":"Story","body":"Body","url":"https://github.com/SquashMerge/trellis/issues/123","state":"OPEN","labels":[],"assignees":[]}'
 `,
   );
   chmodSync(command, 0o755);
@@ -79,15 +79,15 @@ test("verify setup refuses a cache inside the checkout before installing package
   const result = spawnSync(process.execPath, [join(ROOT, "tools/verify-env.mjs")], {
     cwd: ROOT,
     encoding: "utf8",
-    env: { ...process.env, BALEYG_RUN_CACHE: forbidden },
+    env: { ...process.env, TRELLIS_RUN_CACHE: forbidden },
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /BALEYG_RUN_CACHE must be outside the checkout/);
+  assert.match(result.stderr, /TRELLIS_RUN_CACHE must be outside the checkout/);
   assert.equal(existsSync(forbidden), false);
 });
 
 test("verify setup rejects symlinked and writable external caches", () => {
-  const temp = mkdtempSync(join(tmpdir(), "baleyg-verify-policy-"));
+  const temp = mkdtempSync(join(tmpdir(), "trellis-verify-policy-"));
   const link = join(temp, "checkout-link");
   symlinkSync(ROOT, link, "dir");
   try {
@@ -96,7 +96,7 @@ test("verify setup rejects symlinked and writable external caches", () => {
       const result = spawnSync(process.execPath, [join(ROOT, "tools/verify-env.mjs")], {
         cwd: ROOT,
         encoding: "utf8",
-        env: { ...process.env, BALEYG_RUN_CACHE: cache },
+        env: { ...process.env, TRELLIS_RUN_CACHE: cache },
       });
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, cache === link ? /outside the checkout/ : /group- or world-writable/);
@@ -107,21 +107,21 @@ test("verify setup rejects symlinked and writable external caches", () => {
   }
 });
 
-test("resolver accepts only canonical Baleyg issue references", () => {
+test("resolver accepts only canonical Trellis issue references", () => {
   const config = loadConfig();
   const fakeDir = makeFakeGh();
   try {
     const accepted = [
       "123",
       "#123",
-      "https://github.com/jasoncarreira/baleyg/issues/123",
+      "https://github.com/SquashMerge/trellis/issues/123",
     ];
     for (const input of accepted) {
       const result = resolve(config, fakeDir, input);
       assert.equal(result.status, 0, input);
       assert.equal(JSON.parse(result.stdout).run_id, "123", input);
       assert.deepEqual(result.args, [
-        "issue", "view", "123", "--repo", "jasoncarreira/baleyg", "--json",
+        "issue", "view", "123", "--repo", "SquashMerge/trellis", "--json",
         "number,title,body,url,state,labels,assignees", "--jq",
         "{run_id:(.number|tostring)} + .",
       ], input);
@@ -129,9 +129,9 @@ test("resolver accepts only canonical Baleyg issue references", () => {
 
     const rejected = [
       "", "0", "01", "+123", "-123", " 123", "123 ", "#abc", "123\n456",
-      "https://github.com/other/baleyg/issues/123",
-      "https://github.com/jasoncarreira/baleyg/issues/123/extra",
-      "https://github.com/jasoncarreira/baleyg/issues/123?state=open",
+      "https://github.com/other/trellis/issues/123",
+      "https://github.com/SquashMerge/trellis/issues/123/extra",
+      "https://github.com/SquashMerge/trellis/issues/123?state=open",
       "not an issue",
     ];
     for (const input of rejected) {
@@ -162,7 +162,7 @@ test("verify is one executable command and retains all checks", () => {
   const config = loadConfig();
   assert.equal(config.verify, "./tools/verify");
   assert.notEqual(statSync(join(ROOT, "tools/verify")).mode & 0o111, 0);
-  const fakeDir = mkdtempSync(join(tmpdir(), "baleyg-factory-verify-"));
+  const fakeDir = mkdtempSync(join(tmpdir(), "trellis-factory-verify-"));
   const log = join(fakeDir, "verify.log");
   const fakeTool = `#!/bin/sh
 line="\${0##*/}"

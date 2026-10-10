@@ -16,7 +16,7 @@ const observations = [];
 const expectedTests = 5;
 
 function sandbox(t) {
-  const dir = mkdtempSync(join(tmpdir(), 'baleyg-lifecycle-'));
+  const dir = mkdtempSync(join(tmpdir(), 'trellis-lifecycle-'));
   const connections = new Set();
   const track = db => { connections.add(db); return db; };
   const close = db => { db.close(); connections.delete(db); };

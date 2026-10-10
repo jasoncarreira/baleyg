@@ -1,4 +1,3 @@
-use baleyg::store::topology::WorkspaceIdentity;
 use serde_json::Value;
 use std::{
     fs,
@@ -7,6 +6,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
+use trellis::store::topology::WorkspaceIdentity;
 
 async fn selected_json(
     app: axum::Router,
@@ -49,7 +49,7 @@ async fn selected_json(
 }
 
 fn command(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
     cmd.env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME");
@@ -130,7 +130,7 @@ impl Drop for FixtureDaemon {
                     socket = path
                         .parent()
                         .and_then(std::path::Path::parent)
-                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                        .map(|data| trellis::daemon::SocketPaths::new(data).socket);
                     break;
                 }
                 if path.is_dir() {
@@ -155,7 +155,7 @@ impl Drop for FixtureDaemon {
                 .ok()?;
             (output.status.success()
                 && String::from_utf8_lossy(&output.stdout).trim()
-                    == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+                    == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
             .then_some(connection)
         };
         let Some(connection) = owned() else {
@@ -275,7 +275,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
     drop(listener);
     let log = temp.path().join("serve-stderr");
     let child = command(&home)
-        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&a)
@@ -362,7 +362,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert_eq!(bad_host.status(), reqwest::StatusCode::FORBIDDEN);
-    assert!(!bad_host.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!bad_host.headers().contains_key("X-Trellis-Workspace"));
     let bad_origin = client
         .get(format!("{base}/api/checkouts/{a_key}/status"))
         .header("Origin", "http://not-local:1")
@@ -371,7 +371,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert_eq!(bad_origin.status(), reqwest::StatusCode::FORBIDDEN);
-    assert!(!bad_origin.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!bad_origin.headers().contains_key("X-Trellis-Workspace"));
     for (key, root, expected) in [
         (&a_key, &a, "alpha_checkout"),
         (&b_key, &b, "beta_checkout"),
@@ -400,10 +400,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
         assert_eq!(
-            status.headers()["X-Baleyg-Workspace"],
+            status.headers()["X-Trellis-Workspace"],
             verified_root.to_str().unwrap()
         );
-        let status_header = status.headers()["X-Baleyg-Catching-Up"]
+        let status_header = status.headers()["X-Trellis-Catching-Up"]
             .to_str()
             .unwrap()
             .to_owned();
@@ -417,7 +417,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(jev.status(), reqwest::StatusCode::OK);
         assert_eq!(
-            jev.headers()["X-Baleyg-Workspace"],
+            jev.headers()["X-Trellis-Workspace"],
             verified_root.to_str().unwrap()
         );
         assert_eq!(jev.headers()["cache-control"], "no-store");
@@ -441,7 +441,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(tree.status(), reqwest::StatusCode::OK);
         assert_eq!(
-            tree.headers()["X-Baleyg-Workspace"],
+            tree.headers()["X-Trellis-Workspace"],
             verified_root.to_str().unwrap()
         );
         let tree: Value = tree.json().await.unwrap();
@@ -491,7 +491,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 let headers = response.headers().clone();
                 let error: Value = response.json().await.unwrap();
                 assert_eq!(
-                    headers["X-Baleyg-Workspace"],
+                    headers["X-Trellis-Workspace"],
                     verified_root.to_str().unwrap()
                 );
                 assert_eq!(error["error"]["code"], "index_not_ready", "{error}");
@@ -515,7 +515,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(files.status(), reqwest::StatusCode::OK);
         assert_eq!(
-            files.headers()["X-Baleyg-Workspace"],
+            files.headers()["X-Trellis-Workspace"],
             verified_root.to_str().unwrap()
         );
         let files: Value = files.json().await.unwrap();
@@ -578,7 +578,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             "{}",
             diagram.text().await.unwrap_or_default()
         );
-        assert!(diagram.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(diagram.headers().contains_key("X-Trellis-Catching-Up"));
         let diagram: Value = diagram.json().await.unwrap();
         assert!(diagram.to_string().contains(class_name), "{diagram}");
         let navigation = client.post(format!("{base}/api/checkouts/{key}/navigation"))
@@ -590,7 +590,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             "{}",
             navigation.text().await.unwrap_or_default()
         );
-        assert!(navigation.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(navigation.headers().contains_key("X-Trellis-Workspace"));
         let navigation: Value = navigation.json().await.unwrap();
         assert_eq!(navigation["revision"], classes["revision"]);
         let foreign_key = if key == &a_key { &b_key } else { &a_key };
@@ -602,7 +602,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert!(!wrong.status().is_success());
-        assert!(wrong.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(wrong.headers().contains_key("X-Trellis-Workspace"));
 
         let symbols = client
             .get(format!("{base}/api/checkouts/{key}/symbols"))
@@ -623,10 +623,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(source.status(), reqwest::StatusCode::OK);
         assert_eq!(
-            source.headers()["X-Baleyg-Workspace"],
+            source.headers()["X-Trellis-Workspace"],
             verified_root.to_str().unwrap()
         );
-        assert!(source.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(source.headers().contains_key("X-Trellis-Catching-Up"));
         let source: Value = source.json().await.unwrap();
         assert!(
             source["file"]["text"].as_str().unwrap().contains(expected),
@@ -650,7 +650,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             "{}",
             query.text().await.unwrap_or_default()
         );
-        assert!(query.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(query.headers().contains_key("X-Trellis-Catching-Up"));
         let view: Value = query.json().await.unwrap();
         assert_eq!(view["query"]["seed"], seed.as_str());
         assert!(view.to_string().contains(expected_name), "{view}");
@@ -674,7 +674,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             "{}",
             saved.text().await.unwrap_or_default()
         );
-        assert!(saved.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(saved.headers().contains_key("X-Trellis-Workspace"));
         let other_view = client
             .get(format!("{base}/api/checkouts/{other}/views/saved"))
             .bearer_auth(token)
@@ -767,7 +767,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 .unwrap();
             assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(
-                refused.headers()["X-Baleyg-Workspace"],
+                refused.headers()["X-Trellis-Workspace"],
                 a.canonicalize().unwrap().to_str().unwrap()
             );
             assert_eq!(refused.headers()["cache-control"], "no-store");
@@ -797,7 +797,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 .unwrap();
             assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
             assert_eq!(
-                foreign.headers()["X-Baleyg-Workspace"],
+                foreign.headers()["X-Trellis-Workspace"],
                 b.canonicalize().unwrap().to_str().unwrap()
             );
             assert_eq!(
@@ -821,7 +821,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             imported.text().await.unwrap_or_default()
         );
         assert_eq!(
-            imported.headers()["X-Baleyg-Workspace"],
+            imported.headers()["X-Trellis-Workspace"],
             (if key == &a_key {
                 a.canonicalize().unwrap()
             } else {
@@ -879,7 +879,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(foreign.headers().contains_key("X-Trellis-Workspace"));
         for (action, payload) in [
             (
                 "jev-response",
@@ -897,7 +897,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
                 .await
                 .unwrap();
             assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-            assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+            assert!(foreign.headers().contains_key("X-Trellis-Workspace"));
         }
         let sequence = client
             .post(format!("{base}/api/checkouts/{key}/sequence"))
@@ -920,7 +920,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign_symbol.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign_symbol.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(foreign_symbol.headers().contains_key("X-Trellis-Workspace"));
         let foreign_query = client
             .post(format!("{base}/api/checkouts/{other}/query"))
             .bearer_auth(token)
@@ -929,7 +929,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign_query.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign_query.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(foreign_query.headers().contains_key("X-Trellis-Workspace"));
         let accepted = client
             .post(format!("{base}/api/checkouts/{key}/index"))
             .bearer_auth(token)
@@ -947,7 +947,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(current.status(), reqwest::StatusCode::OK);
-        assert!(current.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(current.headers().contains_key("X-Trellis-Workspace"));
         let current: Value = current.json().await.unwrap();
         assert!(current.is_null() || current["id"] == id, "{current}");
         let own = client
@@ -965,7 +965,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .await
             .unwrap();
         assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
-        assert!(foreign.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(foreign.headers().contains_key("X-Trellis-Workspace"));
         let cancelled = client
             .post(format!("{base}/api/checkouts/{key}/jobs/{id}/cancel"))
             .bearer_auth(token)
@@ -976,7 +976,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             cancelled.status(),
             reqwest::StatusCode::CONFLICT | reqwest::StatusCode::OK
         ));
-        assert!(cancelled.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(cancelled.headers().contains_key("X-Trellis-Catching-Up"));
         let foreign_cancel = client
             .post(format!("{base}/api/checkouts/{other}/jobs/{id}/cancel"))
             .bearer_auth(token)
@@ -994,10 +994,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(
-            deleted.headers()["X-Baleyg-Workspace"],
+            deleted.headers()["X-Trellis-Workspace"],
             a.canonicalize().unwrap().to_str().unwrap()
         );
-        assert!(deleted.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(deleted.headers().contains_key("X-Trellis-Catching-Up"));
         let surviving = client
             .get(format!(
                 "{base}/api/checkouts/{b_key}/{}",
@@ -1026,7 +1026,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(
-            deleted.headers()["X-Baleyg-Workspace"],
+            deleted.headers()["X-Trellis-Workspace"],
             b.canonicalize().unwrap().to_str().unwrap()
         );
     }
@@ -1037,7 +1037,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
-    assert!(!missing.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!missing.headers().contains_key("X-Trellis-Workspace"));
     let unknown = client
         .get(format!("{base}/api/checkouts/{}/status", "a".repeat(64)))
         .bearer_auth(token)
@@ -1045,7 +1045,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert!(!unknown.status().is_success());
-    assert!(!unknown.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!unknown.headers().contains_key("X-Trellis-Workspace"));
     let unknown: Value = unknown.json().await.unwrap();
     assert_eq!(unknown["error"]["code"], "workspace_selection_failed");
     let resolved = client
@@ -1057,10 +1057,10 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .unwrap();
     assert_eq!(resolved.status(), reqwest::StatusCode::NOT_FOUND);
     assert_eq!(
-        resolved.headers()["X-Baleyg-Workspace"],
+        resolved.headers()["X-Trellis-Workspace"],
         a.canonicalize().unwrap().to_str().unwrap()
     );
-    assert!(resolved.headers().contains_key("X-Baleyg-Catching-Up"));
+    assert!(resolved.headers().contains_key("X-Trellis-Catching-Up"));
     let invalid = client
         .get(format!("{base}/api/checkouts/not-a-key/status"))
         .bearer_auth(token)
@@ -1068,7 +1068,7 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert!(!invalid.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!invalid.headers().contains_key("X-Trellis-Workspace"));
     let changed = temp.path().join("moved-a");
     fs::rename(&a, &changed).unwrap();
     let drift = client
@@ -1078,12 +1078,12 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
         .await
         .unwrap();
     assert_eq!(drift.status(), reqwest::StatusCode::CONFLICT);
-    assert!(!drift.headers().contains_key("X-Baleyg-Workspace"));
+    assert!(!drift.headers().contains_key("X-Trellis-Workspace"));
 }
 
 #[test]
 fn selected_browser_clock_has_separate_disconnect_release_and_exit_delays() {
-    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    use trellis::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -1137,7 +1137,7 @@ fn selected_browser_clock_has_separate_disconnect_release_and_exit_delays() {
 
 #[test]
 fn selected_browser_renewal_does_not_extend_other_checkout() {
-    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    use trellis::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
     let temp = TempDir::new().unwrap();
     let a = temp.path().join("a");
     let b = temp.path().join("b");
@@ -1172,7 +1172,7 @@ fn selected_browser_renewal_does_not_extend_other_checkout() {
 
 #[test]
 fn global_list_marks_corrupt_existing_index_without_attaching() {
-    use baleyg::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
+    use trellis::{daemon::registry::CheckoutRegistry, store::topology::TopologyRoots};
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -1194,7 +1194,7 @@ fn global_list_marks_corrupt_existing_index_without_attaching() {
 
 #[test]
 fn global_discovery_reuses_live_sqlite_witness_and_never_repairs() {
-    use baleyg::{
+    use trellis::{
         daemon::registry::CheckoutRegistry,
         store::{Store, topology::TopologyRoots},
     };
@@ -1211,9 +1211,9 @@ fn global_discovery_reuses_live_sqlite_witness_and_never_repairs() {
     )
     .unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (_, session) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, session) = trellis::index_coordinator::reconcile_workspace(
         &store,
-        &baleyg::indexer::IndexOptions::new(identity.root.clone()),
+        &trellis::indexer::IndexOptions::new(identity.root.clone()),
         &cancel,
         |_| {},
     )
@@ -1256,16 +1256,16 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         body::{Body, to_bytes},
         http::Request,
     };
-    use baleyg::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::TopologyRoots,
-    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
     use tower::ServiceExt;
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::TopologyRoots,
+    };
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     for (stage, route_suffix) in [
         ("after_handler", "status"),
@@ -1332,10 +1332,10 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
         assert!(changed.load(Ordering::Acquire));
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
         assert_eq!(
-            response.headers()["X-Baleyg-Workspace"],
+            response.headers()["X-Trellis-Workspace"],
             identity.root.to_str().unwrap()
         );
-        assert!(response.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(response.headers().contains_key("X-Trellis-Catching-Up"));
         let error: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
@@ -1345,12 +1345,12 @@ async fn resolved_root_change_retains_headers_even_when_read_fence_fails() {
 
 #[tokio::test]
 async fn selected_question_export_keeps_legacy_oversize_error() {
-    use baleyg::{
+    use std::sync::Arc;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
@@ -1427,19 +1427,19 @@ async fn selected_question_export_keeps_legacy_oversize_error() {
     );
     assert_eq!(error["error"]["code"], "evidence_too_large");
     assert_eq!(
-        headers["X-Baleyg-Workspace"],
+        headers["X-Trellis-Workspace"],
         identity.root.to_str().unwrap()
     );
 }
 
 #[tokio::test]
 async fn selected_question_preview_keeps_legacy_oversize_error() {
-    use baleyg::{
+    use std::sync::Arc;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
@@ -1502,21 +1502,21 @@ async fn selected_question_preview_keeps_legacy_oversize_error() {
     );
     assert_eq!(error["error"]["code"], "evidence_too_large");
     assert_eq!(
-        headers["X-Baleyg-Workspace"],
+        headers["X-Trellis-Workspace"],
         identity.root.to_str().unwrap()
     );
 }
 
 #[tokio::test]
 async fn selected_saved_mutation_reports_committed_drift_and_preserves_real_record_state() {
-    use baleyg::{
-        daemon::registry::{CheckoutOptions, CheckoutRegistry},
-        http::ProvisionedBrowser,
-        store::topology::{DurableRecords, TopologyRoots},
-    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+    };
+    use trellis::{
+        daemon::registry::{CheckoutOptions, CheckoutRegistry},
+        http::ProvisionedBrowser,
+        store::topology::{DurableRecords, TopologyRoots},
     };
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     for kind in ["view", "annotation"] {
@@ -1611,16 +1611,16 @@ async fn selected_saved_mutation_reports_committed_drift_and_preserves_real_reco
                 );
                 assert_eq!(value["error"]["code"], "root_changed");
                 assert_eq!(
-                    headers["X-Baleyg-Workspace"],
+                    headers["X-Trellis-Workspace"],
                     identity.root.to_str().unwrap()
                 );
-                assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+                assert!(headers.contains_key("X-Trellis-Catching-Up"));
                 if stage == "after_handler" {
                     assert_eq!(value["mutationOutcome"], "committed");
-                    assert_eq!(headers["X-Baleyg-Mutation-Outcome"], "committed");
+                    assert_eq!(headers["X-Trellis-Mutation-Outcome"], "committed");
                 } else {
                     assert!(value.get("mutationOutcome").is_none());
-                    assert!(!headers.contains_key("X-Baleyg-Mutation-Outcome"));
+                    assert!(!headers.contains_key("X-Trellis-Mutation-Outcome"));
                 }
                 fs::rename(&moved, &root).unwrap();
                 let records = DurableRecords::new(&roots, &identity);
@@ -1665,14 +1665,14 @@ fn open_descriptors(path: &std::path::Path) -> usize {
 
 #[tokio::test]
 async fn browser_only_live_listener_releases_resources_then_exits_with_control_present() {
-    use baleyg::{
+    use std::sync::Arc;
+    use trellis::{
         daemon::{
             BrowserProvisioner,
             registry::{CheckoutOptions, CheckoutRegistry},
         },
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -1715,7 +1715,7 @@ async fn browser_only_live_listener_releases_resources_then_exits_with_control_p
     let listener = provisioner.spawn_with_shutdown(signal).unwrap();
     let idle_registry = registry.clone();
     let daemon_exit = tokio::spawn(async move {
-        baleyg::daemon::run_idle_lifecycle(idle_registry)
+        trellis::daemon::run_idle_lifecycle(idle_registry)
             .await
             .unwrap();
         shutdown.send(true).unwrap();
@@ -1822,13 +1822,13 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
         body::{Body, to_bytes},
         http::Request,
     };
-    use baleyg::{
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
-    use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("cold");
@@ -1887,10 +1887,10 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
-        response.headers()["X-Baleyg-Workspace"],
+        response.headers()["X-Trellis-Workspace"],
         identity.root.to_str().unwrap()
     );
-    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "true");
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
@@ -1906,13 +1906,13 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         body::{Body, to_bytes},
         http::Request,
     };
-    use baleyg::{
+    use std::sync::Arc;
+    use tower::ServiceExt;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
-    use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
@@ -1960,7 +1960,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         loop {
             let (code, headers, body) = status(app.clone()).await;
             if code == axum::http::StatusCode::OK && body["catchingUp"] == false {
-                assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
+                assert_eq!(headers["X-Trellis-Catching-Up"], "false");
                 break body["revision"].clone();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2042,7 +2042,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         .await;
         assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["error"]["code"], "index_not_ready");
-        assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+        assert_eq!(headers["X-Trellis-Catching-Up"], "true");
         let (code, _, body) = selected_json(
             app.clone(),
             "DELETE",
@@ -2053,7 +2053,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["error"]["code"], "index_not_ready");
     }
-    let records = baleyg::store::topology::DurableRecords::new(&roots, &identity);
+    let records = trellis::store::topology::DurableRecords::new(&roots, &identity);
     assert_eq!(
         records.view_record("saved").unwrap().unwrap().title,
         "Original"
@@ -2061,7 +2061,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     assert_eq!(records.annotation_records().unwrap()[0].body, "Original");
     let (code, headers, prior) = status(app.clone()).await;
     assert_eq!(code, axum::http::StatusCode::OK, "{prior}");
-    assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(prior["catchingUp"], true);
     assert_eq!(prior["revision"], old_revision);
     let file_path = format!("/api/checkouts/{}/files", identity.root_key);
@@ -2078,7 +2078,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "true");
     let prior_files: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
@@ -2102,7 +2102,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
-    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "true");
     let mismatch = format!(
         "{file_path}?indexGeneration={}&indexRevision={}",
         old_revision["indexGeneration"].as_str().unwrap(),
@@ -2121,7 +2121,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
         .await
         .unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "true");
 
     let (code, headers, dependencies) = selected_json(
         app.clone(),
@@ -2131,7 +2131,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::OK, "{dependencies}");
-    assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     assert_eq!(dependencies["workspaceRevision"], old_revision);
     for route in [
         "dependencies/refresh",
@@ -2154,7 +2154,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             error["error"]["code"], "index_not_ready",
             "{route}: {error}"
         );
-        assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+        assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     }
     resume_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -2162,7 +2162,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             if !runtime.catching_up() {
                 let (code, headers, current) = status(app.clone()).await;
                 if code == axum::http::StatusCode::OK && current["catchingUp"] == false {
-                    assert_eq!(headers["X-Baleyg-Catching-Up"], "false");
+                    assert_eq!(headers["X-Trellis-Catching-Up"], "false");
                     assert_ne!(current["revision"], old_revision);
                     let response = app
                         .clone()
@@ -2177,7 +2177,7 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
                         .await
                         .unwrap();
                     assert_eq!(response.status(), axum::http::StatusCode::OK);
-                    assert_eq!(response.headers()["X-Baleyg-Catching-Up"], "false");
+                    assert_eq!(response.headers()["X-Trellis-Catching-Up"], "false");
                     let files: Value = serde_json::from_slice(
                         &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
                     )
@@ -2195,12 +2195,12 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
 
 #[tokio::test]
 async fn provider_routes_use_only_the_selected_checkout() {
-    use baleyg::{
+    use std::sync::Arc;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
     let temp = TempDir::new().unwrap();
     let roots =
         TopologyRoots::isolated_for_tests(temp.path().join("cache"), temp.path().join("data"));
@@ -2314,7 +2314,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
                 assert!(body[field].is_null());
             }
             assert_eq!(
-                headers["X-Baleyg-Workspace"],
+                headers["X-Trellis-Workspace"],
                 identity.root.to_str().unwrap()
             );
             assert_eq!(headers["cache-control"], "no-store");
@@ -2406,7 +2406,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{initial_refresh}");
-    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
     let a_catalog = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let (code, _, status) = selected_json(
@@ -2438,8 +2438,8 @@ async fn provider_routes_use_only_the_selected_checkout() {
     let (code, headers, symbols) =
         selected_json(app.clone(), "GET", &symbol_url, Value::Null).await;
     assert_eq!(code, axum::http::StatusCode::OK, "{symbols}");
-    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
-    assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
+    assert!(headers.contains_key("X-Trellis-Catching-Up"));
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(symbols["catalogId"], catalog_id);
     let library_symbol = symbols["items"]
@@ -2453,8 +2453,8 @@ async fn provider_routes_use_only_the_selected_checkout() {
         format!("{a_prefix}/dependencies/source?catalogId={catalog_id}&sourceRef={source_ref}");
     let (code, headers, source) = selected_json(app.clone(), "GET", &source_url, Value::Null).await;
     assert_eq!(code, axum::http::StatusCode::OK, "{source}");
-    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
-    assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
+    assert!(headers.contains_key("X-Trellis-Catching-Up"));
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(source["rootLabel"], "std");
     assert_eq!(source["file"]["text"], library_text);
@@ -2466,7 +2466,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
         let (code, headers, error) = selected_json(app.clone(), "GET", &route, Value::Null).await;
         assert_eq!(code, axum::http::StatusCode::CONFLICT, "{error}");
         assert_eq!(error["error"]["code"], "stale_catalog");
-        assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+        assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
     }
     let (code, headers, b_refresh) = selected_json(
         app.clone(),
@@ -2476,7 +2476,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{b_refresh}");
-    assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+    assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
     let b_catalog_before = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let (code, _, status) = selected_json(
@@ -2504,7 +2504,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     .await;
     assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{refresh}");
     assert_eq!(refresh["state"], "loading");
-    assert_eq!(headers["X-Baleyg-Workspace"], a_id.root.to_str().unwrap());
+    assert_eq!(headers["X-Trellis-Workspace"], a_id.root.to_str().unwrap());
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let (code, _, status) = selected_json(
@@ -2534,7 +2534,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::OK, "{b_catalog_after}");
-    assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+    assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
     assert_eq!(
         b_catalog_after, b_catalog_before,
         "A refresh must not touch B catalog"
@@ -2569,7 +2569,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
         )
         .await;
         assert_eq!(code, axum::http::StatusCode::NOT_FOUND, "{error}");
-        assert_eq!(headers["X-Baleyg-Workspace"], b_id.root.to_str().unwrap());
+        assert_eq!(headers["X-Trellis-Workspace"], b_id.root.to_str().unwrap());
     }
     let response = serde_json::json!({"answer":{"packetId":packet,"summary":[{"text":"Returns 1.",
         "citations":[{"path":"core.js","startLine":1,"endLine":1,
@@ -2626,24 +2626,24 @@ async fn provider_routes_use_only_the_selected_checkout() {
             .unwrap();
         assert_eq!(response.status(), expected);
         assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
+        assert!(!response.headers().contains_key("X-Trellis-Workspace"));
     }
     for suffix in ["jev/status", "acp/status", "dependencies", "rust-sources"] {
         let (code, headers, _) =
             selected_json(app.clone(), "GET", &format!("/api/{suffix}"), Value::Null).await;
         assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
-        assert!(!headers.contains_key("X-Baleyg-Workspace"));
+        assert!(!headers.contains_key("X-Trellis-Workspace"));
     }
 }
 
 #[tokio::test]
 async fn production_browser_rejects_every_selector_free_checkout_route_without_attachment() {
-    use baleyg::{
+    use std::sync::Arc;
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         store::topology::TopologyRoots,
     };
-    use std::sync::Arc;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     // The same inventory must hold with exactly one registered checkout: no
@@ -2725,11 +2725,11 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
             );
             assert_eq!(headers["cache-control"], "no-store", "{method} {path}");
             assert!(
-                !headers.contains_key("X-Baleyg-Workspace"),
+                !headers.contains_key("X-Trellis-Workspace"),
                 "{method} {path}"
             );
             assert!(
-                !headers.contains_key("X-Baleyg-Catching-Up"),
+                !headers.contains_key("X-Trellis-Catching-Up"),
                 "{method} {path}"
             );
             let state = registry.lock().await;
@@ -2750,7 +2750,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
             let (code, headers, _) = selected_json(app.clone(), "GET", path, Value::Null).await;
             assert_eq!(code, axum::http::StatusCode::OK, "{path}");
             assert_eq!(headers["cache-control"], "no-store");
-            assert!(!headers.contains_key("X-Baleyg-Workspace"));
+            assert!(!headers.contains_key("X-Trellis-Workspace"));
             assert_eq!(
                 registry.lock().await.active_count(),
                 0,
@@ -2773,7 +2773,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
                 .unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
             assert_eq!(response.headers()["cache-control"], "no-store");
-            assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
+            assert!(!response.headers().contains_key("X-Trellis-Workspace"));
             assert_eq!(registry.lock().await.active_count(), 0);
         }
         for (host, auth, origin, expected) in [
@@ -2820,8 +2820,8 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
                     .unwrap();
                 assert_eq!(response.status(), expected, "{path} {host}");
                 assert_eq!(response.headers()["cache-control"], "no-store");
-                assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
-                assert!(!response.headers().contains_key("X-Baleyg-Catching-Up"));
+                assert!(!response.headers().contains_key("X-Trellis-Workspace"));
+                assert!(!response.headers().contains_key("X-Trellis-Catching-Up"));
             }
         }
         assert_eq!(registry.lock().await.browser_checkouts(), original);
@@ -2841,17 +2841,17 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
         .await
         .unwrap();
         assert_eq!(code, axum::http::StatusCode::OK, "{status}");
-        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
+        assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
         assert_eq!(
-            headers["X-Baleyg-Catching-Up"],
+            headers["X-Trellis-Catching-Up"],
             status["catchingUp"].as_bool().unwrap().to_string()
         );
         assert_eq!(status["workspaceRoot"], first.root.to_str().unwrap());
         let (code, headers, files) =
             selected_json(app.clone(), "GET", &format!("{prefix}/files"), Value::Null).await;
         assert_eq!(code, axum::http::StatusCode::OK, "{files}");
-        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
-        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Trellis-Catching-Up"));
         assert!(
             files["items"]
                 .as_array()
@@ -2868,8 +2868,8 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
         )
         .await;
         assert_eq!(code, axum::http::StatusCode::OK, "{provider}");
-        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
-        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Trellis-Catching-Up"));
         let (code, headers, mutation) = selected_json(
             app,
             "POST",
@@ -2879,22 +2879,22 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
         .await;
         assert_eq!(code, axum::http::StatusCode::ACCEPTED, "{mutation}");
         assert!(mutation["id"].is_string(), "{mutation}");
-        assert_eq!(headers["X-Baleyg-Workspace"], first.root.to_str().unwrap());
-        assert!(headers.contains_key("X-Baleyg-Catching-Up"));
+        assert_eq!(headers["X-Trellis-Workspace"], first.root.to_str().unwrap());
+        assert!(headers.contains_key("X-Trellis-Catching-Up"));
         assert_eq!(registry.lock().await.active_count(), 1);
     }
 }
 
 #[tokio::test]
 async fn selected_reads_validated_predecessor_through_owner_handoff() {
-    use baleyg::{
+    use std::sync::{Arc, Mutex, mpsc};
+    use trellis::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
         index_coordinator::establish_serving_session,
         indexer::IndexOptions,
         store::{Store, topology::TopologyRoots},
     };
-    use std::sync::{Arc, Mutex, mpsc};
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("checkout");
     fs::create_dir(&root).unwrap();
@@ -2989,7 +2989,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         .expect("proved predecessor waited for metadata validation")
         .unwrap();
     assert_eq!(code, axum::http::StatusCode::OK, "{files}");
-    assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     assert!(files.to_string().contains("core.js"));
     let (mutation_code, _, mutation_body) = selected_json(
         browser.clone(),
@@ -3021,7 +3021,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     .await;
     assert_eq!(late_code, axum::http::StatusCode::OK, "{late_status}");
     assert_eq!(late_status["revision"], prior);
-    assert_eq!(late_headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(late_headers["X-Trellis-Catching-Up"], "true");
     let validation_released_at = std::time::Instant::now();
     unlock_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -3043,7 +3043,7 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     )
     .await;
     assert_eq!(code, axum::http::StatusCode::OK, "{tree}");
-    assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
+    assert_eq!(headers["X-Trellis-Catching-Up"], "true");
     let (code, _, paused) = selected_json(
         browser.clone(),
         "GET",

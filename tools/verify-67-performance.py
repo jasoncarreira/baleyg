@@ -25,7 +25,7 @@ GENERATOR = REPO / "tools/synthetic-cohorts/generate.mjs"
 TARGET_DIR = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
 if not TARGET_DIR.is_absolute():
     TARGET_DIR = REPO / TARGET_DIR
-BINARY = TARGET_DIR / "release/baleyg"
+BINARY = TARGET_DIR / "release/trellis"
 DEADLINE = time.monotonic() + 1700  # below Factory's 1800-second verifier timeout
 FACTS = """SELECT m.language,SUM(
  (SELECT count(*) FROM native_version_declarations d WHERE d.version_id=m.document_version_id)+
@@ -205,9 +205,9 @@ def main():
     require(model == "Mac17,16", f"wrong reference host: {model}")
     pinned = PINNED.read_bytes()
     parsed = json.loads(pinned)
-    require(parsed["version"] == 1 and parsed["seed"] == "baleyg-synthetic-cohorts-v1", "unknown manifest")
+    require(parsed["version"] == 1 and parsed["seed"] == "trellis-synthetic-cohorts-v1", "unknown manifest")
     command(["cargo", "build", "--locked", "--release"])
-    with tempfile.TemporaryDirectory(prefix="baleyg-67-reference-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="trellis-67-reference-") as scratch:
         scratch = Path(scratch)
         corpus = scratch / "canonical"
         command(["node", str(GENERATOR), "--out", str(corpus)])

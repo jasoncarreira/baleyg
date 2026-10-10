@@ -30,7 +30,7 @@ const canon = (value) =>
           .join(",")}}`;
 const digest = (domain, value) =>
   createHash("sha256")
-    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
+    .update(`trellis.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(canon(value))
     .digest("hex")
     .slice(0, 32);
@@ -729,7 +729,7 @@ async function specimen(t, change = {}) {
     const id = `occ:v2:${digest("occurrence", {
       contentHash: sha(text),
       extractionContext: sha(
-        "baleyg.extraction-context.v1\0" +
+        "trellis.extraction-context.v1\0" +
           canon({ language: "java", components: [] }),
       ),
       nativeProducerId: "native",

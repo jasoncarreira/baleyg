@@ -55,7 +55,7 @@ test('same inputs produce byte-identical normalized graphs',()=>{
   assert.equal(JSON.stringify(g),JSON.stringify(get()));
 });
 test('input edit invalidates all SCIP resolutions; original index stays intact',()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'baleyg-stale-'));
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'trellis-stale-'));
   try {
     fs.cpSync(fixturePath('fixture'),dir,{recursive:true});
     fs.appendFileSync(path.join(dir,'helpers.js'),'\n// changed source\n');
@@ -87,7 +87,7 @@ test('real imported cross-file calls resolve in feature-factory',()=>{
 
 test('added, deleted, and configuration-changed inputs cannot retain a fresh index',()=>{
   for(const scenario of ['add','delete','config']) {
-    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'baleyg-input-'));
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),'trellis-input-'));
     try {
       fs.cpSync(fixturePath('fixture'),dir,{recursive:true});
       if(scenario==='add') fs.writeFileSync(path.join(dir,'added.js'),'export function added() { unknown(); }');

@@ -1,13 +1,13 @@
 mod common;
-use baleyg::{
-    model::Annotation,
-    store::topology::{DurableRecords, UseGuard, WorkspaceIdentity},
-};
 use std::os::unix::fs::MetadataExt;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+};
+use trellis::{
+    model::Annotation,
+    store::topology::{DurableRecords, UseGuard, WorkspaceIdentity},
 };
 
 // This isolated child leaves a real SQLite rollback journal after an uncommitted write.
@@ -22,7 +22,7 @@ fn leave_hot_journal_child() {
     std::process::exit(0);
 }
 
-fn annotation(roots: &baleyg::store::topology::TopologyRoots, identity: &WorkspaceIdentity) {
+fn annotation(roots: &trellis::store::topology::TopologyRoots, identity: &WorkspaceIdentity) {
     DurableRecords::new(roots, identity)
         .put_annotation(&Annotation {
             id: "note".into(),
@@ -210,7 +210,7 @@ fn hostile_path_text_and_non_utf8_entries_cannot_spoof_status_or_abort_inventory
         .path()
         .join("storage_busy recovery sidecar present incomplete_record");
     common::private(&hostile);
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         hostile.join("cache"),
         hostile.join("data"),
     );

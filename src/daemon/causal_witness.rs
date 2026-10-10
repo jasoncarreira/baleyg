@@ -73,7 +73,7 @@ impl CausalWitness {
     /// Its test owns the private directory and socket; ordinary runs are inert.
     pub fn from_env(root_key: String) -> Option<Arc<Self>> {
         let home = PathBuf::from(env::var_os("HOME")?);
-        let socket = PathBuf::from(env::var_os("BALEYG_TEST_MCP_CAUSAL_SOCKET")?);
+        let socket = PathBuf::from(env::var_os("TRELLIS_TEST_MCP_CAUSAL_SOCKET")?);
         if !home.is_absolute() || !socket.is_absolute() || socket.parent()? != home {
             return None;
         }

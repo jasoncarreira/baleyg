@@ -1,9 +1,9 @@
-use baleyg::store::{
+use std::{fs, path::Path};
+use tempfile::TempDir;
+use trellis::store::{
     Store,
     topology::{TopologyRoots, UseGuard},
 };
-use std::{fs, path::Path};
-use tempfile::TempDir;
 
 #[allow(dead_code)]
 pub fn fixture() -> (TempDir, TopologyRoots) {
@@ -42,7 +42,7 @@ pub fn assert_topology_fixture(
     let indexes = cache.join("indexes");
     let root = workspace.canonicalize().unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
+        trellis::store::topology::WorkspaceIdentity::discover(Some(workspace), workspace).unwrap();
     assert_eq!(identity.root, root);
     store.verify_root().unwrap();
     let baseline = store.index_baseline().unwrap();

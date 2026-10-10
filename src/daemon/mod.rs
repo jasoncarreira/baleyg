@@ -39,7 +39,7 @@ impl SocketPaths {
             digest.update(unsafe { libc::geteuid() }.to_be_bytes());
             let digest = digest.finalize();
             let name = format!(
-                "baleyg-{}-{}",
+                "trellis-{}-{}",
                 unsafe { libc::geteuid() },
                 hex::encode(&digest[..16])
             );
@@ -53,7 +53,7 @@ impl SocketPaths {
     }
 
     fn prepare(&self) -> io::Result<()> {
-        // Existing system ancestors are not managed by Baleyg. Create each missing
+        // Existing system ancestors are not managed by Trellis. Create each missing
         // component privately, even when the data directory itself is not present.
         let mut missing = Vec::new();
         let mut ancestor = self.run.as_path();

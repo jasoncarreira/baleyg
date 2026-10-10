@@ -6,7 +6,13 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
+use serde_json::{Value, json};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
+use tower::ServiceExt;
+use trellis::{
     behavior::{SequenceStep, SequenceView},
     http,
     indexer::{IndexOptions, index_workspace},
@@ -16,12 +22,6 @@ use baleyg::{
         topology::{IndexNotReady, LeaderSession},
     },
 };
-use serde_json::{Value, json};
-use std::{
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-};
-use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const JAVA: &str = r#"interface Port { void signatureOnly(); }
@@ -50,7 +50,7 @@ struct Fixture {
     workspace: PathBuf,
     sentinel: PathBuf,
     store: Store,
-    pin: baleyg::model::IndexPin,
+    pin: trellis::model::IndexPin,
     graph: Graph,
     app: Router,
     session: Arc<LeaderSession>,
@@ -114,7 +114,7 @@ fn setup() -> Fixture {
             &graph,
             &workspace,
             session.leader_guard().unwrap(),
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
             },
@@ -501,7 +501,7 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
             &f.graph,
             &f.workspace,
             f.session.leader_guard().unwrap(),
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation,
                 index_revision: 1
             },
@@ -578,15 +578,15 @@ async fn java_python_cached_endpoints_enforce_revision_and_auth() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

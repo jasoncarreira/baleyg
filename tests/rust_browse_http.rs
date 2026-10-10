@@ -5,13 +5,13 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
-    http,
-    indexer::{IndexOptions, index_workspace_bundle},
-};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
+use trellis::{
+    http,
+    indexer::{IndexOptions, index_workspace_bundle},
+};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 async fn request(app: &Router, method: &str, path: &str, body: Value) -> (u16, Value) {
     let response = app
@@ -218,8 +218,8 @@ async fn rust_methods_sequence_and_source_survive_live_file_removal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_tick_keeps_pinned_and_current_source_available_across_fifty_edits() {
-    use baleyg::index_coordinator;
     use std::time::{Duration, Instant};
+    use trellis::index_coordinator;
 
     struct StopLoad(Arc<AtomicBool>);
     impl Drop for StopLoad {

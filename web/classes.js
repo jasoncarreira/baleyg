@@ -37,8 +37,8 @@
     if (text !== undefined) node.textContent = text;
     return node;
   };
-  const context = () => ({session: api.currentSession(), revision: window.BaleygIndexPin.copy(api.currentRevision())});
-  const valid = c => !!api && c.session === api.currentSession() && window.BaleygIndexPin.equal(c.revision, api.currentRevision());
+  const context = () => ({session: api.currentSession(), revision: window.TrellisIndexPin.copy(api.currentRevision())});
+  const valid = c => !!api && c.session === api.currentSession() && window.TrellisIndexPin.equal(c.revision, api.currentRevision());
   const state = (text, kind = "ready") => { ui.state.textContent = text; ui.state.dataset.state = kind; };
   function renderWarnings(warnings = []) {
     if (!warningBox) {
@@ -213,7 +213,7 @@
       if (path) params.set("path", path);
       const data = await api.request(`/api/classes?${params}`);
       if (ticket !== searchSerial || !valid(c)) return;
-      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+      if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
         reset(); api.onStale?.("Workspace revision changed. Search again.");
         state("Workspace revision changed. Search again.", "stale"); return;
       }
@@ -244,7 +244,7 @@
       if (autoOpen && items.length) await loadDiagram(items[0].symbol.id, [], true);
     } catch (error) {
       if (ticket === searchSerial && valid(c) && error.name !== "AbortError") {
-        const conflict = window.BaleygIndexPin.isConflict(error);
+        const conflict = window.TrellisIndexPin.isConflict(error);
         if (conflict) { reset(); api.onStale?.("Workspace revision changed. Search again."); }
         state(error.message || "Class lookup failed. Try Search again.", conflict ? "stale" : "error");
       }
@@ -268,7 +268,7 @@
     try {
       const data = await api.request("/api/class-diagram", {method: "POST", body: {seed: nextSeed, expectedRevision: c.revision, expanded: expansion, includeHierarchy: false, includeUnmatched: false}});
       if (ticket !== serial || searchTicket !== searchSerial || !valid(c)) return;
-      if (!window.BaleygIndexPin.equal(data.revision, c.revision)) {
+      if (!window.TrellisIndexPin.equal(data.revision, c.revision)) {
         reset(); api.onStale?.("Workspace revision changed. Open the class again.");
         state("Workspace revision changed. Open the class again.", "stale"); return;
       }
@@ -279,7 +279,7 @@
       updateStatus(); restoreFocus();
     } catch (error) {
       if (ticket === serial && searchTicket === searchSerial && valid(c) && error.name !== "AbortError") {
-        const conflict = window.BaleygIndexPin.isConflict(error);
+        const conflict = window.TrellisIndexPin.isConflict(error);
         const recoverable = diagram && snapshot && valid(snapshot) && ![401, 403].includes(error.status) && !conflict;
         if (recoverable) {
           // This request never published a new view. Restore only the still-current cached view.
@@ -435,5 +435,5 @@
     }
     ui.diagram.append(ledger);
   }
-  window.BaleygClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu});
+  window.TrellisClasses = Object.freeze({init, open, reset, showContextMenu, closeContextMenu});
 })();

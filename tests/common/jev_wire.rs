@@ -11,7 +11,7 @@ fn identity(value: &Value, dictionary: &[Value]) -> Value {
 }
 pub fn decode_packet(body: &Value) -> Value {
     let state = &body["state"];
-    assert_eq!(state["encoding"], "baleyg-evidence-tables-v1");
+    assert_eq!(state["encoding"], "trellis-evidence-tables-v1");
     let dictionary = state["identities"].as_array().unwrap();
     let mut packet = state["packet"].clone();
     for path in state["identityPaths"].as_array().unwrap() {

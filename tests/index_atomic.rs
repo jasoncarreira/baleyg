@@ -1,6 +1,6 @@
-use baleyg::store::Store;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, sync::mpsc};
 use tempfile::TempDir;
+use trellis::store::Store;
 
 fn fixture() -> (TempDir, TempDir) {
     let state = tempfile::tempdir().unwrap();
@@ -11,11 +11,11 @@ fn projection_fixture() -> (
     TempDir,
     TempDir,
     Store,
-    baleyg::model::IndexPin,
-    std::sync::Arc<baleyg::store::topology::LeaderSession>,
+    trellis::model::IndexPin,
+    std::sync::Arc<trellis::store::topology::LeaderSession>,
 ) {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
     use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
     let (state, workspace) = fixture();
     fs::write(
         workspace.path().join("flow.js"),
@@ -255,11 +255,11 @@ fn preexisting_corrupt_index_is_not_reinitialized() {
 
 #[test]
 fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recovery() {
-    use baleyg::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
     use std::{
         os::unix::fs::MetadataExt,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{index_coordinator::reconcile_workspace, indexer::IndexOptions};
 
     let (state, workspace, store, old_pin, session) = projection_fixture();
     drop(session);
@@ -312,13 +312,13 @@ fn published_sqlite_header_with_missing_pages_refuses_reads_until_explicit_recov
 
 #[test]
 fn failed_capture_leaves_existing_index_revision_unchanged() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace},
-        model::CancelFlag,
-    };
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace},
+        model::CancelFlag,
     };
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("main.js"), "f();").unwrap();
@@ -348,11 +348,11 @@ fn failed_capture_leaves_existing_index_revision_unchanged() {
 
 #[test]
 fn drift_refusal_preserves_populated_store_pair_and_graph() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         indexer::{IndexOptions, index_workspace},
         model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     let root = workspace.path();
     fs::write(root.join("main.js"), "function f() {} f();").unwrap();
@@ -384,15 +384,15 @@ fn drift_refusal_preserves_populated_store_pair_and_graph() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},
@@ -406,13 +406,13 @@ fn publish_bundle(
 
 #[test]
 fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use sha2::{Digest, Sha256};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     let (state, workspace) = fixture();
     let root = workspace.path();
@@ -542,7 +542,7 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
     );
     let stale = IndexJobCoordinator::prepare_with_session(
         &store,
-        Some(baleyg::model::IndexPin {
+        Some(trellis::model::IndexPin {
             index_generation: first.index_generation,
             index_revision: first.index_revision - 1,
         }),
@@ -592,10 +592,10 @@ fn coordinator_rejects_drift_cancel_and_stale_pair_without_partial_publication()
 
 #[test]
 fn full_reconcile_replaces_persisted_source_and_input_inventory() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
     fs::write(
@@ -687,7 +687,7 @@ fn full_reconcile_replaces_persisted_source_and_input_inventory() {
 
 fn sqlite_snapshot(
     path: &Path,
-    pin: baleyg::model::IndexPin,
+    pin: trellis::model::IndexPin,
     normalize_current_publication: bool,
 ) -> Vec<(String, Vec<Vec<String>>)> {
     use rusqlite::types::Value;
@@ -914,11 +914,11 @@ fn sqlite_snapshot(
 
 #[test]
 fn parse_error_retained_pin_matches_independent_cold_and_advisory_uses_exact_token() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
         native_evidence::DocumentKey,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
 
     let (state, workspace) = fixture();
     let root = workspace.path();
@@ -1127,10 +1127,10 @@ fn new_producer_binding_refuses_unilateral_executable_header_and_binding_tamper(
 
 #[test]
 fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     fs::write(
         workspace.path().join("A.java"),
@@ -1216,10 +1216,10 @@ fn additive_producer_binding_keeps_same_generation_legacy_pin_and_queue() {
 
 #[test]
 fn document_local_delta_and_cross_file_fallback_match_independent_cold_publications() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     let padding = "x".repeat(145_000);
     let js = |value: &str, name: &str| {
@@ -1291,7 +1291,7 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
         local_phases.iter().any(|phase| phase == "mode:local"),
         "a successful local edit must take the measured local branch: {local_phases:?}"
     );
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
         Some(workspace.path()),
         workspace.path(),
     )
@@ -1356,7 +1356,7 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
     );
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     for path in ["A.java", "run.py", "run.rs"] {
-        let version = |pin: baleyg::model::IndexPin| -> String {
+        let version = |pin: trellis::model::IndexPin| -> String {
             db.query_row(
             "SELECT document_version_id FROM revision_documents WHERE revision_id=?1 AND path=?2",
             rusqlite::params![format!("pin:v1:{}:{}",pin.index_generation,pin.index_revision),path],|r|r.get(0)).unwrap()
@@ -1472,10 +1472,10 @@ fn document_local_delta_and_cross_file_fallback_match_independent_cold_publicati
 
 #[test]
 fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     for (family, mutation) in [
         (
             "native",
@@ -1584,10 +1584,10 @@ fn local_reuse_trusts_validated_head_but_selected_reads_refuse_sql_forgery() {
 
 #[test]
 fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore_change() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     for (name, source) in [
         ("keep.js", "function keep() { oldCall(); }\n"),
@@ -1755,12 +1755,12 @@ fn reconcile_matches_fresh_full_snapshot_after_add_edit_delete_rename_and_ignore
 #[cfg(unix)]
 #[test]
 fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::{
         os::unix::{ffi::OsStrExt, fs::MetadataExt},
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     let (state, workspace) = fixture();
     let source = workspace.path().join("same.js");
@@ -1835,15 +1835,15 @@ fn full_scan_detects_same_size_preserved_mtime_edit_through_persisted_ctime() {
 
 #[test]
 fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::{
         os::unix::fs::MetadataExt,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
@@ -1904,7 +1904,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
             .unwrap()
             .is_none()
     );
-    let wrong = baleyg::model::IndexPin {
+    let wrong = trellis::model::IndexPin {
         index_generation: uuid::Uuid::new_v4(),
         index_revision: rebuilt.index_revision,
     };
@@ -2043,15 +2043,15 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
 
 #[test]
 fn bounded_control_decode_rebuilds_and_failed_attempt_stays_closed() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::{
         os::unix::fs::MetadataExt,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
@@ -2105,13 +2105,13 @@ fn bounded_control_decode_rebuilds_and_failed_attempt_stays_closed() {
 
 #[test]
 fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::{
         io::{Seek, SeekFrom, Write},
         os::unix::fs::MetadataExt,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
     let (state, workspace) = fixture();
     fs::write(workspace.path().join("one.js"), "function one() {}\n").unwrap();
@@ -2152,10 +2152,10 @@ fn exceptional_format_is_typed_deferred_refusal_without_file_mutation() {
 
 #[test]
 fn current_v8_inventory_validation_rejects_missing_unknown_and_unsupported_state() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     for mutation in [
         "DELETE FROM revision_capture_inputs WHERE input_key='config:package.json'",
         "INSERT INTO revision_capture_inputs(revision_id,input_key,payload) SELECT id,'unknown:slot','{\"state\":\"absent\"}' FROM native_revisions WHERE published_index_revision=(SELECT index_revision FROM index_metadata)",
@@ -2330,7 +2330,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         [],
     )
     .unwrap();
-    let mut items = vec![baleyg::file_tree::Entry {
+    let mut items = vec![trellis::file_tree::Entry {
         name: "flow.js".into(),
         path: "flow.js".into(),
         kind: "file",
@@ -2356,7 +2356,7 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
     let (_state, _workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     assert!(store.methods_at("missing.js", Some(pin)).unwrap().is_none());
-    let wrong = baleyg::model::IndexPin {
+    let wrong = trellis::model::IndexPin {
         index_generation: uuid::Uuid::new_v4(),
         index_revision: pin.index_revision,
     };
@@ -2373,13 +2373,13 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
 
 #[test]
 fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::os::unix::fs::MetadataExt;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
 
     let (state, workspace, store, pin, session) = projection_fixture();
@@ -2454,9 +2454,6 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
 
 #[test]
 fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use rusqlite::types::ValueRef;
     use std::{
         os::unix::fs::MetadataExt,
@@ -2464,6 +2461,9 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
 
     let (state, workspace, initial, old, session) = projection_fixture();
@@ -2552,7 +2552,6 @@ fn metadata_real_revision_uses_private_witness_and_recovers_same_inode() {
 
 #[test]
 fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
-    use baleyg::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
     use rusqlite::MAIN_DB;
     use std::{
         os::unix::fs::MetadataExt,
@@ -2561,6 +2560,7 @@ fn private_metadata_witness_distinguishes_nul_real_and_multichunk_blob() {
             atomic::{AtomicBool, Ordering},
         },
     };
+    use trellis::{index_coordinator::IndexJobCoordinator, indexer::IndexOptions};
 
     let conflict = |first: &str, mutate: &dyn Fn(&rusqlite::Connection)| {
         let (state, workspace, initial, _old, session) = projection_fixture();
@@ -2903,15 +2903,15 @@ fn live_root_mismatch_precedes_typed_control_corruption_without_latching() {
 
 #[test]
 fn live_stats_recovery_cancel_then_success_preserves_inode_and_rotates_pin() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use std::{
         os::unix::fs::MetadataExt,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
 
     let (state, workspace, store, old, session) = projection_fixture();
@@ -3011,13 +3011,13 @@ fn live_control_corruption_status_first_is_typed_and_clone_shared() {
 
 #[test]
 fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinates() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{CancelFlag, SymbolKind},
-    };
     use protobuf::Message;
     use sha2::{Digest, Sha256};
     use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{CancelFlag, SymbolKind},
+    };
     let (state, workspace) = fixture();
     let java = "/*é*/ class A {}\n";
     let python = "class P: pass\n";
@@ -3064,7 +3064,7 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
     };
     let valid = occurrences("valid");
     let (baseline, base_native, _) = run(&valid, &correct_hashes);
-    let node = |graph: &baleyg::model::Graph, path: &str, name: &str| {
+    let node = |graph: &trellis::model::Graph, path: &str, name: &str| {
         graph
             .nodes
             .iter()
@@ -3173,14 +3173,14 @@ fn captured_java_python_scip_labels_require_unique_measured_names_and_coordinate
 
 #[test]
 fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinned_revisions() {
-    use baleyg::{
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator,
         indexer::IndexOptions,
         model::{CancelFlag, IndexPin, SymbolKind},
     };
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     let java = "class A {}\n";
     fs::write(workspace.path().join("A.java"), java).unwrap();
@@ -3281,14 +3281,14 @@ fn same_source_new_scip_label_reuses_native_and_reprojects_presentation_at_pinne
 
 #[test]
 fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_labels() {
-    use baleyg::{
+    use protobuf::Message;
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         classes::{Catalog, FileExtraction, Limits},
         indexer::{IndexOptions, index_workspace_bundle},
         model::{CancelFlag, Graph, SymbolKind},
     };
-    use protobuf::Message;
-    use sha2::{Digest, Sha256};
-    use std::sync::{Arc, atomic::AtomicBool};
     let (state, workspace) = fixture();
     let sources = [
         ("A.java", "/*é*/ class A {}\n"),
@@ -3349,7 +3349,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
         index_workspace_bundle(&options, store.root_id(), &cancel, |_| {}).unwrap()
     };
     let (positive, positive_native, positive_capture) = run(&index);
-    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a baleyg::model::Symbol {
+    fn node<'a>(graph: &'a Graph, path: &str, name: &str) -> &'a trellis::model::Symbol {
         graph
             .nodes
             .iter()
@@ -3369,7 +3369,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             .filter(|n| n.path == "a.rs")
             .all(|n| n.display_label.is_none())
     );
-    let extract = |graph: &Graph, capture: &baleyg::capture::Capture| {
+    let extract = |graph: &Graph, capture: &trellis::capture::Capture| {
         let files: Vec<_> = capture
             .files
             .iter()
@@ -3524,7 +3524,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             "SELECT n.payload FROM graph_nodes n JOIN revision_documents m ON n.projection_id=m.graph_projection_id WHERE m.revision_id=?1 AND m.path=?2 AND n.id=?3",
             rusqlite::params![current,path,expected.id],|r|r.get(0)).unwrap();
         assert_eq!(
-            serde_json::from_str::<baleyg::model::Symbol>(&graph_payload).unwrap(),
+            serde_json::from_str::<trellis::model::Symbol>(&graph_payload).unwrap(),
             *expected
         );
         assert!(expected.display_label.is_none());
@@ -3549,7 +3549,7 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
             "SELECT c.payload FROM classes c JOIN revision_documents m ON m.class_projection_id=c.projection_id WHERE m.revision_id=?1 AND m.path=?2 AND c.id=?3",
             rusqlite::params![current,path,expected.symbol.id],|r|r.get(0)).unwrap();
         assert_eq!(
-            serde_json::from_str::<baleyg::classes::ClassDefinition>(&payload).unwrap(),
+            serde_json::from_str::<trellis::classes::ClassDefinition>(&payload).unwrap(),
             *expected
         );
         assert!(expected.symbol.display_label.is_none());
@@ -3559,13 +3559,13 @@ fn captured_scip_document_cutoff_refuses_optional_java_python_and_javascript_lab
 #[test]
 #[ignore = "pinned medium Cmedium0000 Java prefix insertion requires two cold indices; run explicitly"]
 fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retains_old_pin() {
-    use baleyg::{
-        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
-    };
     use sha2::{Digest, Sha256};
     use std::{
         process::Command,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
 
     let root = tempfile::tempdir().unwrap();
@@ -3587,7 +3587,7 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
             "{:x}",
             Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
         ),
-        "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046"
+        "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
     );
     let workspace = corpus.join("medium");
     let relative = "java/Cmedium0000.java";
@@ -3705,10 +3705,10 @@ fn canonical_medium_java_prefix_literal_local_matches_independent_cold_and_retai
 
 #[test]
 fn exported_javascript_and_bare_rust_tail_local_match_independent_cold() {
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::IndexJobCoordinator, indexer::IndexOptions, model::CancelFlag,
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     for (path, before, after) in [
         (
             "f0.js",

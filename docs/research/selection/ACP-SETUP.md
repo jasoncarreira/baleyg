@@ -42,7 +42,7 @@ SDK 1.4.0 integration follows the official adapter example:
 import { Readable, Writable } from 'node:stream';
 import { client, methods, ndJsonStream, PROTOCOL_VERSION } from '@agentclientprotocol/sdk';
 
-const connection = client({ name: 'baleyg-selection-smoke' })
+const connection = client({ name: 'trellis-selection-smoke' })
   .onNotification(methods.client.session.update, ({ params }) => {
     // Record bounded, redacted agent_message_chunk/tool_call/tool_call_update data.
   })
@@ -58,7 +58,7 @@ const agent = connection.agent;
 1. Send `initialize`, using SDK `PROTOCOL_VERSION` (currently wire version 1):
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"baleyg-selection-smoke","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"trellis-selection-smoke","version":"0.1.0"},"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}}}
 ```
 
 Check negotiated protocol and capabilities. Do not advertise client filesystem or terminal access. Do not enable gateway auth, subagents, goals, or background tasks.

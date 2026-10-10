@@ -798,10 +798,10 @@ mod tests {
 
     #[test]
     fn process_reservation_worker() {
-        let Some(dir) = std::env::var_os("BALEYG_TEST_LEDGER_DIR") else {
+        let Some(dir) = std::env::var_os("TRELLIS_TEST_LEDGER_DIR") else {
             return;
         };
-        let work = std::env::var_os("BALEYG_TEST_LEDGER_WORK").unwrap();
+        let work = std::env::var_os("TRELLIS_TEST_LEDGER_WORK").unwrap();
         let live = provider(Path::new(&dir), Path::new(&work), 500);
         for _ in 0..30 {
             let _ = live.reserve(b"synthetic process request");
@@ -816,8 +816,8 @@ mod tests {
             .map(|_| {
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "live_jev::tests::process_reservation_worker"])
-                    .env("BALEYG_TEST_LEDGER_DIR", dir.path())
-                    .env("BALEYG_TEST_LEDGER_WORK", work.path())
+                    .env("TRELLIS_TEST_LEDGER_DIR", dir.path())
+                    .env("TRELLIS_TEST_LEDGER_WORK", work.path())
                     .stdout(std::process::Stdio::null())
                     .spawn()
                     .unwrap()

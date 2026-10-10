@@ -59,12 +59,12 @@ test.before(async () => {
   const metadata = await run("cargo", ["metadata", "--no-deps", "--format-version", "1"], {timeout:60000});
   const target = JSON.parse(metadata.stdout).target_directory;
   assert.equal(typeof target, "string");
-  await run("cargo", ["build", "--locked", "--bin", "baleyg"], {timeout:900000});
-  const built = join(target, "debug", process.platform === "win32" ? "baleyg.exe" : "baleyg");
-  assert.ok(existsSync(built), `built Baleyg binary is unavailable at ${built}`);
+  await run("cargo", ["build", "--locked", "--bin", "trellis"], {timeout:900000});
+  const built = join(target, "debug", process.platform === "win32" ? "trellis.exe" : "trellis");
+  assert.ok(existsSync(built), `built Trellis binary is unavailable at ${built}`);
   // tools/verify runs Cargo tests and browser acceptance concurrently. Cargo may
   // replace its target executable between these two real-browser scenarios.
-  suiteBinaryDir = mkdtempSync(join(tmpdir(), "baleyg-saved-binary-"));
+  suiteBinaryDir = mkdtempSync(join(tmpdir(), "trellis-saved-binary-"));
   binary = join(suiteBinaryDir, basename(built));
   copyFileSync(built, binary);
   assert.ok(existsSync(binary), `fixed suite binary is unavailable at ${binary}`);
@@ -78,13 +78,13 @@ function isolatedEnv(paths) {
     XDG_DATA_HOME:paths.xdgData,
     XDG_CONFIG_HOME:paths.xdgConfig,
     CARGO_HOME:paths.cargoHome,
-    RUST_LOG:"baleyg=info",
+    RUST_LOG:"trellis=info",
   };
   delete env.RUST_SRC_PATH; delete env.JEV_KEY;
   return env;
 }
 function fixture() {
-  const temp = mkdtempSync(join(tmpdir(), "baleyg-saved-browser-"));
+  const temp = mkdtempSync(join(tmpdir(), "trellis-saved-browser-"));
   const paths = {temp, workspace:join(temp,"workspace"), home:join(temp,"home"), xdgCache:join(temp,"xdg-cache"),
     xdgData:join(temp,"xdg-data"), xdgConfig:join(temp,"xdg-config"), cargoHome:join(temp,"cargo-home"), secrets:join(temp,"secrets")};
   for (const path of Object.values(paths).slice(1)) mkdirSync(path, {recursive:true, mode:0o700});
@@ -110,7 +110,7 @@ async function startDaemon(paths, expectedRevision) {
       rejected = rejectAddress;
       child.stderr.on("data", chunk => {
         stderr = (stderr + chunk).slice(-16384);
-        const match = stderr.match(/Baleyg: (http:\/\/127\.0\.0\.1:\d+)\//);
+        const match = stderr.match(/Trellis: (http:\/\/127\.0\.0\.1:\d+)\//);
         if (match && !base) { base = match[1]; resolveAddress(base); }
       });
       child.once("error", rejectAddress);

@@ -3,7 +3,7 @@
 > **Superseded (2026-09-23).** This plan implemented the grant-based pilot (enrollment, owner-issued
 > grants, limited principals, budgets, HTTP tool routes). Its PRs were closed unmerged. The accepted
 > design is the [local topology](local-topology.md) and [stdio MCP contract](mcp-readonly-pilot-contract.md),
-> sequenced by [#8](https://github.com/jasoncarreira/baleyg/issues/8). Kept as history; do not implement from it.
+> sequenced by [#8](https://github.com/SquashMerge/trellis/issues/8). Kept as history; do not implement from it.
 
 Status (historical): **PLAN — no implementation authorized beyond slice 0**. This sequenced the work
 specified by the grant-based pilot contract as it stood before 2026-09-23, which was then the
@@ -36,7 +36,7 @@ New code lives under `src/mcp/`, keeping the contract's separations visible in t
 | `enrollment` | Retained FDs, device/inode anchors, the enrolled read-only connection, identity checks, generation epoch, unavailability latch, read serialization and interruption |
 | `grants` | In-memory grant table, capabilities, TTL, budget reservation and settlement, revocation |
 | `http` | Owner control routes, the four tool routes, DTO projection, error envelope |
-| `stdio` | The `baleyg mcp` adapter: framing, `tools/list` filtering, cancellation, EOF teardown |
+| `stdio` | The `trellis mcp` adapter: framing, `tools/list` filtering, cancellation, EOF teardown |
 | `handoff` | Descriptor and grant-file creation, validation and consumption |
 
 Keeping enrollment separate from `store::Store` is deliberate. The contract requires a connection
@@ -138,7 +138,7 @@ rather than a sampled subset. Preserve the existing single-`Host`, single-`Origi
 
 **Gates:** acceptance test 4 (server authorization).
 
-### Slice 4 — `baleyg_workspace_describe` end to end
+### Slice 4 — `trellis_workspace_describe` end to end
 
 > **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
@@ -156,7 +156,7 @@ owner bearer and hiding tools is not this design" — so there is no shortcut wo
 
 > **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
-**Deliverable:** `baleyg_find_symbols`, `baleyg_inspect`, `baleyg_read_source` as SQL patterns on
+**Deliverable:** `trellis_find_symbols`, `trellis_inspect`, `trellis_read_source` as SQL patterns on
 the enrolled connection with mandatory `expectedRevision` equality against both the admitted
 revision and the transaction-pinned current revision.
 
@@ -177,7 +177,7 @@ no incoming hierarchy to expose.
 
 > **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
-**Deliverable:** `baleyg mcp --binding-file`, added beside the existing `index`/`serve`/`status`/
+**Deliverable:** `trellis mcp --binding-file`, added beside the existing `index`/`serve`/`status`/
 `symbols`/`query`/`export` subcommands (`src/main.rs:32`). Protocol-only stdout with diagnostics on
 stderr, `tools/list` filtered to granted capabilities, structured errors returned as `isError`,
 cancellation that suppresses late responses, EOF teardown, and the consumed-grant
@@ -189,7 +189,7 @@ cancellation that suppresses late responses, EOF teardown, and the consumed-gran
 
 > **Historical plan only.** This section belongs to the superseded grant-based pilot. It does not impose requirements or grant implementation authority for the current [stdio MCP contract](mcp-readonly-pilot-contract.md).
 
-**Deliverable:** `baleyg mcp-grant issue`. Operator-controlled 0700 directory with symlink-free
+**Deliverable:** `trellis mcp-grant issue`. Operator-controlled 0700 directory with symlink-free
 resolution, refusal when a configured path lies inside an agent-readable root, exclusive no-follow
 0600 grant file validated through the opened FD, unlink after consumption, exact loopback base URL
 with no redirects or proxy routing, and no token in argv, environment, logs or diagnostics.

@@ -40,7 +40,7 @@ Include auth/host/origin, stale revision, cache-only, crossfile types, ambiguous
 UTF8 line boundaries, overloaded methods/shared field ranges, exact member validation, limits tests.
 
 Source UI owner: web/navigation.js (new), web/navigation.css (new), tests/navigation-ui.test.cjs(new).
-window.BaleygNavigation.init({request,currentRevision,currentSession,openClass,selectMethod,showMenu}).
+window.TrellisNavigation.init({request,currentRevision,currentSession,openClass,selectMethod,showMenu}).
 request(path,{method,body}) same interface asClasses. showMenu(event,actions) delegates existingaccessible
 classcontextmenu. Public open(event,selector,{isCurrent?}={}) captures anchor/coords synchronously,
 prevents native menu then fetches targets; callbacks must rechecksession/revision/request/scope.

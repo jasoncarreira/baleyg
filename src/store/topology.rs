@@ -120,7 +120,8 @@ pub struct TopologyRoots {
 }
 impl TopologyRoots {
     pub fn production() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "odin", "baleyg").context("ProjectDirs unavailable")?;
+        let dirs = ProjectDirs::from("dev", "squashmerge", "trellis")
+            .context("ProjectDirs unavailable")?;
         Ok(Self {
             cache: dirs.cache_dir().to_owned(),
             data: dirs.data_local_dir().to_owned(),
@@ -568,7 +569,7 @@ impl WorkspaceIdentity {
                 metadata(git)?.uid() == owner() && metadata(git)?.is_dir(),
                 "unsafe Git directory"
             );
-            let path = git.join("baleyg/workspace-id");
+            let path = git.join("trellis/workspace-id");
             let marker = read_marker_readonly(&path).map_err(|error| {
                 if error
                     .downcast_ref::<std::io::Error>()
@@ -666,9 +667,9 @@ impl WorkspaceIdentity {
                 "workspace_id_changed"
             );
             let marker = if readonly {
-                read_marker_readonly(&git.join("baleyg/workspace-id"))?
+                read_marker_readonly(&git.join("trellis/workspace-id"))?
             } else {
-                read_marker(&git.join("baleyg/workspace-id"))?
+                read_marker(&git.join("trellis/workspace-id"))?
             };
             ensure!(Some(marker) == self.marker, "workspace_id_changed");
         }
@@ -925,7 +926,7 @@ fn read_marker_during_creation(
 }
 fn durable_marker(
     path: &Path,
-    baleyg: &Path,
+    trellis: &Path,
     git: &Path,
     file: &File,
     hook: &mut impl FnMut(MarkerStage) -> Result<()>,
@@ -935,7 +936,7 @@ fn durable_marker(
     file.sync_all().context("workspace_id_not_durable")?;
     private_file(path, file).context("workspace_id_not_durable")?;
     hook(MarkerStage::PrivateDirSync).context("workspace_id_not_durable")?;
-    sync_directory(baleyg).context("workspace_id_not_durable")?;
+    sync_directory(trellis).context("workspace_id_not_durable")?;
     private_file(path, file).context("workspace_id_not_durable")?;
     hook(MarkerStage::GitDirSync).context("workspace_id_not_durable")?;
     sync_directory(git).context("workspace_id_not_durable")?;
@@ -946,9 +947,9 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
         metadata(git)?.uid() == owner() && metadata(git)?.is_dir(),
         "unsafe Git directory"
     );
-    let baleyg = git.join("baleyg");
-    make_private(&baleyg)?;
-    let path = baleyg.join("workspace-id");
+    let trellis = git.join("trellis");
+    make_private(&trellis)?;
+    let path = trellis.join("workspace-id");
     // Only an absent initial pathname may start a new UUID. Once opened,
     // descriptor/path failures (including NotFound) must not regenerate it.
     let initial = OpenOptions::new()
@@ -960,7 +961,7 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
         Ok(file) => {
             let first = classify_marker_file(&path, file)?;
             let (id, file) = read_marker_during_creation(&path, first, hook)?;
-            durable_marker(&path, &baleyg, git, &file, hook)?;
+            durable_marker(&path, &trellis, git, &file, hook)?;
             Ok(id)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -976,13 +977,13 @@ fn marker_at(git: &Path, hook: &mut impl FnMut(MarkerStage) -> Result<()>) -> Re
                     private_file(&path, &f)?;
                     hook(MarkerStage::CreatedBeforeWrite)?;
                     f.write_all(id.to_string().as_bytes())?;
-                    durable_marker(&path, &baleyg, git, &f, hook)?;
+                    durable_marker(&path, &trellis, git, &f, hook)?;
                     Ok(id)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let first = read_marker_file(&path)?;
                     let (id, file) = read_marker_during_creation(&path, first, hook)?;
-                    durable_marker(&path, &baleyg, git, &file, hook)?;
+                    durable_marker(&path, &trellis, git, &file, hook)?;
                     Ok(id)
                 }
                 Err(e) => Err(e.into()),
@@ -2001,34 +2002,34 @@ fn historical_index_extractor(
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut digest = Sha256::new();
-    digest.update(b"baleyg.gc.legacy-shape.v1\0");
+    digest.update(b"trellis.gc.legacy-shape.v1\0");
     digest.update(serde_json::to_vec(&objects)?);
     let shape = hex::encode(digest.finalize());
     let marker = match version {
-        4 if shape == "671fb1bc8f8afdabc2c0cd3fdfa48f9ca4c0dae19e4b120a029531ab263a7f97" => {
+        4 if shape == "7293ab78eac10e67b74de81524fa4c79220c01ae4adae4fa4ca04de9b0e3f9e6" => {
             "native-v1"
         }
-        5 if shape == "671fb1bc8f8afdabc2c0cd3fdfa48f9ca4c0dae19e4b120a029531ab263a7f97" => {
+        5 if shape == "7293ab78eac10e67b74de81524fa4c79220c01ae4adae4fa4ca04de9b0e3f9e6" => {
             "native-no-lexical-v1"
         }
         6 if matches!(
             shape.as_str(),
-            "7157d498af3664202afd5cf22611504c6c3c13c7680df9bd95edca9bcffa744f"
-                | "3d8f85da1147c24af05d0cc1edf5eb3f8dbc57147a8fe5fb34c3dc77b522782e"
+            "122fb52f9e80b1124248273b28454a8911ae1c6ac6c94ca06059d43a7affaa0e"
+                | "7038f9d5ba95f13affd80db66b76254cd6e4cee5cb63430b68ff822bc717f118"
         ) =>
         {
             "native-paired-v1"
         }
-        7 if shape == "0f9d35effec7cc42016ba8c5965155558ab4c9d7f80a710474932b6f13499964" => {
+        7 if shape == "20cd03736e753938bbaaa4ba159f36f062075202c697fc2cbc08203aff582172" => {
             "native-paired-v1"
         }
-        8 if shape == "67f6d823fce6f306b35eab660421fe57d8bfee2385a223c3faa5c062355e4a2d" => {
+        8 if shape == "93170e588fb8cd6a569b31806df68f652f8888713eba74366cef1e90b86d5555" => {
             "native-v4"
         }
         8 if matches!(
             shape.as_str(),
-            "8f41ecd1ea2829e56ad78acea951664542df43dba59cda8db846d68cdf7bb9b9"
-                | "58d077101fce7bfbe41f5fdf048df947d1964415f3d7f84af8346d2d02201d2d"
+            "ac245130f19fef856d735638b8825ca6860d89562477cd63bf8da3b0ccca692c"
+                | "1271e294805e1310bfaf32c07700f870767cdcfa1a5ad629a148fced08cb5a78"
         ) =>
         {
             "native-v4-class-compose-v1"
@@ -2037,8 +2038,8 @@ fn historical_index_extractor(
         // changes later. Both no-binding and producer-binding layouts exist.
         8 if matches!(
             shape.as_str(),
-            "9d455d7d5871944959a4499a7b50a4fb77ddb0e016187bbfdf71f64603568219"
-                | "1462227f6bdd63bf305a3ba6710c2829488e509858e49fc070d125433403a712"
+            "beeed26afe15dc0c4f4f23b11eab1ccfbe65d4343e3e9069b14d0c0a4a78c81d"
+                | "a701218d85454aa6569dc53422a55826a1c3c10d08521e8fa7a5f8a329d369ac"
         ) =>
         {
             "native-v4-delta-v1"

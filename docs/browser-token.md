@@ -1,7 +1,7 @@
 # Browser token convenience
 
 Use **Load token file instead** if pasting into the password field does not work.
-`.baleyg/native-smoke/daemon.token` was the token used by an earlier inspector snapshot;
+`.trellis/native-smoke/daemon.token` was the token used by an earlier inspector snapshot;
 do not use an in-checkout token path for current startup. Run
 `serve --workspace /path/to/repository --token-file /absolute/private/path/outside/checkout/daemon.token`
 with an existing private parent directory. `--token-file` is required and its absolute

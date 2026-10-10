@@ -4,11 +4,11 @@ import { validate } from "./formats.mjs";
 import { inventoryMismatch } from "./native-inventory.mjs";
 
 const domains = Object.freeze({
-  syntax: "baleyg.syntax.v1\0",
-  occurrence: "baleyg.occurrence.v2\0",
-  extractionContext: "baleyg.extraction-context.v1\0",
-  header: "baleyg.header.v1\0",
-  siblingGroup: "baleyg.sibling-group.v1\0",
+  syntax: "trellis.syntax.v1\0",
+  occurrence: "trellis.occurrence.v2\0",
+  extractionContext: "trellis.extraction-context.v1\0",
+  header: "trellis.header.v1\0",
+  siblingGroup: "trellis.sibling-group.v1\0",
 });
 const shapes = Object.freeze({
   syntax: "SyntaxDigestInput",

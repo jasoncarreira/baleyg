@@ -1,15 +1,15 @@
-fn test_pin(revision: u64) -> baleyg::model::IndexPin {
-    baleyg::model::IndexPin {
+fn test_pin(revision: u64) -> trellis::model::IndexPin {
+    trellis::model::IndexPin {
         index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
         index_revision: revision,
     }
 }
-use baleyg::{
+use std::sync::{Arc, atomic::AtomicBool};
+use trellis::{
     behavior::{SequenceStep, SequenceView, build_sequence},
     indexer::{IndexOptions, index_workspace},
     model::*,
 };
-use std::sync::{Arc, atomic::AtomicBool};
 
 fn fixture(source: &str, name: &str) -> (Graph, SequenceView) {
     let dir = tempfile::tempdir().unwrap();
@@ -401,7 +401,7 @@ fn participant_limit_keeps_source_backed_call_evidence() {
     }
 }
 
-fn participant_for<'a>(view: &'a SequenceView, call: &str) -> &'a baleyg::behavior::Participant {
+fn participant_for<'a>(view: &'a SequenceView, call: &str) -> &'a trellis::behavior::Participant {
     let step = flatten(&view.steps)
         .into_iter()
         .find(|s| s.kind == "call" && s.label == call)

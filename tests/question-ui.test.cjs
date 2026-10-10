@@ -157,7 +157,7 @@ for (const size of [176000, 176001]) {
       assert.equal(h.blobs.length, 1);
       assert.equal(h.blobs[0].size, 176000);
       assert.equal(await h.blobs[0].text(), compact);
-      assert.deepEqual(h.downloads, ["baleyg-jev-request.json"]);
+      assert.deepEqual(h.downloads, ["trellis-jev-request.json"]);
       assert.equal(h.get("error").hidden, true);
     } else {
       assert.equal(h.blobs.length, 0);

@@ -1,4 +1,4 @@
-# API handoff: Baleyg local daemon v1
+# API handoff: Trellis local daemon v1
 
 ## Purpose
 

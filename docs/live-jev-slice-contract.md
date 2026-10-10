@@ -2,7 +2,7 @@
 
 New user authorization: “You can set the Jev budget at $5. Keep going.”
 The old tests/fixtures/selection/outputs/budget.json remains closed and untouched.
-New shared ledger directory: .baleyg/jev-question-budget (private), cap 500 cents.
+New shared ledger directory: .trellis/jev-question-budget (private), cap 500 cents.
 Reserve 10 cents durably before EVERY outbound attempt; retain reservation on success,
 error, invalid JSON/labels, timeout, cancellation or crash. No automatic retries.
 This is conservative reservation accounting, not verified provider billing.

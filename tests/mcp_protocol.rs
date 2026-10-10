@@ -128,7 +128,7 @@ fn private_socket_under(home: &Path) -> Option<PathBuf> {
         for entry in fs::read_dir(dir).ok()?.flatten() {
             let path = entry.path();
             if path.file_name().is_some_and(|name| name == "daemon.lock") {
-                return Some(baleyg::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
+                return Some(trellis::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
             }
             if path.is_dir() {
                 dirs.push(path);
@@ -149,7 +149,7 @@ fn owned_daemon_connection(home: &Path, pid: u32) -> Option<std::os::unix::net::
         .ok()?;
     (output.status.success()
         && String::from_utf8_lossy(&output.stdout).trim()
-            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+            == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
     .then_some(stream)
 }
 
@@ -232,14 +232,14 @@ impl Peer {
     ) -> Self {
         let stderr_path = home.path().join("mcp-stderr.log");
         let stderr = fs::File::create(&stderr_path).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
         cmd.arg("mcp")
             .current_dir(cwd.unwrap_or(home.path()))
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
             .env(
-                "BALEYG_TEST_DAEMON_PID_FILE",
+                "TRELLIS_TEST_DAEMON_PID_FILE",
                 home.path().join("auto-daemon.pid"),
             )
             .process_group(0)
@@ -250,11 +250,11 @@ impl Peer {
             cmd.arg("--workspace").arg(path);
         }
         if let Some((stage, socket)) = phase {
-            cmd.env("BALEYG_TEST_MCP_PHASE", stage)
-                .env("BALEYG_TEST_MCP_PHASE_SOCKET", socket);
+            cmd.env("TRELLIS_TEST_MCP_PHASE", stage)
+                .env("TRELLIS_TEST_MCP_PHASE_SOCKET", socket);
         }
         if let Some(socket) = causal_socket {
-            cmd.env("BALEYG_TEST_MCP_CAUSAL_SOCKET", socket);
+            cmd.env("TRELLIS_TEST_MCP_CAUSAL_SOCKET", socket);
         }
         let mut child = cmd.spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -346,7 +346,7 @@ impl Drop for Peer {
 #[test]
 fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
     let home = tempfile::tempdir().unwrap();
-    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+    let owner = trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(
         &home.path().join("private-data"),
     ))
     .unwrap()
@@ -367,13 +367,13 @@ fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
 #[test]
 fn marker_for_other_fixture_daemon_does_not_target_this_private_socket() {
     let home = tempfile::tempdir().unwrap();
-    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+    let owner = trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(
         &home.path().join("private-data"),
     ))
     .unwrap()
     .unwrap();
     let other = tempfile::tempdir().unwrap();
-    let mut decoy = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut decoy = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", other.path())
         .env("XDG_CACHE_HOME", other.path().join("cache"))
@@ -581,7 +581,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             ));
             assert_eq!(
                 init["result"],
-                json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"baleyg","version":env!("CARGO_PKG_VERSION")}})
+                json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}})
             );
             error(
                 &peer.ask(request(json!(2), "tools/list", json!({}))),
@@ -593,7 +593,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             let discover = peer.ask(modern(json!(1), "server/discover", json!({})));
             assert_eq!(
                 discover["result"],
-                json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"baleyg","version":env!("CARGO_PKG_VERSION")}}})
+                json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","supportedVersions":["2026-07-28","2025-11-25"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"trellis","version":env!("CARGO_PKG_VERSION")}}})
             );
         }
         let list = if legacy {
@@ -669,7 +669,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
             }
         }
         let control_id = format!("{}aa", "\u{0000}".repeat(42));
-        let fields = json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}});
+        let fields = json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}});
         let max_call = if legacy {
             request(json!(control_id), "tools/call", fields)
         } else {
@@ -678,7 +678,7 @@ fn both_modes_full_catalog_tools_and_lifecycle() {
         let max_response = peer.ask(max_call);
         tool(&max_response, None, !legacy);
         assert_eq!(max_response["id"], control_id);
-        let fields = json!({"name":"baleyg_find_symbols","arguments":{"schemaVersion":1,"query":"a","limit":51}});
+        let fields = json!({"name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":"a","limit":51}});
         let reply = peer.ask(if legacy {
             request(json!(40), "tools/call", fields)
         } else {
@@ -782,27 +782,27 @@ fn framing_ids_negotiation_and_application_validation() {
     );
     for (name, wrong, code) in [
         (
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1,"extra":0}),
             "invalid_request",
         ),
         (
-            "baleyg_find_symbols",
+            "trellis_find_symbols",
             json!({"schemaVersion":1,"query":""}),
             "invalid_request",
         ),
         (
-            "baleyg_inspect",
+            "trellis_inspect",
             json!({"schemaVersion":1,"symbolId":"sid:v1:x","view":"declaration"}),
             "invalid_request",
         ),
         (
-            "baleyg_read_source",
+            "trellis_read_source",
             json!({"schemaVersion":1,"path":"../outside","startLine":1,"endLine":1}),
             "invalid_request",
         ),
         (
-            "baleyg_read_source",
+            "trellis_read_source",
             json!({"schemaVersion":1,"path":"a","startLine":1,"endLine":201}),
             "range_too_large",
         ),
@@ -854,7 +854,7 @@ fn legacy_title_recovery_max_id_and_root_selection() {
     // Topology overlap is refused before marker attachment.
     let overlap = tmp.path().join("managed-home");
     fs::create_dir_all(overlap.join(".git")).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
     command
         .arg("mcp")
         .arg("--workspace")
@@ -869,8 +869,8 @@ fn legacy_title_recovery_max_id_and_root_selection() {
         "overlap refusal must exit naturally, not from a signal"
     );
     assert!(outcome.stdout.is_empty());
-    assert!(!overlap.join(".git/baleyg/workspace-id").exists());
-    assert!(root.join(".git/baleyg/workspace-id").is_file());
+    assert!(!overlap.join(".git/trellis/workspace-id").exists());
+    assert!(root.join(".git/trellis/workspace-id").is_file());
     // A separate explicit non-Git workspace cannot attach to the daemon.
     let no_git = tmp.path().join("not-checkout");
     fs::create_dir(&no_git).unwrap();
@@ -1248,15 +1248,15 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         let pin = json!({"indexGeneration":"123e4567-e89b-42d3-a456-426614174000","indexRevision":9007199254740991_u64});
         for (name, args) in [
             (
-                "baleyg_find_symbols",
+                "trellis_find_symbols",
                 json!({"schemaVersion":1,"query":"x","expectedBasis":pin}),
             ),
             (
-                "baleyg_inspect",
+                "trellis_inspect",
                 json!({"schemaVersion":1,"symbolId":format!("sid:v1:{}","a".repeat(32)),"view":"outgoing_calls","limit":50,"expectedBasis":pin}),
             ),
             (
-                "baleyg_read_source",
+                "trellis_read_source",
                 json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":200,"expectedBasis":pin,"expectedContentHash":"a".repeat(64)}),
             ),
         ] {
@@ -1271,14 +1271,14 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
         let mut wrong = fixture()["validArguments"][1].clone();
         wrong["limit"] = json!(51);
         exact_tool_for_id(
-            &peer.ask(call(legacy, json!(heavy_id), "baleyg_find_symbols", wrong)),
+            &peer.ask(call(legacy, json!(heavy_id), "trellis_find_symbols", wrong)),
             &json!(heavy_id),
             Some("range_too_large"),
             !legacy,
             "checkout",
         );
         for fields in [
-            json!({"name":"baleyg_workspace_describe","arguments":{},"unexpected":0}),
+            json!({"name":"trellis_workspace_describe","arguments":{},"unexpected":0}),
             json!({"name":"not_a_tool","arguments":{}}),
             json!({"arguments":{}}),
         ] {
@@ -1300,7 +1300,7 @@ fn golden_tool_envelopes_and_maximum_ids_both_modes() {
     let mut peer = Peer::start(Some(&root));
     let args = json!({"schemaVersion":1,"path":"src-sentinel.txt","startLine":1,"endLine":1,"expectedContentHash":"a".repeat(64)});
     exact_tool_for_id(
-        &peer.ask(call(false, json!(heavy_id), "baleyg_read_source", args)),
+        &peer.ask(call(false, json!(heavy_id), "trellis_read_source", args)),
         &json!(heavy_id),
         Some("index_not_ready"),
         true,
@@ -1362,15 +1362,15 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &explicit.ask(modern(
             json!(1),
             "tools/call",
-            json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}),
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
         )),
         None,
         true,
         "ancestor",
     );
-    let ancestor_marker = ancestor.join(".git/baleyg/workspace-id");
+    let ancestor_marker = ancestor.join(".git/trellis/workspace-id");
     let first_marker = fs::read(&ancestor_marker).unwrap();
-    assert!(!nearer.join(".git/baleyg/workspace-id").exists());
+    assert!(!nearer.join(".git/trellis/workspace-id").exists());
     no_db_under(explicit._home.path());
     assert!(explicit.finish().0.success());
     // Adopt the same marker on restart; never regenerate a valid existing UUID.
@@ -1379,7 +1379,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &adopted.ask(modern(
             json!(2),
             "tools/call",
-            json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}),
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
         )),
         None,
         true,
@@ -1393,13 +1393,13 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &implicit.ask(modern(
             json!(3),
             "tools/call",
-            json!({"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}),
+            json!({"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}),
         )),
         None,
         true,
         "nearer",
     );
-    let nearer_marker = fs::read(nearer.join(".git/baleyg/workspace-id")).unwrap();
+    let nearer_marker = fs::read(nearer.join(".git/trellis/workspace-id")).unwrap();
     assert_ne!(first_marker, nearer_marker);
     assert!(implicit.finish().0.success());
     // A non-Git cwd cannot acquire a daemon checkout attachment or marker.
@@ -1425,7 +1425,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &marker_lost.ask(call(
             false,
             json!(5),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         )),
         5,
@@ -1436,7 +1436,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &marker_lost.ask(call(
             false,
             json!(6),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1,"workspace":"escape"}),
         )),
         6,
@@ -1456,7 +1456,7 @@ fn workspace_selection_startup_side_effects_and_final_identity() {
         &root_changed.ask(call(
             false,
             json!(7),
-            "baleyg_find_symbols",
+            "trellis_find_symbols",
             json!({"schemaVersion":1,"query":"a"}),
         )),
         7,
@@ -1573,9 +1573,9 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
     );
     let home = peer._home.path();
     let caches = [
-        home.join("Library/Caches/dev.odin.baleyg"),
-        home.join("cache/baleyg"),
-        home.join("cache/dev/odin/baleyg"),
+        home.join("Library/Caches/dev.squashmerge.trellis"),
+        home.join("cache/trellis"),
+        home.join("cache/dev/squashmerge/trellis"),
     ];
     let mut sentinels = Vec::new();
     for cache in caches {
@@ -1585,9 +1585,9 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
         sentinels.push(index);
     }
     for name in [
-        "baleyg_find_symbols",
-        "baleyg_inspect",
-        "baleyg_read_source",
+        "trellis_find_symbols",
+        "trellis_inspect",
+        "trellis_read_source",
     ] {
         let i = fixture()["names"]
             .as_array()
@@ -1609,7 +1609,7 @@ fn unusable_index_sentinels_do_not_change_unavailable_projection_or_get_repaired
         assert!(!index.with_extension("db-wal").exists());
         assert!(!index.with_extension("db-shm").exists());
     }
-    assert!(!root.join(".git/baleyg/requests.db").exists());
+    assert!(!root.join(".git/trellis/requests.db").exists());
     assert!(peer.finish().0.success());
 }
 
@@ -1639,14 +1639,14 @@ fn golden_modern_legacy_transcripts() {
         let response = peer.ask(call(
             mode == "legacy",
             json!("golden-describe"),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
         exact_tool(&response, None, mode == "modern", "checkout");
         let response = peer.ask(call(
             mode == "legacy",
             json!("golden-evidence"),
-            "baleyg_find_symbols",
+            "trellis_find_symbols",
             json!({"schemaVersion":1,"query":"x"}),
         ));
         exact_tool(
@@ -1671,7 +1671,7 @@ fn ordinary_cancellation_and_eof_without_private_race_hook() {
         let active = call(
             legacy,
             json!("cancel-me"),
-            "baleyg_find_symbols",
+            "trellis_find_symbols",
             json!({"schemaVersion":1,"query":"a"}),
         );
         let cancelled = json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-me","reason":"client no longer needs response"}});
@@ -1796,14 +1796,14 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
         let result = peer.ask(call(
             false,
             json!(1),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
         exact_tool_for_id(&result, &json!(1), None, true, label);
-        let marker = git.join("baleyg/workspace-id");
+        let marker = git.join("trellis/workspace-id");
         ids.push(fs::read(&marker).unwrap());
         assert!(
-            !root.join(".git/baleyg/workspace-id").exists(),
+            !root.join(".git/trellis/workspace-id").exists(),
             "pointer file must not be treated as directory"
         );
         no_db_under(peer._home.path());
@@ -1812,7 +1812,7 @@ fn linked_git_worktrees_get_distinct_selected_markers() {
         let result = reopened.ask(call(
             false,
             json!(2),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
         exact_tool_for_id(&result, &json!(2), None, true, label);
@@ -1880,19 +1880,19 @@ fn per_call_linked_worktree_selection_and_closed_failures() {
     let main = main.canonicalize().unwrap();
     let linked = linked.canonicalize().unwrap();
     let foreign = foreign.canonicalize().unwrap();
-    let foreign_marker = foreign.join(".git/baleyg/workspace-id");
+    let foreign_marker = foreign.join(".git/trellis/workspace-id");
     let git_pointer = fs::read_to_string(linked.join(".git")).unwrap();
     let linked_git =
         fs::canonicalize(linked.join(git_pointer.trim().strip_prefix("gitdir: ").unwrap()))
             .unwrap();
-    let linked_marker = linked_git.join("baleyg/workspace-id");
+    let linked_marker = linked_git.join("trellis/workspace-id");
     for legacy in [false, true] {
         let mut peer = Peer::start(Some(&main));
         if legacy {
             ready_legacy(&mut peer);
         }
         let describe = |peer: &mut Peer, id: i64, args: Value| {
-            peer.ask(call(legacy, json!(id), "baleyg_workspace_describe", args))
+            peer.ask(call(legacy, json!(id), "trellis_workspace_describe", args))
         };
         let selected = describe(&mut peer, 10, json!({"schemaVersion":1,"workspace":linked}));
         tool(&selected, None, !legacy);
@@ -2094,7 +2094,7 @@ fn linked_marker(linked: &Path) -> PathBuf {
     let pointer = fs::read_to_string(linked.join(".git")).unwrap();
     fs::canonicalize(linked.join(pointer.trim().strip_prefix("gitdir: ").unwrap()))
         .unwrap()
-        .join("baleyg/workspace-id")
+        .join("trellis/workspace-id")
 }
 
 #[test]
@@ -2112,7 +2112,7 @@ fn selected_clone_failure_is_resolved_and_does_not_kill_the_session() {
             serde_json::to_string(&call(
                 legacy,
                 json!(8),
-                "baleyg_workspace_describe",
+                "trellis_workspace_describe",
                 json!({"schemaVersion":1,"workspace":linked}),
             ))
             .unwrap()
@@ -2177,7 +2177,7 @@ fn final_resolved_drift_is_attributed_for_four_tools_and_both_modes() {
                     let marker = if explicit {
                         linked_marker(root)
                     } else {
-                        root.join(".git/baleyg/workspace-id")
+                        root.join(".git/trellis/workspace-id")
                     };
                     let mut saved = Vec::new();
                     phase_barrier(&listener, stage, || {
@@ -2244,7 +2244,7 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
         let reply = peer.ask(call(
             false,
             json!(index),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1,"workspace":path}),
         ));
         tool(&reply, None, true);
@@ -2258,7 +2258,7 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
         serde_json::to_string(&call(
             false,
             json!(64),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1,"workspace":denied}),
         ))
         .unwrap()
@@ -2427,18 +2427,18 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     let first = peer.ask(call(
         false,
         json!(1),
-        "baleyg_workspace_describe",
+        "trellis_workspace_describe",
         json!({"schemaVersion":1}),
     ));
     tool(&first, None, true);
     // This first true means pending work; without a phase witness it does not
     // distinguish mandatory H from a queued watcher hint.
     assert_eq!(first["result"]["structuredContent"]["catchingUp"], true);
-    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .root_key;
     let home = peer._home.path().to_path_buf();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
     command
         .arg("index")
         .arg("--workspace")
@@ -2463,7 +2463,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
     let second = peer.ask(call(
         false,
         json!(2),
-        "baleyg_workspace_describe",
+        "trellis_workspace_describe",
         json!({"schemaVersion":1}),
     ));
     tool(&second, None, true);
@@ -2509,7 +2509,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
         let reply = peer.ask(call(
             false,
             json!(id),
-            "baleyg_workspace_describe",
+            "trellis_workspace_describe",
             json!({"schemaVersion":1}),
         ));
         tool(&reply, None, true);
@@ -2560,16 +2560,16 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let selected = peer.ask(call(
         false,
         json!(1),
-        "baleyg_workspace_describe",
+        "trellis_workspace_describe",
         json!({"schemaVersion":1}),
     ));
     tool(&selected, None, true);
-    let root_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
+    let root_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root)
         .unwrap()
         .root_key;
     let home = peer._home.path().to_path_buf();
     let index = |size: Option<u64>| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
         command
             .arg("index")
             .arg("--workspace")
@@ -2674,7 +2674,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let final_reply = peer.ask(call(
         false,
         json!(2),
-        "baleyg_workspace_describe",
+        "trellis_workspace_describe",
         json!({"schemaVersion":1}),
     ));
     tool(&final_reply, None, true);

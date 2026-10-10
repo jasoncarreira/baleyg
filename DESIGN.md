@@ -1,6 +1,6 @@
-# Baleyg interface direction
+# Trellis interface direction
 
-Approved by the user from `~/Downloads/Baleyg UI.html`. The reference is a visual/interaction
+Approved by the user from a user-provided UI reference. The reference is a visual/interaction
 model, not evidence of implemented compiler, agent, terminal or class-diagram capabilities.
 
 ## Planned unified workbench
@@ -31,7 +31,7 @@ Borders `#2E2A26` and `#3A3632`. Text `#EDE9E3`, secondary `#A79F95`, muted `#8C
 Flame orange `#F0913C` is the single action/selection accent. Verify contrast on actual surfaces.
 Use locally served Space Grotesk for interface text and JetBrains Mono for identifiers/source.
 Body 13–14px; code labels 12–13px where practical. Keep focus, disabled and loading states visible.
-The lowercase `baleyg` wordmark and flame-eye mark follow the reference.
+The lowercase `trellis` wordmark and flame-eye mark follow the reference.
 
 ## Diagram simplification, not semantic loss
 

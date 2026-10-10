@@ -7,17 +7,17 @@ slice.
 
 ## User outcome
 
-Keep source, diagrams and agent terminals in one Baleyg window. Provide docked, resizable terminal
+Keep source, diagrams and agent terminals in one Trellis window. Provide docked, resizable terminal
 tabs; maximize/restore a terminal without losing the selected method or diagram. Agents can still
-run outside Baleyg and use the exact same MCP tools. Herdr and ACP remain optional connection modes.
+run outside Trellis and use the exact same MCP tools. Herdr and ACP remain optional connection modes.
 
 ## Three different surfaces
 
 | Surface | Presentation | Lifecycle owner |
 | --- | --- | --- |
-| Direct agent launched from Baleyg | Real interactive terminal tab over an owned PTY | Baleyg supervises the launched child; the harness owns its agent loop |
-| Existing Herdr-managed agent | Embedded attachment only if a supported terminal transport is validated | Herdr; Baleyg is an explicitly attached client, not a replacement pane manager |
-| ACP adapter, primarily Mimir | Structured conversation, tool activity, progress and approval tab | Existing harness/runtime; Baleyg owns only an adapter process it explicitly launched |
+| Direct agent launched from Trellis | Real interactive terminal tab over an owned PTY | Trellis supervises the launched child; the harness owns its agent loop |
+| Existing Herdr-managed agent | Embedded attachment only if a supported terminal transport is validated | Herdr; Trellis is an explicitly attached client, not a replacement pane manager |
+| ACP adapter, primarily Mimir | Structured conversation, tool activity, progress and approval tab | Existing harness/runtime; Trellis owns only an adapter process it explicitly launched |
 
 ACP protocol stdout is not terminal output. Hands shell results are tool results, not necessarily
 a live PTY. Show them honestly. A Mimir CLI can separately run in a real terminal if that is the
@@ -57,18 +57,18 @@ its supported client transport, input/resize authority, multi-client behavior an
 before promising per-pane embedding. Never approximate a terminal by polling `pane.read` and
 forwarding arbitrary keys as if that were a reliable attach protocol.
 
-A possible experiment is an explicit Herdr TUI client in a Baleyg-owned PTY, attached to a user-chosen
+A possible experiment is an explicit Herdr TUI client in a Trellis-owned PTY, attached to a user-chosen
 existing session. That embeds Herdr as a whole, not an individual pane, and needs usability/security
 validation. Detaching or terminating that client must not terminate the Herdr server or its agents.
 Until a supported attachment works, provide honest association/focus links rather than a fake terminal.
 
 ## ACP and MCP boundaries
 
-Both terminal and ACP agents get the same portable Baleyg MCP tool schemas, served by a stdio
-`baleyg mcp` launched in the agent's checkout ([local topology](local-topology.md)). Terminal input
+Both terminal and ACP agents get the same portable Trellis MCP tool schemas, served by a stdio
+`trellis mcp` launched in the agent's checkout ([local topology](local-topology.md)). Terminal input
 authority is not MCP artifact-write authority, and neither grants arbitrary ACP
 filesystem/terminal capabilities. Negotiate implemented capabilities; preserve Mimir's provider
-admission, local/remote host distinction, permission gates and one-client constraint. Baleyg may be
+admission, local/remote host distinction, permission gates and one-client constraint. Trellis may be
 the chosen ACP client; it must not connect as a second observer beside an occupied editor session.
 
 ## Acceptance before shipping

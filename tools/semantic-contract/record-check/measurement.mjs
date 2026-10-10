@@ -119,7 +119,7 @@ function witnesses(row, source, within, encoding) {
 // Decision 0003: occurrence identity is v2; every other domain stays v1.
 function hash(domain, input) {
   return createHash("sha256")
-    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
+    .update(`trellis.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(bytes(input))
     .digest("hex");
 }
@@ -280,7 +280,7 @@ export function checkMeasurement(
     return {
       contentHash: document.contentHash,
       extractionContext: createHash("sha256")
-        .update("baleyg.extraction-context.v1\0")
+        .update("trellis.extraction-context.v1\0")
         .update(bytes({ language: row.document.language, components }))
         .digest("hex"),
       nativeProducerId: producer.id,

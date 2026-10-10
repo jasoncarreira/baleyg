@@ -1,5 +1,5 @@
 //! Public API tests. No test invokes the production transport.
-use baleyg::live_jev::LiveJev;
+use trellis::live_jev::LiveJev;
 #[test]
 fn public_budget_is_serializable_and_provider_is_send_sync() {
     fn send_sync<T: Send + Sync>() {}

@@ -1,15 +1,15 @@
 mod common;
-use baleyg::{
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-    planning::*,
-    store::Store,
-};
 use std::{
     collections::BTreeSet,
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
+use trellis::{
+    indexer::{IndexOptions, index_workspace},
+    model::*,
+    planning::*,
+    store::Store,
+};
 const CODE: &str = "function leaf() {}\nfunction helper() { leaf(); }\nfunction seed(flag) { if (flag) { helper(); helper(); } console.log(flag); }\n";
 fn fixture(
     code: &str,
@@ -19,7 +19,7 @@ fn fixture(
     Store,
     Graph,
     QuestionRequest,
-    Arc<baleyg::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::LeaderSession>,
 ) {
     let work = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -39,7 +39,7 @@ fn fixture(
         &graph,
         work.path(),
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
         },
@@ -493,15 +493,15 @@ fn variable_question_packet_is_source_only_not_an_executable_seed() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../web/classes.js"), "utf8");
-const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.BaleygIndexPin = IndexPin;/)[0];
+const pinSource = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8").match(/const IndexPin = Object.freeze\(\{[\s\S]*?\n\}\);\nwindow.TrellisIndexPin = IndexPin;/)[0];
 const descendants = node => [node, ...node.children.flatMap(descendants)];
 const text = node => descendants(node).map(item => item.textContent).join(" ");
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject}; };
@@ -51,8 +51,8 @@ function harness({navigation = false} = {}) {
   document.getElementById=id=>{if(!elements.has(id)){const item=element(id);elements.set(id,item);document.body.append(item);}return elements.get(id);};
   const window = {innerWidth:390,innerHeight:600,addEventListener(type,fn){(winListeners[type] ||= []).push(fn);}};
   vm.runInNewContext(pinSource + "\n" + source,{window,document,URLSearchParams,console});
-  window.BaleygClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
-  return {controller:window.BaleygClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
+  window.TrellisClasses.init({...(navigation ? {navigateMember:(...args)=>navigate(...args)} : {}),request:(url,options)=>{calls.push({url,options});return request(url,options);},readSource:(step,rev)=>reads.push({step,revision:rev}),selectMethod:symbol=>methods.push(symbol),currentRevision:()=>revision,currentSession:()=>session,onChange:()=>changes.push(true),onStale:message=>stale.push(message)});
+  return {controller:window.TrellisClasses,document,window,calls,reads,methods,changes,navigations,stale,get:document.getElementById,
     setNavigate(fn){navigate=fn;},setRequest(fn){request=fn;},setRevision(value){revision=value;},setSession(value){session=value;},
     async event(type,target){for(const fn of docListeners[type]||[]) await fn({target});},
     menu(){return document.body.querySelector(".classes-context-menu");},
@@ -449,7 +449,7 @@ for(const dismissal of ["focus","escape","outside","scroll","reset"])test(`share
 function integratedNavigation() {
  const h=harness({navigation:true}),navigationSource=fs.readFileSync(path.join(__dirname,"../web/navigation.js"),"utf8");
  vm.runInNewContext(navigationSource,{window:h.window,document:h.document,console});
- const nav=h.window.BaleygNavigation,selected=[];
+ const nav=h.window.TrellisNavigation,selected=[];
  let request=async()=>({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},targets:[{symbol:{id:"A.run",name:"run",path:"A.java",range},action:"sequence",reason:"declaration",matchKind:"measured"}],warnings:[]});
  nav.init({currentRevision:()=>({indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}),currentSession:()=>"one",request:(...args)=>request(...args),
   showMenu:(event,actions,options)=>h.controller.showContextMenu(event,actions,options),

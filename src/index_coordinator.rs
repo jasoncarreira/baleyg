@@ -36,12 +36,12 @@ fn diagnostics() -> Option<&'static DiagnosticMarkers> {
     static MARKERS: std::sync::OnceLock<Option<DiagnosticMarkers>> = std::sync::OnceLock::new();
     MARKERS
         .get_or_init(|| {
-            if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() != Ok("1") {
+            if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() != Ok("1") {
                 return None;
             }
             let (sender, receiver) = std::sync::mpsc::sync_channel::<String>(256);
             std::thread::Builder::new()
-                .name("baleyg-diagnostic-writer".into())
+                .name("trellis-diagnostic-writer".into())
                 .spawn(move || {
                     use std::io::Write;
                     while let Ok(line) = receiver.recv() {
@@ -1320,7 +1320,7 @@ pub fn establish_serving_session(
     if store.is_recreate_pending() {
         let options = explicit_options.ok_or_else(|| {
             anyhow::anyhow!(
-                "recovery_required: index options unavailable; run explicit baleyg index"
+                "recovery_required: index options unavailable; run explicit trellis index"
             )
         })?;
         let (_, session) = store.recreate_pending_leader_session(options, cancel)?;
@@ -2224,7 +2224,7 @@ mod tests {
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let missing = establish_serving_session(&pending, None, &cancel).unwrap_err();
         assert!(
-            missing.to_string().contains("explicit baleyg index"),
+            missing.to_string().contains("explicit trellis index"),
             "{missing:#}"
         );
         assert_eq!(fs::read(&path).unwrap(), original);

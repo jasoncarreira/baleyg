@@ -1,6 +1,6 @@
 # Saved-item browser acceptance
 
-This test drives the real Baleyg web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
+This test drives the real Trellis web shell in Playwright Chromium. It starts the compiled daemon with an isolated workspace, token, home, and XDG directories. It does not mock or intercept application requests.
 
 ## Verify from a clean checkout
 
@@ -11,7 +11,7 @@ lanes start. The package lock pins `playwright` to exactly `1.55.1`; setup never
 a system browser, or `--with-deps`. A first run needs npm registry and browser-download access.
 
 By default, setup uses an owner-private, stable **per-checkout** cache under the OS temp
-directory, outside the repository. Set `BALEYG_RUN_CACHE` to an absolute, user-owned,
+directory, outside the repository. Set `TRELLIS_RUN_CACHE` to an absolute, user-owned,
 non-group-writable external directory to keep the npm and browser cache at a known location.
 An existing absolute external `PLAYWRIGHT_BROWSERS_PATH` (including CI's) is honored when
 it has the same safe ownership and permissions. Invalid, symlinked, or in-checkout cache
@@ -28,13 +28,13 @@ A direct test invocation does **not** run verifier setup. Provision once per che
 the same external cache and pinned installer:
 
 ```sh
-export BALEYG_RUN_CACHE=/path/to/external/run-cache
-mkdir -p "$BALEYG_RUN_CACHE/npm-cache" "$BALEYG_RUN_CACHE/playwright-browsers"
-npm_config_cache="$BALEYG_RUN_CACHE/npm-cache" \
+export TRELLIS_RUN_CACHE=/path/to/external/run-cache
+mkdir -p "$TRELLIS_RUN_CACHE/npm-cache" "$TRELLIS_RUN_CACHE/playwright-browsers"
+npm_config_cache="$TRELLIS_RUN_CACHE/npm-cache" \
   npm ci --prefix tests/browser --ignore-scripts
-PLAYWRIGHT_BROWSERS_PATH="$BALEYG_RUN_CACHE/playwright-browsers" \
+PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
   node tests/browser/node_modules/playwright/cli.js install chromium
-PLAYWRIGHT_BROWSERS_PATH="$BALEYG_RUN_CACHE/playwright-browsers" \
+PLAYWRIGHT_BROWSERS_PATH="$TRELLIS_RUN_CACHE/playwright-browsers" \
   node tests/browser/saved-items.test.cjs
 ```
 

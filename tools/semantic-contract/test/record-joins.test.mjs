@@ -35,7 +35,7 @@ const canonical = (value) =>
         "}";
 const domain = (name, input) =>
   createHash("sha256")
-    .update(`baleyg.${name}.v1\0`)
+    .update(`trellis.${name}.v1\0`)
     .update(canonical(input))
     .digest("hex")
     .slice(0, 32);
@@ -59,12 +59,12 @@ const syntax = (name) =>
 // Decision 0003: occ:v2 binds document bytes, extraction context and native
 // producer descriptor; the declared native inventory is explicitly empty.
 const extractionContext = sha(
-  "baleyg.extraction-context.v1\0" +
+  "trellis.extraction-context.v1\0" +
     canonical({ language: "javascript", components: [] }),
 );
 const occurrence = (owner, kind, ordinal, text = source) =>
   sha(
-    "baleyg.occurrence.v2\0" +
+    "trellis.occurrence.v2\0" +
       canonical({
         contentHash: sha(text),
         extractionContext,

@@ -280,16 +280,16 @@ impl IdentityRegistry {
     }
     pub fn stable(&mut self, input: &Value) -> Result<String> {
         validate_stable(input)?;
-        self.register(b"baleyg.syntax.v1\0", input, "sid:v1:")
+        self.register(b"trellis.syntax.v1\0", input, "sid:v1:")
     }
     pub fn occurrence(&mut self, input: &Value) -> Result<String> {
         validate_occurrence(input)?;
-        self.register(b"baleyg.occurrence.v2\0", input, "occ:v2:")
+        self.register(b"trellis.occurrence.v2\0", input, "occ:v2:")
     }
 }
 
 /// Decision 0003 extraction context: the full SHA-256 over
-/// `baleyg.extraction-context.v1\0` and canonical `{language,components}`.
+/// `trellis.extraction-context.v1\0` and canonical `{language,components}`.
 /// Components must already be sorted by name then hash and unique.
 pub fn extraction_context(language: &str, components: &[(String, String)]) -> Result<String> {
     ensure!(
@@ -311,7 +311,7 @@ pub fn extraction_context(language: &str, components: &[(String, String)]) -> Re
         .map(|(name, hash)| serde_json::json!({"name":name,"hash":hash}))
         .collect();
     Ok(digest(
-        b"baleyg.extraction-context.v1\0",
+        b"trellis.extraction-context.v1\0",
         &canonical(&serde_json::json!({"language":language,"components":components})),
     ))
 }

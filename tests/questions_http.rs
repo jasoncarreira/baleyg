@@ -5,13 +5,13 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use baleyg::{
+use serde_json::{Value, json};
+use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::*,
     store::{Store, topology::LeaderSession},
 };
-use serde_json::{Value, json};
 #[path = "common/jev_wire.rs"]
 mod jev_wire;
 use jev_wire::decode_packet;
@@ -52,7 +52,7 @@ fn setup(
         &graph,
         &workspace,
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
         },
@@ -308,7 +308,7 @@ async fn bad_choices_missing_packets_and_stale_revisions_are_client_errors() {
         &graph,
         &dir.path().join("workspace"),
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation,
             index_revision: 1,
         },
@@ -466,7 +466,7 @@ async fn oversized_export_explains_how_to_narrow_without_truncation() {
 
 #[tokio::test]
 async fn packet_operation_pair_matrix() {
-    use baleyg::store::topology::UseGuard;
+    use trellis::store::topology::UseGuard;
     let (temp, _store, graph, _state, app, request, session) = setup(0);
     let (code, preview) = call(&app, "POST", "/api/questions/preview", request.clone()).await;
     assert_eq!(code, 200, "{preview}");
@@ -518,15 +518,15 @@ async fn packet_operation_pair_matrix() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

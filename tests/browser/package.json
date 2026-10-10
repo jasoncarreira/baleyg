@@ -1,8 +1,8 @@
 {
-  "name": "baleyg-browser-tests",
+  "name": "trellis-browser-tests",
   "version": "1.0.0",
   "private": true,
-  "description": "Real-browser acceptance tests for Baleyg",
+  "description": "Real-browser acceptance tests for Trellis",
   "dependencies": {
     "playwright": "1.55.1"
   }

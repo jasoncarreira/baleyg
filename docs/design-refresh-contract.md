@@ -2,7 +2,7 @@
 
 ## Layout and assets
 
-The approved reference is the user-provided `Baleyg UI.html`. The implementation uses its
+The approved reference is the user-provided UI reference. The implementation uses its
 warm charcoal/flame-orange palette and locally served Space Grotesk/JetBrains Mono fonts.
 It does not copy fictional compiler, class-diagram, agent or terminal capabilities.
 
@@ -17,7 +17,7 @@ checks. Font licenses ship under `web/fonts/`.
 
 ## Controller interface
 
-`window.BaleygShell` is presentation-only. It never fetches, indexes or calls a provider:
+`window.TrellisShell` is presentation-only. It never fetches, indexes or calls a provider:
 
 - `setConnected(bool)`, `updateWorkspace(status)`
 - `showView("sequence" | "libraries" | "tools")`

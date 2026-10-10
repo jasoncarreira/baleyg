@@ -1,4 +1,4 @@
-# Baleyg
+# Trellis
 
 A diagram-first code browser with native JavaScript, Rust, Java and Python indexing, SQLite snapshots,
 and an authenticated local inspector. Browse files, expand their functions/methods, and
@@ -13,8 +13,8 @@ The authenticated daemon currently requires Unix private-file permissions.
 ```sh
 cargo test --locked --all-targets
 cargo run --locked -- index
-mkdir -m 700 -p "$HOME/.baleyg-private"
-cargo run --locked -- serve --token-file "$HOME/.baleyg-private/token"
+mkdir -m 700 -p "$HOME/.trellis-private"
+cargo run --locked -- serve --token-file "$HOME/.trellis-private/token"
 ```
 
 Open **http://127.0.0.1:8877/**. Paste the token or load the private token file whose path
@@ -24,7 +24,7 @@ The workspace defaults to cwd; `--workspace PATH` changes both the browser and i
 The daemon does not index automatically: use **Index workspace** after source changes.
 Stop the daemon with Ctrl-C.
 
-Without SCIP, calls are visible as unresolved syntax; Baleyg does not guess their targets.
+Without SCIP, calls are visible as unresolved syntax; Trellis does not guess their targets.
 For the existing feature-factory snapshot with semantic resolution, see
 [the daemon guide](docs/daemon-v1.md#use-the-existing-semantic-snapshot).
 
@@ -36,9 +36,9 @@ Jev and ACP ledgers also require explicit external paths when enabled. No old st
 automatically. Indexing never runs package scripts, installs source dependencies, or edits source.
 See [local topology](docs/local-topology.md#storage).
 
-`baleyg gc --report` only inventories derived-index and saved-record candidates. A historical
-index marked `eligible` is **not deleted**. Baleyg has no derived-index deletion command or
-automatic deletion path today. Future [#16](https://github.com/jasoncarreira/baleyg/issues/16)
+`trellis gc --report` only inventories derived-index and saved-record candidates. A historical
+index marked `eligible` is **not deleted**. Trellis has no derived-index deletion command or
+automatic deletion path today. Future [#16](https://github.com/SquashMerge/trellis/issues/16)
 automatic GC needs a separate guarded public contract: authenticate the exact historical schema,
 root identity and age; hold a verified exclusive use lock; refuse live, hot-journal, unknown or
 busy data; and never touch durable saved records. Deleting an eligible whole index invalidates
@@ -72,15 +72,15 @@ Java/Python indexing never runs Gradle, Maven, Python imports, decorators or pac
 ## Planned agent and semantic integration
 
 The accepted direction supports agents running directly in a terminal (including terminal tabs in
-Baleyg or optional Herdr panes), and agents connected through ACP, primarily Mimir. Both use the
-same portable MCP tools. The local `baleyg mcp` stdio protocol layer is shipped; general coding-agent
+Trellis or optional Herdr panes), and agents connected through ACP, primarily Mimir. Both use the
+same portable MCP tools. The local `trellis mcp` stdio protocol layer is shipped; general coding-agent
 ACP sessions and embedded terminals are **not implemented yet**. The existing one-shot ACP answer
 feature and authenticated browser `serve` daemon remain separate.
 
-Run `baleyg mcp --workspace <path>` for the local, read-only stdio protocol. Its four-tool catalog is
-`baleyg_workspace_describe`, `baleyg_find_symbols`, `baleyg_inspect` and `baleyg_read_source`.
+Run `trellis mcp --workspace <path>` for the local, read-only stdio protocol. Its four-tool catalog is
+`trellis_workspace_describe`, `trellis_find_symbols`, `trellis_inspect` and `trellis_read_source`.
 This is protocol-only: describe reports an unavailable index, and all three evidence tools return
-typed `index_not_ready` until [#17](https://github.com/jasoncarreira/baleyg/issues/17) connects
+typed `index_not_ready` until [#17](https://github.com/SquashMerge/trellis/issues/17) connects
 eligible snapshots. It does not open a real Store or serve evidence, enroll grants, expose HTTP MCP
 routes or accept authenticated MCP intake. Client interoperability is not certified. Run the native
 protocol fixtures with `cargo test --locked --test mcp_protocol`.
@@ -112,7 +112,7 @@ The existing selection-experiment budget is closed and is not changed by this im
 ## Feature Factory
 
 Repository features can be driven from GitHub Issues through Feature Factory. The tracked configuration
-resolves issue numbers, `#number` references, and canonical issue URLs in `jasoncarreira/baleyg`.
+resolves issue numbers, `#number` references, and canonical issue URLs in `SquashMerge/trellis`.
 See [Feature Factory operations](docs/feature-factory.md) for prerequisites, run invocation, gates, and
 issue-writing guidance.
 
@@ -129,7 +129,7 @@ excluded; local archives and runtime state must not be committed.
 
 ## License
 
-Baleyg is source-available under the [Business Source License 1.1](LICENSE) (`BUSL-1.1`).
+Trellis is source-available under the [Business Source License 1.1](LICENSE) (`BUSL-1.1`).
 You may use it in production free of charge if you are an individual, use it non-commercially
 or for education or research, or are an organization (with affiliates) of no more than 5
 employees and contractors, under US$5M annual revenue and under US$50M total outside funding.
@@ -177,8 +177,8 @@ and the Feature Factory fixtures (`tests/fixtures/extraction/inputs/feature-fact
 - [Jev/Opus exploratory comparison](docs/research/selection/HARD-RESULTS.md)
 
 Next: connect eligible evidence snapshots to the already shipped per-checkout stdio MCP protocol
-([#17](https://github.com/jasoncarreira/baleyg/issues/17)) as part of the semantic-index program
-([#8](https://github.com/jasoncarreira/baleyg/issues/8)). Multi-language SCIP import and separately
+([#17](https://github.com/SquashMerge/trellis/issues/17)) as part of the semantic-index program
+([#8](https://github.com/SquashMerge/trellis/issues/8)). Multi-language SCIP import and separately
 gated snapshot search, diagram artifacts and embedded terminal/ACP integration remain future work.
 Continue static sequence coverage and library adapters beyond Rust/Cargo; source-backed provider
 validation still requires authorization and working authentication.

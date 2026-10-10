@@ -5,22 +5,22 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use baleyg::{
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
+use trellis::{
     http,
     indexer::{IndexOptions, index_workspace_bundle},
     model::*,
     store::Store,
 };
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn setup() -> (
     tempfile::TempDir,
     Store,
     Graph,
     Router,
-    Arc<baleyg::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::LeaderSession>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");

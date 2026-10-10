@@ -74,8 +74,8 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
         return Err("invalid_request");
     };
     let (fields, required): (&[&str], &[&str]) = match name {
-        "baleyg_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
-        "baleyg_find_symbols" => (
+        "trellis_workspace_describe" => (&["schemaVersion", "workspace"], &["schemaVersion"]),
+        "trellis_find_symbols" => (
             &[
                 "schemaVersion",
                 "query",
@@ -85,7 +85,7 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
             ],
             &["schemaVersion", "query"],
         ),
-        "baleyg_inspect" => (
+        "trellis_inspect" => (
             &[
                 "schemaVersion",
                 "symbolId",
@@ -116,15 +116,15 @@ pub fn validate(name: &str, args: Option<&Value>) -> Result<(), &'static str> {
         return Err("invalid_request");
     }
     let validated = match name {
-        "baleyg_workspace_describe" => Ok(()),
-        "baleyg_find_symbols" => {
+        "trellis_workspace_describe" => Ok(()),
+        "trellis_find_symbols" => {
             let q = string(o.get("query")).ok_or("invalid_request")?;
             if q.is_empty() || q.len() > 256 {
                 return Err("invalid_request");
             }
             limit(o)
         }
-        "baleyg_inspect" => {
+        "trellis_inspect" => {
             let sid = string(o.get("symbolId")).ok_or("invalid_request")?;
             if sid.len() > 8192
                 || sid.len() != 39
@@ -305,7 +305,7 @@ pub fn prepare(
         Ok(()) => attributed(
             match workspace.check() {
                 Err(e) => failure(id, identity_error(e)),
-                Ok(()) if name == "baleyg_workspace_describe" => describe(id, workspace.label()),
+                Ok(()) if name == "trellis_workspace_describe" => describe(id, workspace.label()),
                 Ok(()) => failure(id, "index_not_ready"),
             },
             workspace,
@@ -358,9 +358,9 @@ mod tests {
     }
     fn good(name: &str) -> Value {
         match name {
-            "baleyg_workspace_describe" => json!({"schemaVersion":1}),
-            "baleyg_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
-            "baleyg_inspect" => json!({"schemaVersion":1,"symbolId":sid(),"view":"declaration"}),
+            "trellis_workspace_describe" => json!({"schemaVersion":1}),
+            "trellis_find_symbols" => json!({"schemaVersion":1,"query":"a"}),
+            "trellis_inspect" => json!({"schemaVersion":1,"symbolId":sid(),"view":"declaration"}),
             _ => json!({"schemaVersion":1,"path":"src/a.rs","startLine":1,"endLine":1}),
         }
     }
@@ -684,7 +684,7 @@ mod tests {
             &workspace,
         );
         assert_eq!(prepared.response["isError"], false);
-        let marker = root.join(".git/baleyg/workspace-id");
+        let marker = root.join(".git/trellis/workspace-id");
         std::fs::remove_file(&marker).unwrap();
         final_check(&mut prepared, &workspace);
         assert_eq!(

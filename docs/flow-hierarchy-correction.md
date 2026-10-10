@@ -22,7 +22,7 @@ Keep private workspace screenshots outside the public repository; public fixture
 
 ## Validation
 
-The [public historical summary](flow-hierarchy-validation.json) retains Baleyg test totals and
+The [public historical summary](flow-hierarchy-validation.json) retains Trellis test totals and
 implementation limits. Private-workspace browser examples, measurements and deployment details
 are omitted. No tests were rerun while preparing that summary, and no synthetic example is
 presented as an observed run.

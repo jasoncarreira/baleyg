@@ -41,7 +41,7 @@ const canon = (value) =>
           .join(",")}}`;
 const digest = (kind, value) =>
   createHash("sha256")
-    .update(`baleyg.${kind}.v1\0`)
+    .update(`trellis.${kind}.v1\0`)
     .update(canon(value))
     .digest("hex")
     .slice(0, 32);
@@ -62,12 +62,12 @@ const syntax = (name, doc = document) =>
 // context (empty declared native inventory) and the native producer, not a revision.
 const callId = (text = source) =>
   createHash("sha256")
-    .update("baleyg.occurrence.v2\0")
+    .update("trellis.occurrence.v2\0")
     .update(
       canon({
         contentHash: sha(text),
         extractionContext: sha(
-          "baleyg.extraction-context.v1\0" +
+          "trellis.extraction-context.v1\0" +
             canon({ language: "javascript", components: [] }),
         ),
         nativeProducerId: "native",

@@ -126,7 +126,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "baleyg"
+name = "trellis"
 version = "0.1.0"
 dependencies = [
  "anyhow",

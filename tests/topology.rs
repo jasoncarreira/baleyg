@@ -1,11 +1,11 @@
 mod common;
-use baleyg::store::topology::{UseGuard, WorkspaceIdentity};
 use std::{
     fs,
     io::{Read, Write},
     path::Path,
     process::{Command, Stdio},
 };
+use trellis::store::topology::{UseGuard, WorkspaceIdentity};
 
 fn root(base: &Path) -> std::path::PathBuf {
     let work = base.join("work");
@@ -152,7 +152,7 @@ fn git_marker_matrix() {
     let work = root(temp.path());
     common::private(&work.join(".git"));
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let marker = work.join(".git/baleyg/workspace-id");
+    let marker = work.join(".git/trellis/workspace-id");
     assert_eq!(fs::read(&marker).unwrap().len(), 36);
     assert_eq!(
         WorkspaceIdentity::discover(Some(&work), &work)
@@ -228,13 +228,13 @@ fn marker_child() {
 
 #[test]
 fn paused_creator_and_adopter_share_the_single_marker() {
-    use baleyg::store::topology::MarkerStage;
     use std::sync::mpsc;
+    use trellis::store::topology::MarkerStage;
     for initial in [b"".as_slice(), b"partial".as_slice()] {
         let (temp, _) = common::fixture();
         let work = root(temp.path());
         common::private(&work.join(".git"));
-        let marker = work.join(".git/baleyg/workspace-id");
+        let marker = work.join(".git/trellis/workspace-id");
         let (created_tx, created_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
         let (short_tx, short_rx) = mpsc::channel();
@@ -279,12 +279,12 @@ fn paused_creator_and_adopter_share_the_single_marker() {
 
 #[test]
 fn short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated() {
-    use baleyg::store::topology::MarkerStage;
+    use trellis::store::topology::MarkerStage;
     for replacement in [None, Some("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")] {
         let (temp, _) = common::fixture();
         let work = root(temp.path());
         common::private(&work.join(".git"));
-        let marker = work.join(".git/baleyg/workspace-id");
+        let marker = work.join(".git/trellis/workspace-id");
         let original = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
         fs::write(&marker, b"partial").unwrap();
         let mut saw_short = false;
@@ -313,7 +313,7 @@ fn short_marker_disappearing_or_replaced_at_barrier_is_not_regenerated() {
 
 #[test]
 fn every_marker_sync_stage_is_required_for_creator_and_adopter() {
-    use baleyg::store::topology::MarkerStage;
+    use trellis::store::topology::MarkerStage;
     for stage in [
         MarkerStage::MarkerSync,
         MarkerStage::PrivateDirSync,
@@ -322,7 +322,7 @@ fn every_marker_sync_stage_is_required_for_creator_and_adopter() {
         let (temp, _) = common::fixture();
         let work = root(temp.path());
         common::private(&work.join(".git"));
-        let marker = work.join(".git/baleyg/workspace-id");
+        let marker = work.join(".git/trellis/workspace-id");
         let mut reached = vec![];
         let error = WorkspaceIdentity::discover_with_marker_hook(Some(&work), &work, |at| {
             reached.push(at);
@@ -358,7 +358,7 @@ fn persistent_short_and_malformed_markers_remain_unchanged() {
     let (temp, _) = common::fixture();
     let work = root(temp.path());
     common::private(&work.join(".git"));
-    let marker = work.join(".git/baleyg/workspace-id");
+    let marker = work.join(".git/trellis/workspace-id");
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
     for bytes in [
         b"partial".as_slice(),
@@ -570,7 +570,7 @@ fn multiprocess_lock_protocol() {
 fn leader_child() {
     if let Some(path) = std::env::var_os("TOPOLOGY_LEADER_CHILD") {
         let base = Path::new(&path);
-        let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
             base.join("cache"),
             base.join("data"),
         );
@@ -731,7 +731,7 @@ fn marker_sync_faults_refuse_creator_and_adopter() {
     let error =
         WorkspaceIdentity::discover_with_marker_sync_hook(Some(&work), &work, fail).unwrap_err();
     assert!(error.to_string().contains("workspace_id_not_durable"));
-    let marker = work.join(".git/baleyg/workspace-id");
+    let marker = work.join(".git/trellis/workspace-id");
     assert_eq!(fs::read(&marker).unwrap().len(), 36);
     let error =
         WorkspaceIdentity::discover_with_marker_sync_hook(Some(&work), &work, fail).unwrap_err();
@@ -905,7 +905,7 @@ fn stale_use_child() {
 fn stale_leader_child() {
     if let Some(path) = std::env::var_os("TOPOLOGY_STALE_LEADER") {
         let base = Path::new(&path);
-        let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
             base.join("cache"),
             base.join("data"),
         );
@@ -1012,7 +1012,7 @@ use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn durable_first_save_empty_record_and_payloads() {
-    use baleyg::{
+    use trellis::{
         model::{Annotation, SavedView},
         store::topology::DurableRecords,
     };
@@ -1072,7 +1072,7 @@ fn durable_first_save_empty_record_and_payloads() {
 
 #[test]
 fn durable_git_move_and_copy_share_payload_without_rewriting() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     common::private(&work.join(".git"));
@@ -1088,15 +1088,15 @@ fn durable_git_move_and_copy_share_payload_without_rewriting() {
     let copied = temp.path().join("copy");
     fs::create_dir(&copied).unwrap();
     common::private(&copied.join(".git"));
-    fs::create_dir(copied.join(".git/baleyg")).unwrap();
+    fs::create_dir(copied.join(".git/trellis")).unwrap();
     fs::set_permissions(
-        copied.join(".git/baleyg"),
+        copied.join(".git/trellis"),
         fs::Permissions::from_mode(0o700),
     )
     .unwrap();
     fs::copy(
-        work.join(".git/baleyg/workspace-id"),
-        copied.join(".git/baleyg/workspace-id"),
+        work.join(".git/trellis/workspace-id"),
+        copied.join(".git/trellis/workspace-id"),
     )
     .unwrap();
     let copy = WorkspaceIdentity::discover(Some(&copied), &copied).unwrap();
@@ -1152,7 +1152,7 @@ fn durable_git_move_and_copy_share_payload_without_rewriting() {
 
 #[test]
 fn durable_incomplete_and_incompatible_refused() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1179,7 +1179,7 @@ fn durable_incomplete_and_incompatible_refused() {
 
 #[test]
 fn durable_absent_parent_is_verified() {
-    use baleyg::store::topology::DurableRecords;
+    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1205,11 +1205,11 @@ fn durable_absent_parent_is_verified() {
 
 #[test]
 fn durable_existing_lock_unlink_never_recreates() {
-    use baleyg::store::topology::DurableRecords;
+    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
-    let note = baleyg::model::Annotation {
+    let note = trellis::model::Annotation {
         id: "n".into(),
         node_id: "node".into(),
         body: "body".into(),
@@ -1286,7 +1286,7 @@ fn durable_existing_lock_replacement_checks_new_inode_and_holder() {
 
 #[test]
 fn durable_annotation_first_commit_fault_and_sync_fault() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1342,9 +1342,9 @@ fn durable_annotation_first_commit_fault_and_sync_fault() {
 #[test]
 fn durable_creator_child() {
     if let Some(base) = std::env::var_os("TOPOLOGY_DURABLE_CHILD") {
-        use baleyg::{model::Annotation, store::topology::DurableRecords};
+        use trellis::{model::Annotation, store::topology::DurableRecords};
         let base = Path::new(&base);
-        let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+        let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
             base.join("cache"),
             base.join("data"),
         );
@@ -1375,8 +1375,8 @@ fn durable_creator_child() {
 
 #[test]
 fn durable_first_creator_process_contention_and_retry() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
     use std::io::{BufRead, BufReader};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let id = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1428,7 +1428,7 @@ fn durable_first_creator_process_contention_and_retry() {
 
 #[test]
 fn durable_non_git_move_retains_old_record_and_root_row() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let old = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1474,7 +1474,7 @@ fn durable_non_git_move_retains_old_record_and_root_row() {
 
 #[test]
 fn durable_marker_change_refuses_real_operation() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     common::private(&work.join(".git"));
@@ -1488,7 +1488,7 @@ fn durable_marker_change_refuses_real_operation() {
         .put_annotation(&note)
         .unwrap();
     fs::write(
-        work.join(".git/baleyg/workspace-id"),
+        work.join(".git/trellis/workspace-id"),
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
@@ -1668,9 +1668,9 @@ fn gc_manifest(base: &Path) -> Vec<GcManifestEntry> {
 
 #[test]
 fn gc_age_and_record_inventory_are_read_only() {
-    use baleyg::model::SavedView;
-    use baleyg::store::topology::{DurableRecords, classify_index_age, valid_record_id};
     use std::os::unix::fs::MetadataExt;
+    use trellis::model::SavedView;
+    use trellis::store::topology::{DurableRecords, classify_index_age, valid_record_id};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1830,9 +1830,9 @@ fn gc_age_and_record_inventory_are_read_only() {
 
 #[test]
 fn gc_rejects_dangling_recovery_sidecars_without_writes() {
-    use baleyg::model::Annotation;
-    use baleyg::store::topology::DurableRecords;
     use std::os::unix::fs::symlink;
+    use trellis::model::Annotation;
+    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -1887,8 +1887,8 @@ fn gc_rejects_dangling_recovery_sidecars_without_writes() {
 
 #[test]
 fn gc_refuses_countable_records_with_missing_durable_columns() {
-    use baleyg::model::Annotation;
-    use baleyg::store::topology::DurableRecords;
+    use trellis::model::Annotation;
+    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     for (n, table, column) in [
         (0, "known_roots", "device"),
@@ -1938,8 +1938,8 @@ fn gc_refuses_countable_records_with_missing_durable_columns() {
 
 #[test]
 fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
-    use baleyg::model::Annotation;
-    use baleyg::store::topology::DurableRecords;
+    use trellis::model::Annotation;
+    use trellis::store::topology::DurableRecords;
     let (temp, roots) = common::fixture();
     let mut identities = (0..3)
         .map(|n| {
@@ -2006,7 +2006,7 @@ fn gc_report_sorts_multiple_derived_records_and_missing_paths() {
 
 #[test]
 fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
-    use baleyg::{
+    use trellis::{
         model::SavedView,
         store::topology::{DurableRecords, valid_record_id},
     };
@@ -2018,10 +2018,10 @@ fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
     let copy = temp.path().join("copy");
     fs::create_dir(&copy).unwrap();
     common::private(&copy.join(".git"));
-    common::private(&copy.join(".git/baleyg"));
+    common::private(&copy.join(".git/trellis"));
     fs::copy(
-        work.join(".git/baleyg/workspace-id"),
-        copy.join(".git/baleyg/workspace-id"),
+        work.join(".git/trellis/workspace-id"),
+        copy.join(".git/trellis/workspace-id"),
     )
     .unwrap();
     let copied = WorkspaceIdentity::discover(Some(&copy), &copy).unwrap();
@@ -2083,8 +2083,8 @@ fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
     );
     assert!(!directory.exists());
     assert!(!lock.exists());
-    assert!(work.join(".git/baleyg/workspace-id").exists());
-    assert!(copy.join(".git/baleyg/workspace-id").exists());
+    assert!(work.join(".git/trellis/workspace-id").exists());
+    assert!(copy.join(".git/trellis/workspace-id").exists());
     assert!(
         DurableRecords::new(&roots, &copied)
             .views()
@@ -2097,7 +2097,7 @@ fn forget_requires_safe_exclusive_record_and_recreates_on_later_save() {
 
 #[test]
 fn forget_empty_record_and_recovery_sidecars_refuse() {
-    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    use trellis::{model::SavedView, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2129,7 +2129,7 @@ fn forget_empty_record_and_recovery_sidecars_refuse() {
 
 #[test]
 fn forget_refuses_countable_records_with_unknown_sqlite_schema() {
-    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    use trellis::{model::SavedView, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let view: SavedView = serde_json::from_str(
         r#"{"id":"view1","title":"A view","query":{"seed":"symbol"},"pins":{}}"#,
@@ -2180,7 +2180,7 @@ fn forget_refuses_countable_records_with_unknown_sqlite_schema() {
 
 #[test]
 fn forget_rechecks_sqlite_schema_after_confirmation() {
-    use baleyg::{model::SavedView, store::topology::DurableRecords};
+    use trellis::{model::SavedView, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2268,7 +2268,7 @@ fn gc_classifies_current_schema8_but_refuses_spoofed_shapes() {
 
 #[test]
 fn saved_anchor_raw_bytes_survive_edits() {
-    use baleyg::{
+    use trellis::{
         model::{Annotation, AnnotationRecord},
         store::topology::DurableRecords,
     };
@@ -2326,7 +2326,7 @@ fn saved_anchor_raw_bytes_survive_edits() {
 
 #[test]
 fn saved_anchor_rejects_target_replacement() {
-    use baleyg::{model::Annotation, store::topology::DurableRecords};
+    use trellis::{model::Annotation, store::topology::DurableRecords};
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2362,9 +2362,9 @@ fn assert_expected_storage_busy(error: &anyhow::Error) {
 
 fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawValue> {
     let hash: String = std::iter::repeat_n(hash_byte, 64).collect();
-    serde_json::value::to_raw_value(&baleyg::model::DurableAnchor {
+    serde_json::value::to_raw_value(&trellis::model::DurableAnchor {
         syntax_id: target.into(),
-        document: baleyg::native_evidence::DocumentKey {
+        document: trellis::native_evidence::DocumentKey {
             source_set_id: "set".into(),
             language: "rust".into(),
             path: "src/lib.rs".into(),
@@ -2380,7 +2380,7 @@ fn test_anchor_raw(target: &str, hash_byte: char) -> Box<serde_json::value::RawV
 
 #[test]
 fn malformed_anchor_documents_fail_before_persistence() {
-    use baleyg::{
+    use trellis::{
         model::{Annotation, AnnotationRecord},
         store::topology::DurableRecords,
     };
@@ -2422,11 +2422,11 @@ fn malformed_anchor_documents_fail_before_persistence() {
 
 #[test]
 fn view_anchor_raw_bytes_survive_edits() {
-    use baleyg::{
+    use std::collections::BTreeMap;
+    use trellis::{
         model::{SavedView, SavedViewRecord, ViewQuery},
         store::topology::DurableRecords,
     };
-    use std::collections::BTreeMap;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2470,7 +2470,7 @@ fn view_anchor_raw_bytes_survive_edits() {
 
 #[test]
 fn existing_saved_writers_use_exclusive_lock_and_orphan_sidecars_refuse() {
-    use baleyg::{
+    use trellis::{
         model::{SavedView, SavedViewRecord},
         store::topology::{DurableRecords, UseGuard},
     };
@@ -2551,14 +2551,14 @@ fn existing_saved_writers_use_exclusive_lock_and_orphan_sidecars_refuse() {
 
 #[test]
 fn saved_anchor_atomic_first_save_and_delete_edit_races() {
-    use baleyg::{
-        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
-        store::topology::DurableRecords,
-    };
     use std::{
         collections::BTreeMap,
         sync::{Arc, Barrier},
         thread,
+    };
+    use trellis::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
     };
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
@@ -2836,13 +2836,13 @@ fn saved_anchor_atomic_first_save_and_delete_edit_races() {
 
 #[test]
 fn server_updates_recapture_after_confirmed_delete_and_reject_stale_raw_input() {
-    use baleyg::{
-        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
-        store::topology::DurableRecords,
-    };
     use std::{
         collections::BTreeMap,
         sync::atomic::{AtomicBool, Ordering},
+    };
+    use trellis::{
+        model::{Annotation, AnnotationRecord, SavedView, SavedViewRecord, ViewQuery},
+        store::topology::DurableRecords,
     };
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
@@ -3134,7 +3134,7 @@ fn automatic_gc_rejects_unknown_shapes_busy_and_hot_files() {
         let candidate = common::open_store(temp.path(), &work).unwrap();
         if *case == "queue" {
             candidate
-                .enqueue_request(&baleyg::indexer::IndexOptions::new(work.clone()), None)
+                .enqueue_request(&trellis::indexer::IndexOptions::new(work.clone()), None)
                 .unwrap();
         }
         drop(candidate);
@@ -3279,7 +3279,7 @@ fn automatic_gc_refuses_malformed_or_future_attempt_stamp() {
 
 #[test]
 fn attempt2_gc_rechecks_current_root_at_final_unlink() {
-    use baleyg::store::topology::GcStage;
+    use trellis::store::topology::GcStage;
     let (temp, roots) = common::fixture();
     let current = root(temp.path());
     let store = common::open_store(temp.path(), &current).unwrap();
@@ -3323,7 +3323,7 @@ fn attempt2_gc_rechecks_current_root_at_final_unlink() {
 
 #[test]
 fn attempt2_gc_rechecks_current_leader_at_final_unlink() {
-    use baleyg::store::topology::GcStage;
+    use trellis::store::topology::GcStage;
     let (temp, roots) = common::fixture();
     let current = root(temp.path());
     drop(common::open_store(temp.path(), &current).unwrap());
@@ -3399,7 +3399,7 @@ fn attempt2_gc_existing_empty_stamp_must_not_scan() {
 
 #[test]
 fn attempt2_gc_fault_before_stamp_rename_keeps_prior_fence() {
-    use baleyg::store::topology::GcStage;
+    use trellis::store::topology::GcStage;
     let (temp, roots) = common::fixture();
     let work = root(temp.path());
     drop(common::open_store(temp.path(), &work).unwrap());

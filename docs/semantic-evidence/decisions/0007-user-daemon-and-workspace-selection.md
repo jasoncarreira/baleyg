@@ -1,22 +1,22 @@
 # Decision 0007: user-level daemon, per-call workspace selection and idle timeouts
 
 - **Status:** owner-approved 2026-10-06; ratified when this record merges. It governs #107, and #17 builds on it. It amends `../../mcp-readonly-pilot-contract.md` (#24) where noted, and adds to `../../local-topology.md`.
-- **Scope:** how Baleyg processes are arranged when many coding-agent sessions run at once, how an MCP call chooses its workspace, and when idle resources are released. Per-checkout indexes, pins, revisions, retention (Decision 0006), the #67 queue and the evidence contracts are unchanged.
+- **Scope:** how Trellis processes are arranged when many coding-agent sessions run at once, how an MCP call chooses its workspace, and when idle resources are released. Per-checkout indexes, pins, revisions, retention (Decision 0006), the #67 queue and the evidence contracts are unchanged.
 - **Compatibility:** none needed (pre-release).
 
 ## Background
 
-Agent clients start a stdio MCP server per session, and subagents share their parent session's server. With many sessions open across many checkouts, a process per session costs memory and contends for each checkout's leader and watcher (#16). `baleyg mcp` also binds one workspace at startup, so a subagent working in its own git worktree gets evidence for the parent's checkout.
+Agent clients start a stdio MCP server per session, and subagents share their parent session's server. With many sessions open across many checkouts, a process per session costs memory and contends for each checkout's leader and watcher (#16). `trellis mcp` also binds one workspace at startup, so a subagent working in its own git worktree gets evidence for the parent's checkout.
 
 ## Decision
 
 ### 1. One daemon per user
 
-- A single Baleyg daemon per user serves every checkout and worktree, enforced by a single-instance lock under Baleyg's private per-user directory.
+- A single Trellis daemon per user serves every checkout and worktree, enforced by a single-instance lock under Trellis's private per-user directory.
 - **Start:** on demand when a client attaches and none is running.
 - **Crash recovery:** clients reconnect, or restart it.
-- **Per checkout, as before:** the daemon competes for each active checkout's leader lock like any other Baleyg process. If a standalone CLI already holds it, the daemon stays a follower for that checkout and never forces a takeover. As leader, it runs that checkout's watcher and reconciliation (#16), request queue (#67), retention and GC (Decision 0006). Indexes, pins and revisions stay **per checkout** and are never merged across branches or worktrees. Reuse of extraction work across worktrees comes from #71's path-neutral fact cache.
-- **`baleyg mcp` becomes a thin client.** It speaks MCP over stdio to the agent client exactly as #24 specifies, and relays to the daemon over a Unix domain socket in an owner-only directory. Access is protected by file-system permissions (T00).
+- **Per checkout, as before:** the daemon competes for each active checkout's leader lock like any other Trellis process. If a standalone CLI already holds it, the daemon stays a follower for that checkout and never forces a takeover. As leader, it runs that checkout's watcher and reconciliation (#16), request queue (#67), retention and GC (Decision 0006). Indexes, pins and revisions stay **per checkout** and are never merged across branches or worktrees. Reuse of extraction work across worktrees comes from #71's path-neutral fact cache.
+- **`trellis mcp` becomes a thin client.** It speaks MCP over stdio to the agent client exactly as #24 specifies, and relays to the daemon over a Unix domain socket in an owner-only directory. Access is protected by file-system permissions (T00).
   - It still exits on stdin end-of-file and still never indexes.
   - "Never daemonizes" applies to the client. The daemon is a separate process the client may start.
 - **CLI commands** use the daemon when it's running. Without it, they keep working standalone under the existing per-checkout leader lock.
@@ -54,7 +54,7 @@ Both are policy constants, to be tuned later without a format change.
 ## Implementation impact (#107)
 
 - **Daemon process:** single-instance lock, socket, start-on-attach, idle exit, crash recovery.
-- **Thin `baleyg mcp` client:** relays over the socket and handles launch-workspace defaulting.
+- **Thin `trellis mcp` client:** relays over the socket and handles launch-workspace defaulting.
 - **Checkout lifecycle:** attach and release per §3, with watcher and handle cleanup.
 - **Tools:** the optional `workspace` input on evidence tools, and workspace attribution in results, per §2.
 - **Process boundaries:** the CLI attaches when the daemon is running and stays standalone otherwise, and the daemon serves the browser.

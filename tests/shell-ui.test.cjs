@@ -33,7 +33,7 @@ function harness(withApp = false) {
       return handler("/api" + url.slice(SCOPED.length),...args);
     };
   }
-  return {get,document,context,run,requests,shell:context.window.BaleygShell};
+  return {get,document,context,run,requests,shell:context.window.TrellisShell};
 }
 const all = node => [node,...node.children.flatMap(all)];
 const text = node => all(node).map(n=>n.textContent).join(" ");
@@ -130,7 +130,7 @@ for(const change of ["method","revision","disconnect","index"] ) test(`app inval
 });
 test("captured app source callback rejects revision/session changes even without a shell reset",async()=>{
   const h=harness(true);let callback;
-  h.context.window.BaleygShell.selectStep=(_,__,source)=>{callback=source;};
+  h.context.window.TrellisShell.selectStep=(_,__,source)=>{callback=source;};
   h.context.fetch=async()=>response(view([call()]));await h.run(`selectMethod(${JSON.stringify(view().seed)})`);
   all(h.get("sequence-diagram")).find(n=>n.attrs.class?.split(" ").includes("sequence-source")).listeners.click();
   h.context.fetch=()=>{throw new Error("Stale source fetch");};h.run("status.revision=2;epoch++;");

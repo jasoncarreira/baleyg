@@ -89,7 +89,7 @@ export async function runFixtures(root) {
   if (fixtures.length === 0)
     fail("RUNNER.DISCOVERY", "fixtures-root", `no fixtures found in ${root}`);
   for (const fixture of fixtures) {
-    const temporary = await mkdtemp(join(tmpdir(), "baleyg-semantic-runner-"));
+    const temporary = await mkdtemp(join(tmpdir(), "trellis-semantic-runner-"));
     const copy = join(temporary, basename(fixture));
     try {
       const { profile } = JSON.parse(

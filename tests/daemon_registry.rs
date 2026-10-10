@@ -1,8 +1,8 @@
-use baleyg::daemon::registry::{
+use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
+use trellis::daemon::registry::{
     CheckoutOptions, CheckoutRegistry, MAX_ACTIVE_CHECKOUTS, SelectionError,
 };
-use baleyg::store::topology::WorkspaceIdentity;
-use std::{fs, os::unix::fs::symlink, path::Path, process::Command};
+use trellis::store::topology::WorkspaceIdentity;
 
 fn git(args: &[&str], dir: &Path) {
     assert!(

@@ -1,18 +1,18 @@
-fn test_pin(revision: u64) -> baleyg::model::IndexPin {
-    baleyg::model::IndexPin {
+fn test_pin(revision: u64) -> trellis::model::IndexPin {
+    trellis::model::IndexPin {
         index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
         index_revision: revision,
     }
 }
-use baleyg::{
-    behavior::{SequenceStep, SequenceView, build_sequence},
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-};
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
+    behavior::{SequenceStep, SequenceView, build_sequence},
+    indexer::{IndexOptions, index_workspace},
+    model::*,
 };
 thread_local! { static FIXTURE_SOURCE: RefCell<String> = const { RefCell::new(String::new()) }; }
 
@@ -528,7 +528,7 @@ fn grouping_depth_budget_is_independent_and_keeps_measured_steps() {
     assert_eq!(ungroup(view.steps), all.steps);
 }
 
-fn target_for<'a>(view: &'a SequenceView, label: &str) -> &'a baleyg::behavior::Participant {
+fn target_for<'a>(view: &'a SequenceView, label: &str) -> &'a trellis::behavior::Participant {
     let step = flatten(&view.steps)
         .into_iter()
         .find(|s| s.kind == "call" && s.label == label)

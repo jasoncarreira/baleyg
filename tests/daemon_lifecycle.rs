@@ -1,14 +1,14 @@
-use baleyg::{
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
+use trellis::{
     daemon::registry::{
         BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY, CheckoutOptions, CheckoutRegistry,
         DAEMON_IDLE_DELAY,
     },
     store::topology::{TopologyRoots, WorkspaceIdentity},
-};
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, Instant},
 };
 
 fn identity(root: &Path) -> WorkspaceIdentity {
@@ -37,7 +37,7 @@ fn fixture() -> (
         .unwrap();
     (base, id, registry, now)
 }
-async fn ready(runtime: &baleyg::daemon::registry::CheckoutRuntime) {
+async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response() {
@@ -60,7 +60,7 @@ async fn lifecycle_driver_exits_when_startup_deadline_is_due() {
     )));
     tokio::time::timeout(
         Duration::from_secs(1),
-        baleyg::daemon::run_idle_lifecycle(registry),
+        trellis::daemon::run_idle_lifecycle(registry),
     )
     .await
     .unwrap()
@@ -268,9 +268,9 @@ fn startup_orphan_queue_blocks_idle_exit_without_any_client() {
     let id = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), id).unwrap();
+    let store = trellis::store::Store::open(roots.clone(), id).unwrap();
     store
-        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout), None)
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
     drop(store);
     let now = Instant::now();
@@ -283,7 +283,7 @@ fn empty_interrupted_index_exits_but_unknown_queue_does_not() {
     let (base, id, _, now) = fixture();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
     let dir = base.path().join("cache/indexes").join(&id.root_key);
     drop(store);
     fs::remove_file(dir.join("index.db")).unwrap();
@@ -314,7 +314,7 @@ fn orphan_scan_refuses_hot_index_sidecars_and_wal_header_without_creation() {
     let (base, id, _, now) = fixture();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
     drop(store);
     let dir = base.path().join("cache/indexes").join(&id.root_key);
     let index = dir.join("index.db");
@@ -449,7 +449,7 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
     };
     assert!(
         error
-            .downcast_ref::<baleyg::store::topology::IndexNotReady>()
+            .downcast_ref::<trellis::store::topology::IndexNotReady>()
             .is_some(),
         "{error:#}"
     );
@@ -462,13 +462,13 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
 
 #[tokio::test]
 async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
-    use baleyg::store::MaintenanceQueueState;
+    use trellis::store::MaintenanceQueueState;
 
     let (base, id, mut registry, now) = fixture();
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
-    let options = baleyg::indexer::IndexOptions::new(id.root.clone());
+    let store = trellis::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let options = trellis::indexer::IndexOptions::new(id.root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     assert_eq!(
         store.request_by_id(&first.id).unwrap().unwrap().state,
@@ -477,7 +477,7 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     let reader = store.open_maintenance_queue_probe().unwrap();
     assert!(matches!(
         reader,
-        baleyg::store::QueueProbeAdmission::Ready(_)
+        trellis::store::QueueProbeAdmission::Ready(_)
     ));
     assert_eq!(reader.check(), MaintenanceQueueState::Pending);
 
@@ -530,9 +530,9 @@ async fn active_writer_and_protected_reader_overlap_orphan_idle_scan() {
     // of the SAME root before the transaction is allowed to commit.
     let (active_pending, orphan_pending, tick, returned_registry) =
         tokio::task::spawn_blocking(move || {
-            let active_pending = baleyg::store::Store::orphan_queues_pending(&roots, &active);
+            let active_pending = trellis::store::Store::orphan_queues_pending(&roots, &active);
             let orphan_pending =
-                baleyg::store::Store::orphan_queues_pending(&roots, &Default::default());
+                trellis::store::Store::orphan_queues_pending(&roots, &Default::default());
             let tick = registry.advance(now + DAEMON_IDLE_DELAY).unwrap();
             (active_pending, orphan_pending, tick, registry)
         })
@@ -608,8 +608,8 @@ async fn committed_fifo_queue_keeps_both_expired_clocks_until_normal_leader_drai
     ready(&runtime).await;
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots, identity(&id.root)).unwrap();
-    let options = baleyg::indexer::IndexOptions::new(id.root.clone());
+    let store = trellis::store::Store::open(roots, identity(&id.root)).unwrap();
+    let options = trellis::indexer::IndexOptions::new(id.root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
     assert!(first.seq < second.seq);
@@ -665,7 +665,7 @@ fn deleted_or_replaced_orphan_root_with_empty_queue_allows_exit() {
         let id = identity(&checkout);
         let roots =
             TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-        drop(baleyg::store::Store::open(roots.clone(), id).unwrap());
+        drop(trellis::store::Store::open(roots.clone(), id).unwrap());
         fs::remove_dir_all(&checkout).unwrap();
         if replace {
             fs::create_dir(&checkout).unwrap();
@@ -759,9 +759,9 @@ fn pending_orphan_scans_are_not_repeated_every_tick() {
     let id = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), id).unwrap();
+    let store = trellis::store::Store::open(roots.clone(), id).unwrap();
     store
-        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout), None)
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
     drop(store);
     let now = Instant::now();
@@ -803,10 +803,10 @@ fn orphan_published_non_git_root_that_became_git_does_not_pin_exit() {
     let old = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    let store = baleyg::store::Store::open(roots.clone(), old).unwrap();
-    let owner = baleyg::index_coordinator::establish_serving_session(
+    let store = trellis::store::Store::open(roots.clone(), old).unwrap();
+    let owner = trellis::index_coordinator::establish_serving_session(
         &store,
-        Some(&baleyg::indexer::IndexOptions::new(checkout.clone())),
+        Some(&trellis::indexer::IndexOptions::new(checkout.clone())),
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
@@ -835,7 +835,7 @@ fn orphan_ambiguous_same_inode_git_metadata_stays_busy() {
     let old = identity(&checkout);
     let roots =
         TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
-    drop(baleyg::store::Store::open(roots.clone(), old).unwrap());
+    drop(trellis::store::Store::open(roots.clone(), old).unwrap());
     fs::write(
         checkout.join(".git"),
         "invalid pointer

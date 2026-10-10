@@ -121,9 +121,9 @@ def divergent_binary(scratch, debug):
 
 
 def main():
-    debug, release = TARGET / "debug/baleyg", TARGET / "release/baleyg"
+    debug, release = TARGET / "debug/trellis", TARGET / "release/trellis"
     assert debug.is_file() and release.is_file(), "build Rust 1.99 debug and release first"
-    with tempfile.TemporaryDirectory(prefix="baleyg-pr98-real-binaries-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="trellis-pr98-real-binaries-") as tmp:
         scratch = Path(tmp)
         home = scratch / "home"
         home.mkdir(mode=0o700)

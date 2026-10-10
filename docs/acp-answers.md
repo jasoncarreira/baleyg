@@ -5,7 +5,7 @@ revision-bound question packet, not only the five visible call sites. Jev select
 a prerequisite: prepare the offline packet, then explicitly choose **Explain with ACP**.
 
 The result separates a short answer, branch differences and limitations. Each answer/branch
-claim has one or more source citations with exact quotes. Baleyg validates the packet ID,
+claim has one or more source citations with exact quotes. Trellis validates the packet ID,
 file, inclusive line range and quoted text before display. Citation validation proves that
 an anchor exists in the snapshot, **not** that the model's assertion logically follows.
 Graph edges remain measured facts; an explanation is not a runtime sequence trace.
@@ -29,10 +29,10 @@ Install the pinned runtime dependencies once:
 npm ci --prefix runtime/acp
 ```
 
-After authorization, add all three flags to your usual `baleyg serve` command:
+After authorization, add all three flags to your usual `trellis serve` command:
 
 ```sh
---acp-runner /absolute/path/to/baleyg/runtime/acp/runner.mjs \
+--acp-runner /absolute/path/to/trellis/runtime/acp/runner.mjs \
 --acp-state-dir /private/path/to/new-acp-allowance \
 --acp-max-attempts <authorized-attempt-count>
 ```

@@ -1,10 +1,10 @@
 mod common;
-use baleyg::{model::*, store::Store};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
+use trellis::{model::*, store::Store};
 fn private_state() -> TempDir {
     let state = tempfile::tempdir().unwrap();
     #[cfg(unix)]
@@ -153,11 +153,11 @@ fn bundle(
     work: &TempDir,
 ) -> (
     Graph,
-    baleyg::native_evidence::Artifact,
-    baleyg::capture::Capture,
+    trellis::native_evidence::Artifact,
+    trellis::capture::Capture,
 ) {
-    baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(work.path().to_owned()),
+    trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(work.path().to_owned()),
         store.root_id(),
         &cancel(),
         |_| {},
@@ -168,11 +168,11 @@ fn publish_bundle(
     store: &Store,
     bundle: &(
         Graph,
-        baleyg::native_evidence::Artifact,
-        baleyg::capture::Capture,
+        trellis::native_evidence::Artifact,
+        trellis::capture::Capture,
     ),
     expected: IndexPin,
-    leader: &baleyg::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::LeaderGuard,
 ) -> IndexPin {
     store
         .publish_native(&bundle.0, &bundle.2, &bundle.1, leader, expected, &cancel())
@@ -886,7 +886,7 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
     store.put_view(&saved).unwrap();
     drop(leader);
     let failed_takeover = store.leader_session().unwrap();
-    let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+    let coordinator = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
         &store,
         None,
         failed_takeover.clone(),
@@ -895,7 +895,7 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
     let cancelled: CancelFlag = Arc::new(AtomicBool::new(true));
     let error = coordinator
         .run(
-            &baleyg::indexer::IndexOptions::new(work.path().to_owned()),
+            &trellis::indexer::IndexOptions::new(work.path().to_owned()),
             &cancelled,
             |_| {},
         )
@@ -1536,9 +1536,9 @@ fn same_path_different_association_is_missing_but_dangling_revision_fails_closed
         .unwrap();
 
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
             .unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
@@ -1639,9 +1639,9 @@ fn saved_reads_without_records_are_conservative_and_write_nothing() {
         "saved reads changed the cache database"
     );
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
             .unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
@@ -1703,9 +1703,9 @@ fn malformed_persisted_anchors_fail_closed_without_an_index() {
     store.put_view(&view).unwrap();
     store.put_annotation(&note).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(work.path()), work.path())
             .unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
