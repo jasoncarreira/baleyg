@@ -24,7 +24,7 @@
       ],
       "type": "object"
     },
-    "name": "baleyg_workspace_describe",
+    "name": "trellis_workspace_describe",
     "outputSchema": {
       "$defs": {
         "Basis": {
@@ -730,7 +730,7 @@
       ],
       "type": "object"
     },
-    "name": "baleyg_find_symbols",
+    "name": "trellis_find_symbols",
     "outputSchema": {
       "$defs": {
         "Basis": {
@@ -1729,7 +1729,7 @@
         }
       ]
     },
-    "name": "baleyg_inspect",
+    "name": "trellis_inspect",
     "outputSchema": {
       "$defs": {
         "Basis": {
@@ -3377,7 +3377,7 @@
       ],
       "type": "object"
     },
-    "name": "baleyg_read_source",
+    "name": "trellis_read_source",
     "outputSchema": {
       "$defs": {
         "Basis": {

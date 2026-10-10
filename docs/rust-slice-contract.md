@@ -2,7 +2,7 @@
 
 Implement .rs indexing and sequence browsing in the existing language-neutral graph/SequenceView.
 Use tree-sitter-rust and cached source. Indexing must never execute cargo, rustc, build.rs, or
-macros. Trusted Baleyg development builds/tests remain allowed. No provider calls or schema migration.
+macros. Trusted Trellis development builds/tests remain allowed. No provider calls or schema migration.
 
 Indexer owns src/indexer.rs, src/indexer_rust.rs, tests/rust_indexer.rs.
 Behavior owns src/behavior_rust.rs, tests/rust_behavior.rs.

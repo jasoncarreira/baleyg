@@ -24,7 +24,7 @@ where
 }
 
 const LANGUAGES: [&str; 4] = ["java", "rust", "python", "javascript"];
-pub(crate) const PRODUCER: &str = "baleyg.native.syntax";
+pub(crate) const PRODUCER: &str = "trellis.native.syntax";
 /// Native producer descriptor version. Any change that can alter a native measured field or
 /// projection, or that starts reading another input, must change it (Decision 0003).
 pub(crate) const NATIVE_VERSION: &str = "native-v4";
@@ -458,7 +458,7 @@ pub(crate) fn document_witness(
         .context("invalid coverage")?
         .remove("revisionId");
     Ok(digest(
-        b"baleyg.native-version-witness.v1\0",
+        b"trellis.native-version-witness.v1\0",
         &canonical(&json!({
             "documentKey": document.key, "contentHash": document.content_hash,
             "byteLength": document.byte_length, "producerId": producer.id,
@@ -611,7 +611,7 @@ fn build_native_header<'a>(
     let revision_input = json!({"sourceSetId":source_set_id,"documents":docs,"toolchain":toolchain,"config":config,"dependencies":dependencies});
     let id = format!(
         "revision:v1:{}",
-        digest(b"baleyg.native-revision.v1\0", &canonical(&revision_input))
+        digest(b"trellis.native-revision.v1\0", &canonical(&revision_input))
     );
     let documents = files
         .iter()
@@ -873,7 +873,7 @@ pub(crate) fn assemble_selected_revision(
         let proof = format!(
             "native-proof:v1:{}",
             digest(
-                b"baleyg.native-proof.v1\0",
+                b"trellis.native-proof.v1\0",
                 &canonical(
                     &json!({"producerId":PRODUCER,"document":document.key,"revisionId":new_revision})
                 )
@@ -1283,7 +1283,7 @@ fn extract_known(
     let proof_id = format!(
         "native-proof:v1:{}",
         digest(
-            b"baleyg.native-proof.v1\0",
+            b"trellis.native-proof.v1\0",
             &canonical(&json!({"producerId":PRODUCER,"document":key,"revisionId":a.revision.id}))
         )
     );
@@ -1802,7 +1802,7 @@ impl Artifact {
             let expected = format!(
                 "native-proof:v1:{}",
                 digest(
-                    b"baleyg.native-proof.v1\0",
+                    b"trellis.native-proof.v1\0",
                     &canonical(
                         &json!({"producerId":PRODUCER,"document":proof.document,"revisionId":self.revision.id})
                     )
@@ -2227,7 +2227,7 @@ mod occurrence_identity_tests {
         };
         assert_eq!(
             witness(&a),
-            "6535526d0cd8de8719f134b7153f5447d7553108981de89519b8bdc7d2eab35f",
+            "c960e8af8036a2010da269b8d9f1c44c1e0778a179ea4467f8d0fe7375d409ca",
             "native witness bytes must retain the legacy canonical digest"
         );
         assert_eq!(

@@ -1,4 +1,4 @@
-use baleyg::file_tree::{SCAN_LIMIT, SourceDir};
+use trellis::file_tree::{SCAN_LIMIT, SourceDir};
 #[test]
 fn shallow_metadata_sorted_pages_and_validation() {
     let temp = tempfile::tempdir().unwrap();

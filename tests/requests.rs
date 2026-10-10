@@ -1,9 +1,9 @@
 //! Queue rows are durable independently of the native index and only the held leader may claim.
-use baleyg::{
+use std::fs;
+use trellis::{
     indexer::IndexOptions,
     store::{MaintenanceQueueState, QueueProbeAdmission, Store},
 };
-use std::fs;
 
 #[test]
 fn partially_created_queue_readers_report_busy_without_initializing_schema() {
@@ -88,7 +88,7 @@ fn durable_fifo_and_incarnation_fence() {
     assert!(b.seq > a.seq);
     assert_eq!(store.current_request().unwrap().unwrap().id, b.id);
     assert!(store.request_by_id(&a.id).unwrap().is_some());
-    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -124,17 +124,17 @@ fn durable_fifo_and_incarnation_fence() {
 
 #[test]
 fn published_pin_before_completion_crash_child() {
-    let Ok(state) = std::env::var("BALEYG_TEST_CRASH_GAP_STATE") else {
+    let Ok(state) = std::env::var("TRELLIS_TEST_CRASH_GAP_STATE") else {
         return;
     };
     let workspace =
-        std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_WORKSPACE").unwrap());
-    let proof = std::path::PathBuf::from(std::env::var("BALEYG_TEST_CRASH_GAP_PROOF").unwrap());
+        std::path::PathBuf::from(std::env::var("TRELLIS_TEST_CRASH_GAP_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("TRELLIS_TEST_CRASH_GAP_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
     // The parent's committed H belongs to its old incarnation. This child
     // must commit its own H before it may claim the durable running gap.
-    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -143,7 +143,7 @@ fn published_pin_before_completion_crash_child() {
     .unwrap();
     let claimed = store.claim_request(&owner).unwrap().unwrap();
     assert_eq!(claimed.state, "running");
-    let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+    let coordinator = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
         &store,
         claimed.expected,
         owner.clone(),
@@ -186,7 +186,7 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
-    let (before, owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (before, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -199,9 +199,9 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("published_pin_before_completion_crash_child")
-        .env("BALEYG_TEST_CRASH_GAP_STATE", state.path())
-        .env("BALEYG_TEST_CRASH_GAP_WORKSPACE", workspace.path())
-        .env("BALEYG_TEST_CRASH_GAP_PROOF", &proof)
+        .env("TRELLIS_TEST_CRASH_GAP_STATE", state.path())
+        .env("TRELLIS_TEST_CRASH_GAP_WORKSPACE", workspace.path())
+        .env("TRELLIS_TEST_CRASH_GAP_PROOF", &proof)
         .output()
         .unwrap();
     assert_eq!(
@@ -226,7 +226,7 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
         "the crash cannot pretend the ACK finished"
     );
     assert!(unfinished.revision.is_none());
-    let (takeover, new_owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (takeover, new_owner) = trellis::index_coordinator::reconcile_workspace(
         &parent,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -235,7 +235,7 @@ fn real_process_death_after_request_publish_reclaims_without_false_done() {
     .unwrap();
     assert!(takeover.index_revision > after_commit.index_revision);
     assert_eq!(
-        baleyg::index_coordinator::drain_requests(&parent, &new_owner).unwrap(),
+        trellis::index_coordinator::drain_requests(&parent, &new_owner).unwrap(),
         1
     );
     let done = parent.request_by_id(&accepted.id).unwrap().unwrap();
@@ -253,7 +253,7 @@ fn new_leader_reclaims_running_head_before_later_queued_row() {
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
     let original = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
-    let (_, old_owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, old_owner) = trellis::index_coordinator::reconcile_workspace(
         &original,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -273,7 +273,7 @@ fn new_leader_reclaims_running_head_before_later_queued_row() {
     drop(old_owner);
     drop(original);
     let replacement = Store::open_for_tests(state.path(), workspace.path()).unwrap();
-    let (_, new_owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, new_owner) = trellis::index_coordinator::reconcile_workspace(
         &replacement,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -281,7 +281,7 @@ fn new_leader_reclaims_running_head_before_later_queued_row() {
     )
     .unwrap();
     assert_eq!(
-        baleyg::index_coordinator::drain_requests(&replacement, &new_owner).unwrap(),
+        trellis::index_coordinator::drain_requests(&replacement, &new_owner).unwrap(),
         2
     );
     let a = replacement.request_by_id(&first.id).unwrap().unwrap();
@@ -301,18 +301,18 @@ fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes()
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
     let old = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
-    let (_, old_owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, old_owner) = trellis::index_coordinator::reconcile_workspace(
         &old,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         |_| {},
     )
     .unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
         Some(workspace.path()),
         workspace.path(),
     )
@@ -326,7 +326,7 @@ fn cli_accepted_during_held_exceptional_owner_waits_until_recreation_completes()
     let (tx, rx) = std::sync::mpsc::channel();
     let options_for_cli = options.clone();
     let cli = std::thread::spawn(move || {
-        let result = baleyg::index_coordinator::enqueue_and_wait(
+        let result = trellis::index_coordinator::enqueue_and_wait(
             &waiting,
             &options_for_cli,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -390,7 +390,7 @@ fn first_cli_takeover_reconciles_then_claims_fifo_head() {
     let options = IndexOptions::new(workspace.path().to_owned());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (pin, session) =
-        baleyg::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
+        trellis::index_coordinator::enqueue_and_wait(&store, &options, &cancel).unwrap();
     assert_eq!(
         pin.index_revision, 2,
         "takeover and explicit claim need separate publications"
@@ -474,7 +474,7 @@ fn incompatible_or_corrupt_existing_queue_never_gets_fresh_ack() {
 
 #[test]
 fn queue_hot_journal_child() {
-    let Some(path) = std::env::var_os("BALEYG_QUEUE_HOT_JOURNAL_CHILD") else {
+    let Some(path) = std::env::var_os("TRELLIS_QUEUE_HOT_JOURNAL_CHILD") else {
         return;
     };
     let db = rusqlite::Connection::open(path).unwrap();
@@ -494,7 +494,7 @@ fn hot_journal_rolls_back_before_queue_identity_and_ack() {
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("queue_hot_journal_child")
-        .env("BALEYG_QUEUE_HOT_JOURNAL_CHILD", &db_path)
+        .env("TRELLIS_QUEUE_HOT_JOURNAL_CHILD", &db_path)
         .output()
         .unwrap();
     assert_eq!(
@@ -525,7 +525,7 @@ fn old_holder_fails_queued_and_running_rows_after_root_is_moved() {
     let options = IndexOptions::new(root.clone());
     let first = store.enqueue_request(&options, None).unwrap();
     let second = store.enqueue_request(&options, None).unwrap();
-    let (_, owner) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, owner) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -585,19 +585,19 @@ fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only(
     );
     drop(old_owner);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let lock = state
         .path()
         .join("cache/indexes")
         .join(format!("{}.lock", identity.root_key));
     let independent_reader =
-        baleyg::store::topology::UseGuard::acquire(&lock, false, false).unwrap();
+        trellis::store::topology::UseGuard::acquire(&lock, false, false).unwrap();
     let index_path = replacement.request_db_path().with_file_name("index.db");
     let index_before = fs::read(&index_path).unwrap();
     let requests_before = fs::read(replacement.request_db_path()).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let error =
-        baleyg::index_coordinator::reconcile_workspace(&replacement, &options, &cancel, |_| {})
+        trellis::index_coordinator::reconcile_workspace(&replacement, &options, &cancel, |_| {})
             .unwrap_err();
     assert!(error.to_string().contains("storage_busy"), "{error:#}");
     assert_eq!(fs::read(&index_path).unwrap(), index_before);
@@ -618,7 +618,7 @@ fn replacement_root_can_accept_while_old_holder_is_live_then_recover_index_only(
     drop(db);
     drop(independent_reader);
     let (pin, session) =
-        baleyg::index_coordinator::enqueue_and_wait(&replacement, &options, &cancel).unwrap();
+        trellis::index_coordinator::enqueue_and_wait(&replacement, &options, &cancel).unwrap();
     assert!(session.is_leader());
     assert_eq!(
         replacement
@@ -651,7 +651,7 @@ fn unchanged_root_with_changed_workspace_marker_cannot_fail_queue_rows() {
         .unwrap();
     let owner = store.leader_session().unwrap();
     fs::write(
-        root.path().join(".git/baleyg/workspace-id"),
+        root.path().join(".git/trellis/workspace-id"),
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
@@ -686,7 +686,7 @@ fn replacement_rechecks_old_index_under_ex_before_any_rename() {
     drop(db);
     let before = fs::read(&index).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let error = baleyg::index_coordinator::reconcile_workspace(
+    let error = trellis::index_coordinator::reconcile_workspace(
         &replacement,
         &IndexOptions::new(root),
         &cancel,
@@ -722,7 +722,7 @@ fn replacement_queue_write_refusal_preserves_old_index_before_ex() {
     let queue_before = fs::read(replacement.request_db_path()).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     assert!(
-        baleyg::index_coordinator::reconcile_workspace(
+        trellis::index_coordinator::reconcile_workspace(
             &replacement,
             &IndexOptions::new(root),
             &cancel,
@@ -773,7 +773,7 @@ fn replacement_refuses_foreign_index_marker_and_sidecars_without_queue_transitio
         let queue_before = fs::read(replacement.request_db_path()).unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         assert!(
-            baleyg::index_coordinator::reconcile_workspace(
+            trellis::index_coordinator::reconcile_workspace(
                 &replacement,
                 &IndexOptions::new(root),
                 &cancel,
@@ -831,7 +831,7 @@ fn replacement_refuses_missing_or_foreign_queue_without_swapping_index() {
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         assert!(
-            baleyg::index_coordinator::reconcile_workspace(
+            trellis::index_coordinator::reconcile_workspace(
                 &replacement,
                 &IndexOptions::new(root),
                 &cancel,
@@ -870,7 +870,7 @@ fn root_failure_commit_error_never_authorizes_index_swap() {
     let before_index = fs::read(&index).unwrap();
     let before_queue = fs::read(&queue).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let error = baleyg::index_coordinator::reconcile_workspace(
+    let error = trellis::index_coordinator::reconcile_workspace(
         &replacement,
         &IndexOptions::new(root),
         &cancel,
@@ -942,7 +942,7 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
     drop(owner);
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     assert!(
-        baleyg::index_coordinator::reconcile_workspace(
+        trellis::index_coordinator::reconcile_workspace(
             &replacement,
             &IndexOptions::new(root),
             &cancel,
@@ -956,8 +956,8 @@ fn replacement_follower_never_recreates_deleted_accepted_queue_on_enqueue() {
 
 #[test]
 fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
-    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1013,8 +1013,8 @@ fn claimed_unchanged_fifo_publishes_fresh_manifest_without_reextracting() {
 
 #[test]
 fn changed_claimed_source_uses_native_fallback_not_unchanged() {
-    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1047,8 +1047,8 @@ fn changed_claimed_source_uses_native_fallback_not_unchanged() {
 
 #[test]
 fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
-    use baleyg::index_coordinator::{drain_requests, reconcile_workspace};
     use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1078,8 +1078,8 @@ fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
 
 #[test]
 fn changed_capture_input_and_options_take_full_claimed_fallback() {
-    use baleyg::index_coordinator::{drain_requests_observed, reconcile_workspace};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests_observed, reconcile_workspace};
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1120,19 +1120,19 @@ fn changed_capture_input_and_options_take_full_claimed_fallback() {
 
 #[test]
 fn executable_drift_claim_child() {
-    let Ok(state) = std::env::var("BALEYG_DRIFT_CLAIM_STATE") else {
+    let Ok(state) = std::env::var("TRELLIS_DRIFT_CLAIM_STATE") else {
         return;
     };
-    use baleyg::index_coordinator::{drain_requests_observed_with_native, reconcile_workspace};
-    use baleyg::native_evidence::FullNativeStage;
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use trellis::index_coordinator::{drain_requests_observed_with_native, reconcile_workspace};
+    use trellis::native_evidence::FullNativeStage;
     let workspace =
-        std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_WORKSPACE").unwrap());
-    let proof = std::path::PathBuf::from(std::env::var("BALEYG_DRIFT_CLAIM_PROOF").unwrap());
+        std::path::PathBuf::from(std::env::var("TRELLIS_DRIFT_CLAIM_WORKSPACE").unwrap());
+    let proof = std::path::PathBuf::from(std::env::var("TRELLIS_DRIFT_CLAIM_PROOF").unwrap());
     let store = Store::open_for_tests(std::path::Path::new(&state), &workspace).unwrap();
     let options = IndexOptions::new(workspace);
-    let stage = std::env::var("BALEYG_DRIFT_CLAIM_STAGE").unwrap_or_else(|_| "old".into());
+    let stage = std::env::var("TRELLIS_DRIFT_CLAIM_STAGE").unwrap_or_else(|_| "old".into());
     if stage == "new" {
         let previous = store.index_baseline().unwrap();
         let modes = Mutex::new(Vec::new());
@@ -1298,10 +1298,10 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
         .arg("--exact")
         .arg("executable_drift_claim_child")
         .arg("--nocapture")
-        .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
-        .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
-        .env("BALEYG_DRIFT_CLAIM_PROOF", &proof)
-        .env("BALEYG_DRIFT_CLAIM_STAGE", "old")
+        .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
+        .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
+        .env("TRELLIS_DRIFT_CLAIM_PROOF", &proof)
+        .env("TRELLIS_DRIFT_CLAIM_STAGE", "old")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1328,7 +1328,7 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
             .append(true)
             .open(&replacement)
             .unwrap();
-        bytes.write_all(b"BALEYG-TEST-PRODUCER-DRIFT-V1").unwrap();
+        bytes.write_all(b"TRELLIS-TEST-PRODUCER-DRIFT-V1").unwrap();
         bytes.sync_all().unwrap();
         drop(bytes);
         fs::rename(&replacement, &binary).unwrap();
@@ -1386,10 +1386,10 @@ fn asserted_claim_under_real_executable_drift(body_edit: bool, drift: bool) {
             .arg("--exact")
             .arg("executable_drift_claim_child")
             .arg("--nocapture")
-            .env("BALEYG_DRIFT_CLAIM_STATE", state.path())
-            .env("BALEYG_DRIFT_CLAIM_WORKSPACE", workspace.path())
-            .env("BALEYG_DRIFT_CLAIM_PROOF", &next_proof)
-            .env("BALEYG_DRIFT_CLAIM_STAGE", "new")
+            .env("TRELLIS_DRIFT_CLAIM_STATE", state.path())
+            .env("TRELLIS_DRIFT_CLAIM_WORKSPACE", workspace.path())
+            .env("TRELLIS_DRIFT_CLAIM_PROOF", &next_proof)
+            .env("TRELLIS_DRIFT_CLAIM_STAGE", "new")
             .output()
             .unwrap();
         assert!(
@@ -1428,12 +1428,12 @@ fn same_body_edit_without_executable_drift_is_proven_local_control() {
 /// work or an exclusive queue writer. No timing or polling is needed.
 #[test]
 fn maintenance_probe_external_child() {
-    let Ok(mode) = std::env::var("BALEYG_TEST_MAINTENANCE_PROBE_CHILD") else {
+    let Ok(mode) = std::env::var("TRELLIS_TEST_MAINTENANCE_PROBE_CHILD") else {
         return;
     };
-    let state = std::path::Path::new(&std::env::var("BALEYG_PROBE_STATE").unwrap()).to_path_buf();
+    let state = std::path::Path::new(&std::env::var("TRELLIS_PROBE_STATE").unwrap()).to_path_buf();
     let workspace =
-        std::path::Path::new(&std::env::var("BALEYG_PROBE_WORKSPACE").unwrap()).to_path_buf();
+        std::path::Path::new(&std::env::var("TRELLIS_PROBE_WORKSPACE").unwrap()).to_path_buf();
     let store = Store::open_for_tests(&state, &workspace).unwrap();
     if mode == "enqueue" {
         store
@@ -1472,9 +1472,9 @@ fn maintenance_probe_child(
         .arg("--exact")
         .arg("maintenance_probe_external_child")
         .arg("--nocapture")
-        .env("BALEYG_TEST_MAINTENANCE_PROBE_CHILD", mode)
-        .env("BALEYG_PROBE_STATE", state)
-        .env("BALEYG_PROBE_WORKSPACE", workspace)
+        .env("TRELLIS_TEST_MAINTENANCE_PROBE_CHILD", mode)
+        .env("TRELLIS_PROBE_STATE", state)
+        .env("TRELLIS_PROBE_WORKSPACE", workspace)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1533,7 +1533,7 @@ fn maintenance_probe_external_fifo_busy_and_inode_replacement() {
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
-    let (_, leader) = baleyg::index_coordinator::reconcile_workspace(
+    let (_, leader) = trellis::index_coordinator::reconcile_workspace(
         &store,
         &options,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1605,11 +1605,11 @@ fn maintenance_probe_rejects_wal_with_and_without_sidecars_without_mutation() {
         .enqueue_request(&IndexOptions::new(workspace.path().to_owned()), None)
         .unwrap();
     let path = store.request_db_path();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
         Some(workspace.path()),
         workspace.path(),
     )

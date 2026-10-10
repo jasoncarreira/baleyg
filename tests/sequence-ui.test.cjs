@@ -18,7 +18,7 @@ function render(participants) {
   });
   const container = new Element("div");
   const steps = participants.filter(p=>p.id !== "seed").map(p=>({id:`call-${p.id}`,kind:"call",label:"sample",target:p.id,path:"main.rs",range:{startLine:1,endLine:1}}));
-  window.BaleygSequence.render(container, {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},seed: {id:"seed",name:"sample"},participants,steps}, () => {});
+  window.TrellisSequence.render(container, {revision:{indexGeneration:"12345678-1234-4123-8123-123456789abc",indexRevision:1},seed: {id:"seed",name:"sample"},participants,steps}, () => {});
   function all(node) { return [node, ...node.children.flatMap(all)]; }
   return all(container);
 }
@@ -28,7 +28,7 @@ test("terminal sequence guard 1: external participant provenance and labels rema
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-0",label:"guessed-0",kind:"internal",identification:"old lexical match"};
   const step={id:"call-0",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -43,7 +43,7 @@ test("terminal sequence guard 2: older participant DTOs still render without ide
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-1",label:"guessed-1",kind:"internal",identification:"old lexical match"};
   const step={id:"call-1",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -64,7 +64,7 @@ test("call groups collapse, expand by keyboard, preserve source and scroll, and 
   const nodes=()=>all(container);
   const count=()=>nodes().filter(n=>n.attrs["data-kind"]==="call").length;
   const control=()=>nodes().find(n=>n.attrs.class==="sequence-group-control");
-  window.BaleygSequence.render(container,view,s=>source.push(s));
+  window.TrellisSequence.render(container,view,s=>source.push(s));
   assert.equal(count(),0); assert.equal(control().attrs["aria-expanded"],"false");
   nodes().find(n=>n.attrs.class==="sequence-source").listeners.click(); assert.equal(source[0],group);
   let prevented=false;
@@ -74,7 +74,7 @@ test("call groups collapse, expand by keyboard, preserve source and scroll, and 
   nodes().filter(n=>n.attrs.class==="sequence-source")[1].listeners.click(); assert.equal(source[1].callId,"one");
   control().listeners.click(); assert.equal(count(),0);
   control().listeners.keydown({key:" ",preventDefault(){}}); assert.equal(count(),3);
-  window.BaleygSequence.render(container,view,s=>source.push(s)); assert.equal(count(),0);
+  window.TrellisSequence.render(container,view,s=>source.push(s)); assert.equal(count(),0);
 });
 
 
@@ -84,7 +84,7 @@ test("terminal sequence guard 3: collapsed chain previews the first measured arr
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-2",label:"guessed-2",kind:"internal",identification:"old lexical match"};
   const step={id:"call-2",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -99,7 +99,7 @@ test("terminal sequence guard 4: groups without a flat, visible, targeted entry 
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-3",label:"guessed-3",kind:"internal",identification:"old lexical match"};
   const step={id:"call-3",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -113,7 +113,7 @@ function diagram(view, options = {}, expanded = new Set()) {
   vm.runInNewContext(fs.readFileSync("web/sequence.js", "utf8"), {window, document:{createElementNS:(_, tag)=>new Element(tag)}});
   const container = new Element("div"); container.scrollTop = 71; container.scrollLeft = 19;
   const all = n => [n, ...n.children.flatMap(all)];
-  const render = (nextOptions = options, nextView = view) => window.BaleygSequence.render(container, nextView, step=>sources.push(step), expanded, nextOptions);
+  const render = (nextOptions = options, nextView = view) => window.TrellisSequence.render(container, nextView, step=>sources.push(step), expanded, nextOptions);
   render();
   return {container, sources, selected, render, nodes:()=>all(container),
     row:id=>all(container).find(n=>n.attrs["data-source-step-id"] === id),
@@ -208,7 +208,7 @@ test("terminal sequence guard 5: call provenance has distinct strokes and labels
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-4",label:"guessed-4",kind:"internal",identification:"old lexical match"};
   const step={id:"call-4",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -223,7 +223,7 @@ test("terminal sequence guard 6: long chain entry names keep the measured arrow,
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-5",label:"guessed-5",kind:"internal",identification:"old lexical match"};
   const step={id:"call-5",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -238,7 +238,7 @@ test("terminal sequence guard 7: hidden-only lanes are omitted and visible lanes
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-6",label:"guessed-6",kind:"internal",identification:"old lexical match"};
   const step={id:"call-6",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -354,7 +354,7 @@ test("terminal sequence guard 8: workflow-shaped sequence keeps all measured cal
   const container=new Element("div"), opened=[];
   const candidate={id:"candidate-7",label:"guessed-7",kind:"internal",identification:"old lexical match"};
   const step={id:"call-7",kind:"call",label:"measured call",target:candidate.id,resolution:"internal",path:"main.rs",range:{startLine:1,endLine:1}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"},candidate],steps:[step]},item=>opened.push(item));
   const all=node=>[node,...node.children.flatMap(all)], nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-participant-label").length,1);
@@ -431,7 +431,7 @@ test("future terminal DTO without target keeps call text and source action",()=>
   const window={};vm.runInNewContext(fs.readFileSync("web/sequence.js","utf8"),{window,document:{createElementNS:(_,tag)=>new Element(tag)}});
   const container=new Element("div"),opened=[];
   const call={id:"future",kind:"call",label:"open",path:"main.rs",range:{startLine:3,endLine:3}};
-  window.BaleygSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"}],steps:[call]},step=>opened.push(step));
+  window.TrellisSequence.render(container,{seed:{id:"seed",name:"measured"},participants:[{id:"seed",label:"measured",kind:"method"}],steps:[call]},step=>opened.push(step));
   const all=node=>[node,...node.children.flatMap(all)],nodes=all(container);
   assert.equal(nodes.filter(node=>node.attrs.class==="sequence-arrow").length,0);
   assert.ok(nodes.some(node=>node.textContent==="open"));

@@ -134,7 +134,7 @@ implement javac without confirming that change.
 
 ### JDT ASTParser (direct-engine option after approved acquisition)
 
-Use a small Baleyg-owned Java helper, not Eclipse IDE, JDT Language Server,
+Use a small Trellis-owned Java helper, not Eclipse IDE, JDT Language Server,
 Gradle tooling, or a project import. Configure `ASTParser` in compilation-unit
 mode with a verified Java 25 DOM/compliance level, explicit compiler options,
 UTF-8 encodings, source roots and a deterministic binary environment. Enable
@@ -169,7 +169,7 @@ level instead of parsing Java 25 with older recovery and calling it semantic.
 
 Use JDK 25's `JavaCompiler`, `JavacTask.parse()` and `analyze()`, `Trees`,
 `SourcePositions`, `Elements` and `Types`. Stop before `generate()` and never
-call application entry points. A Baleyg-owned file manager supplies approved
+call application entry points. A Trellis-owned file manager supplies approved
 source snapshots and reads approved binary metadata only.
 
 Set `-proc:none`, `-implicit:none`, `-encoding UTF-8`, and `--release 25`.
@@ -313,7 +313,7 @@ They describe the indexed revision, not a live revalidation of disk state.
 classpath and module path; no build-output roots or generated sources. Main and
 test sources are separate source sets. No guessed source roots, implicit imports
 from arbitrary folders, wildcard cache jars, or evaluation of build scripts.
-Start with small synthetic fixtures owned by Baleyg, not the private application.
+Start with small synthetic fixtures owned by Trellis, not the private application.
 
 A source-only run may resolve self-contained source calls and JDK methods. It
 cannot resolve most framework/generated behavior. Overall application
@@ -353,7 +353,7 @@ abort publication rather than publish a misleading complete revision.
 1. Finalize engine choice and exact authorization below.
 2. Add a pure Rust overlay validator/manifest module and optional schema fields.
    Keep navigation workers' files untouched until their changes are integrated.
-3. Add the isolated Java helper under a Baleyg runtime directory and tests using
+3. Add the isolated Java helper under a Trellis runtime directory and tests using
    synthetic Java only. No build system is needed for the javac alternative.
 4. Add an explicit opt-in index option and private artifact handling. Default
    indexing remains syntax-only; missing tooling has deterministic fallback.
@@ -394,7 +394,7 @@ Required tests:
   network access. Exercise timeout, cancellation, malformed helper JSON,
   symlink/path rejection and output limits. Flags are not the sole assertion.
 
-Run Baleyg's native Rust test commands after implementation, including targeted
+Run Trellis's native Rust test commands after implementation, including targeted
 `java_indexer`, `java_behavior`, `store`, `planning`, `questions_http` and
 `java_python_http` suites. Add an offline optional helper integration suite with
 an explicit JDK/tool path; ordinary lexical tests must not need Java or downloads.
@@ -423,16 +423,16 @@ Runtime dispatch analysis is a separate future feature, not this slice.
    before acquisition. Direct ASTParser is a third option, not an LSP server.
 2. **If JDT/JDT LS:** authorize acquisition of only the reviewed compiler/server
    tool runtime from named official artifact repositories or official release
-   distributions into a Baleyg-owned cache, with pinned versions/hashes/license
+   distributions into a Trellis-owned cache, with pinned versions/hashes/license
    review. This does not authorize
    application dependency downloads. No acquisition is authorized yet.
 3. **Implementation/synthetic execution:** authorize compiling and running only
-   the Baleyg-owned helper against synthetic fixtures, outside the private app,
+   the Trellis-owned helper against synthetic fixtures, outside the private app,
    with no processors/plugins/build tools/network and no application class loading.
 4. **Application pilot:** separately approve compiler static analysis of specified
    cached application source snapshots. This permits parsing/type attribution,
    not running application code, build scripts or annotation processors. Keep
-   all source-bearing output in the private Baleyg state directory.
+   all source-bearing output in the private Trellis state directory.
 5. **Coverage beyond source-only:** provide/approve an ordered classpath and
    source-set manifest. Selecting all cached jars is not acceptable. Generated
    outputs require their own explicit input/provenance decision.

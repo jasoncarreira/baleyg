@@ -4,9 +4,9 @@ Status: architecture and staged implementation plan. The first bounded Rust cata
 
 ## User requirement
 
-Baleyg must automatically discover and index included libraries. The design must support multiple languages and ecosystems on multiple operating systems, not depend on a particular developer machine, Homebrew layout, or manually entered library roots.
+Trellis must automatically discover and index included libraries. The design must support multiple languages and ecosystems on multiple operating systems, not depend on a particular developer machine, Homebrew layout, or manually entered library roots.
 
-Classes and types must be usable as diagram participants. Calls into third-party libraries must stop at those participants. Baleyg must not expand a third-party implementation into sequence behavior, even when source or semantic evidence is available.
+Classes and types must be usable as diagram participants. Calls into third-party libraries must stop at those participants. Trellis must not expand a third-party implementation into sequence behavior, even when source or semantic evidence is available.
 
 The existing manual Rust source browser does **not** fulfill this requirement. It is useful infrastructure for source inspection only. Automatic source discovery also does not, by itself, resolve receiver types or call targets.
 
@@ -85,7 +85,7 @@ Bottom line: replace manual-root-first product direction with automatic local-on
 
 ### Stage 3: exact semantic links
 
-- **Current blocker:** rust-analyzer is unavailable in the researched environment, and Baleyg has no Rust semantic integration. This plan does not claim exact Rust receiver or dispatch resolution.
+- **Current blocker:** rust-analyzer is unavailable in the researched environment, and Trellis has no Rust semantic integration. This plan does not claim exact Rust receiver or dispatch resolution.
 - A trusted, explicitly approved semantic adapter or imported artifact must supply source-matched evidence before links are labeled resolved.
 - Tests cover module/import/re-export lookup, aliases and shadowing, feature/target/cfg assumptions, receiver inference, generics, autoderef/autoref, trait selection, and fluent return types.
 - Definition resolution and concrete dispatch resolution have different evidence labels. A trait declaration returned by a definition service is not proof of a concrete runtime receiver.

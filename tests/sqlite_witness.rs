@@ -1,16 +1,16 @@
-use baleyg::{indexer::IndexOptions, store::Store};
 use rusqlite::Connection;
 use std::{path::Path, process::Command, time::Duration};
+use trellis::{indexer::IndexOptions, store::Store};
 
 // A separate process detects lost POSIX fcntl locks; a second thread cannot.
 #[test]
 fn sqlite_writer_child() {
-    let Some(path) = std::env::var_os("BALEYG_WITNESS_LOCK_CHILD") else {
+    let Some(path) = std::env::var_os("TRELLIS_WITNESS_LOCK_CHILD") else {
         return;
     };
     let db = Connection::open(path).unwrap();
     db.busy_timeout(Duration::ZERO).unwrap();
-    let update = if std::env::var_os("BALEYG_WITNESS_QUEUE").is_some() {
+    let update = if std::env::var_os("TRELLIS_WITNESS_QUEUE").is_some() {
         "UPDATE requests SET submitted_at=submitted_at||'!' WHERE seq=1"
     } else {
         "UPDATE index_metadata SET last_opened_at=last_opened_at+1"
@@ -33,9 +33,9 @@ fn contender(path: &Path) -> i32 {
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.arg("--exact")
         .arg("sqlite_writer_child")
-        .env("BALEYG_WITNESS_LOCK_CHILD", path);
+        .env("TRELLIS_WITNESS_LOCK_CHILD", path);
     if path.file_name().is_some_and(|name| name == "requests.db") {
-        cmd.env("BALEYG_WITNESS_QUEUE", "1");
+        cmd.env("TRELLIS_WITNESS_QUEUE", "1");
     }
     cmd.output().unwrap().status.code().unwrap()
 }
@@ -137,14 +137,14 @@ fn live_request_writer_survives_queue_worker_reads() {
 // mask leaked old inodes behind other tests' process-wide cache.
 #[test]
 fn corrupt_index_recreation_child() {
-    if std::env::var_os("BALEYG_RECREATE_CHILD").is_none() {
+    if std::env::var_os("TRELLIS_RECREATE_CHILD").is_none() {
         return;
     }
-    use baleyg::index_coordinator::reconcile_workspace;
     use std::{
         os::unix::fs::MetadataExt,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::index_coordinator::reconcile_workspace;
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -192,7 +192,7 @@ fn corrupt_index_recreation_preserves_queue_and_replaces_only_index_inode() {
     let outcome = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("corrupt_index_recreation_child")
-        .env("BALEYG_RECREATE_CHILD", "1")
+        .env("TRELLIS_RECREATE_CHILD", "1")
         .output()
         .unwrap();
     assert!(
@@ -205,17 +205,17 @@ fn corrupt_index_recreation_preserves_queue_and_replaces_only_index_inode() {
 
 #[test]
 fn gc_releases_only_deleted_candidate_witnesses_child() {
-    if std::env::var_os("BALEYG_GC_WITNESS_CHILD").is_none() {
+    if std::env::var_os("TRELLIS_GC_WITNESS_CHILD").is_none() {
         return;
     }
-    use baleyg::{
+    use std::sync::{Arc, atomic::AtomicBool};
+    use trellis::{
         index_coordinator::reconcile_workspace,
         store::{
             retained_sqlite_witness_count_for_tests,
             topology::{TopologyRoots, WorkspaceIdentity},
         },
     };
-    use std::sync::{Arc, atomic::AtomicBool};
     let state = tempfile::tempdir().unwrap();
     let old = tempfile::tempdir().unwrap();
     let current = tempfile::tempdir().unwrap();
@@ -287,7 +287,7 @@ fn gc_releases_only_deleted_candidate_witnesses() {
             "gc_releases_only_deleted_candidate_witnesses_child",
             "--nocapture",
         ])
-        .env("BALEYG_GC_WITNESS_CHILD", "1")
+        .env("TRELLIS_GC_WITNESS_CHILD", "1")
         .output()
         .unwrap();
     assert!(
@@ -300,7 +300,7 @@ fn gc_releases_only_deleted_candidate_witnesses() {
 
 #[test]
 fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
-    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
     let state = tempfile::tempdir().unwrap();
     let current_root = tempfile::tempdir().unwrap();
     let candidate_root = tempfile::tempdir().unwrap();
@@ -352,7 +352,7 @@ fn gc_fault_after_first_unlink_reports_partial_failure_not_success() {
 
 #[test]
 fn gc_fault_after_parent_sync_reports_error_before_last_lock_removal() {
-    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
     let state = tempfile::tempdir().unwrap();
     let current_root = tempfile::tempdir().unwrap();
     let candidate_root = tempfile::tempdir().unwrap();

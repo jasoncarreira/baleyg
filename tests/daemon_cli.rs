@@ -18,22 +18,25 @@ fn short_temp() -> TempDir {
 }
 
 /// Explicit platform parameter lets the Linux fixture rule run on macOS too.
-fn fixture_roots_for(home: &Path, host: &str) -> baleyg::store::topology::TopologyRoots {
+fn fixture_roots_for(home: &Path, host: &str) -> trellis::store::topology::TopologyRoots {
     let (cache, data) = match host {
         "macos" => (
-            home.join("Library/Caches/dev.odin.baleyg"),
-            home.join("Library/Application Support/dev.odin.baleyg"),
+            home.join("Library/Caches/dev.squashmerge.trellis"),
+            home.join("Library/Application Support/dev.squashmerge.trellis"),
         ),
-        "linux" => (home.join(".cache/baleyg"), home.join(".local/share/baleyg")),
+        "linux" => (
+            home.join(".cache/trellis"),
+            home.join(".local/share/trellis"),
+        ),
         other => panic!("unsupported fixture host: {other}"),
     };
-    baleyg::store::topology::TopologyRoots::isolated_for_tests(cache, data)
+    trellis::store::topology::TopologyRoots::isolated_for_tests(cache, data)
 }
-fn fixture_roots(home: &Path) -> baleyg::store::topology::TopologyRoots {
+fn fixture_roots(home: &Path) -> trellis::store::topology::TopologyRoots {
     fixture_roots_for(home, std::env::consts::OS)
 }
-fn fixture_socket_paths(home: &Path) -> baleyg::daemon::SocketPaths {
-    baleyg::daemon::SocketPaths::new(&fixture_roots(home).data)
+fn fixture_socket_paths(home: &Path) -> trellis::daemon::SocketPaths {
+    trellis::daemon::SocketPaths::new(&fixture_roots(home).data)
 }
 
 #[test]
@@ -42,17 +45,20 @@ fn fixture_home_roots_match_linux_and_macos_layouts() {
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
     let linux = fixture_roots_for(&home, "linux");
-    assert_eq!(linux.cache, home.join(".cache/baleyg"));
-    assert_eq!(linux.data, home.join(".local/share/baleyg"));
+    assert_eq!(linux.cache, home.join(".cache/trellis"));
+    assert_eq!(linux.data, home.join(".local/share/trellis"));
     assert_ne!(
         linux.data,
-        home.join("Library/Application Support/dev.odin.baleyg")
+        home.join("Library/Application Support/dev.squashmerge.trellis")
     );
     let mac = fixture_roots_for(&home, "macos");
-    assert_eq!(mac.cache, home.join("Library/Caches/dev.odin.baleyg"));
+    assert_eq!(
+        mac.cache,
+        home.join("Library/Caches/dev.squashmerge.trellis")
+    );
     assert_eq!(
         mac.data,
-        home.join("Library/Application Support/dev.odin.baleyg")
+        home.join("Library/Application Support/dev.squashmerge.trellis")
     );
     #[cfg(target_os = "linux")]
     {
@@ -81,8 +87,8 @@ fn fixture_daemon_diagnostic(home: &Path, expected: &Path) -> String {
     use std::os::unix::fs::FileTypeExt;
     let candidates = [
         fixture_socket_paths(home).socket,
-        baleyg::daemon::SocketPaths::new(&fixture_roots_for(home, "macos").data).socket,
-        baleyg::daemon::SocketPaths::new(&fixture_roots_for(home, "linux").data).socket,
+        trellis::daemon::SocketPaths::new(&fixture_roots_for(home, "macos").data).socket,
+        trellis::daemon::SocketPaths::new(&fixture_roots_for(home, "linux").data).socket,
     ];
     let observed: Vec<_> = candidates
         .iter()
@@ -115,7 +121,7 @@ fn fixture_daemon_diagnostic(home: &Path, expected: &Path) -> String {
 }
 
 fn cli(home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trellis"));
     command
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
@@ -217,8 +223,8 @@ async fn ready(client: &reqwest::Client, address: SocketAddr, child: &mut Child)
 
 #[test]
 fn serve_request_preserves_explicit_default_file_cap_presence() {
-    use baleyg::daemon::{SocketOwner, protocol};
     use std::sync::mpsc;
+    use trellis::daemon::{SocketOwner, protocol};
     let temp = short_temp();
     let home = temp.path().join("home");
     fs::create_dir(&home).unwrap();
@@ -286,7 +292,7 @@ fn serve_request_preserves_explicit_default_file_cap_presence() {
         }
         let stderr = bounded_fixture_stderr(&stderr_path);
         assert!(
-            stderr.contains("Baleyg:"),
+            stderr.contains("Trellis:"),
             "serve did not receive fake acknowledgement: {stderr}; {}",
             fixture_daemon_diagnostic(&home, &fixture_socket_paths(&home).socket)
         );
@@ -333,7 +339,7 @@ fn daemon_keeps_private_socket_after_transient_accept_errors() {
         let mut command = cli(&home);
         command
             .arg("daemon")
-            .env("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
+            .env("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE", fault);
         let mut owner = detached(command);
         let socket = fixture_socket_paths(&home).socket;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -450,7 +456,7 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
         .unwrap();
     assert_eq!(status.status(), reqwest::StatusCode::OK);
     assert_eq!(status.json::<Value>().await.unwrap()["activeCheckouts"], 0);
-    let first_key = baleyg::store::topology::WorkspaceIdentity::discover(Some(&first), &first)
+    let first_key = trellis::store::topology::WorkspaceIdentity::discover(Some(&first), &first)
         .unwrap()
         .root_key;
     for (method, path) in [
@@ -471,8 +477,8 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
             "{method} {path}"
         );
         assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(!response.headers().contains_key("X-Baleyg-Workspace"));
-        assert!(!response.headers().contains_key("X-Baleyg-Catching-Up"));
+        assert!(!response.headers().contains_key("X-Trellis-Workspace"));
+        assert!(!response.headers().contains_key("X-Trellis-Catching-Up"));
         let state = client
             .get(format!("http://{address}/api/daemon/status"))
             .bearer_auth(token.trim())
@@ -505,10 +511,10 @@ async fn executable_daemon_is_socket_only_until_explicit_serve_and_registers_two
     .await
     .unwrap();
     assert_eq!(
-        selected.headers()["X-Baleyg-Workspace"],
+        selected.headers()["X-Trellis-Workspace"],
         fs::canonicalize(&first).unwrap().to_str().unwrap()
     );
-    assert!(selected.headers().contains_key("X-Baleyg-Catching-Up"));
+    assert!(selected.headers().contains_key("X-Trellis-Catching-Up"));
     let selected: Value = selected.json().await.unwrap();
     assert_eq!(
         selected["workspaceRoot"],
@@ -817,7 +823,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
     let mut command = cli(&homes[0]);
     command
         .arg("daemon")
-        .env("BALEYG_TEST_DAEMON_PID_FILE", &pid_file);
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", &pid_file);
     let mut recovered = detached(command);
     let deadline = Instant::now() + Duration::from_secs(10);
     assert!(recovered.0.try_wait().unwrap().is_none());
@@ -872,7 +878,7 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
         "recovered daemon exited before protocol proof: {}",
         fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
     );
-    use baleyg::daemon::protocol;
+    use trellis::daemon::protocol;
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .expect("recovered socket connected after the original 10-second deadline");
@@ -935,8 +941,8 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
 
 #[tokio::test]
 async fn daemon_scheduler_follows_held_checkout_leader_then_claims_same_cli_request() {
-    use baleyg::store::topology::WorkspaceIdentity;
     use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    use trellis::store::topology::WorkspaceIdentity;
 
     let temp = short_temp();
     let home = temp.path().join("home");
@@ -1250,7 +1256,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     let log = temp.path().join("serve.log");
     let mut command = serve(&home, &root, address, &token);
     command
-        .env("BALEYG_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
+        .env("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(fs::File::create(&log).unwrap()));
     let mut served = Owned(command.spawn().unwrap());
@@ -1258,7 +1264,7 @@ async fn serve_arms_sigterm_before_banner_to_control_wait() {
     loop {
         if fs::read_to_string(&log)
             .unwrap()
-            .contains(&format!("Baleyg: http://{address}/"))
+            .contains(&format!("Trellis: http://{address}/"))
         {
             break;
         }

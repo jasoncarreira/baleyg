@@ -1,12 +1,12 @@
 mod common;
-use baleyg::{
-    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
-    model::*,
-};
 use std::{
     collections::BTreeSet,
     fs,
     sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
+    indexer::{IndexOptions, index_workspace, index_workspace_bundle},
+    model::*,
 };
 fn run(options: &IndexOptions) -> Graph {
     index_workspace(options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap()

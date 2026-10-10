@@ -147,7 +147,7 @@ export async function main(packetArg,outputArg,...flags) {
     child.stderr.on('data',chunk=>{if(diagnosticBytes<65536){const line=redactedDiagnostic(chunk.toString());fs.writeSync(log,line);diagnosticBytes+=line.length;}});
     let wireBytes=0;
     child.stdout.on('data',chunk=>{wireBytes+=chunk.length;if(wireBytes>2_000_000) rejectAbort(new Error('ACP output limit exceeded'));});
-    connection=client({name:'baleyg-selection-smoke'})
+    connection=client({name:'trellis-selection-smoke'})
       .onRequest(methods.client.session.requestPermission,({params})=>{
         const decision=permissionDecision(packet,params), allowed=decision.outcome.outcome==='selected';
         if(!allowed) permissionsDenied++;
@@ -176,7 +176,7 @@ export async function main(packetArg,outputArg,...flags) {
     timer=setTimeout(()=>rejectAbort(new Error('ACP timeout')),120000);
     const run=async()=>{
       phase('initialize');
-      const initialized=await connection.agent.request('initialize',{protocolVersion:PROTOCOL_VERSION,clientInfo:{name:'baleyg-selection-smoke',version:'1.0.0'},clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}});
+      const initialized=await connection.agent.request('initialize',{protocolVersion:PROTOCOL_VERSION,clientInfo:{name:'trellis-selection-smoke',version:'1.0.0'},clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}});
       record.negotiated={protocolVersion:initialized.protocolVersion,agentInfo:initialized.agentInfo,agentCapabilities:initialized.agentCapabilities};
       if(initialized.protocolVersion!==PROTOCOL_VERSION) throw new Error('Unsupported ACP protocol');
       phase('session');

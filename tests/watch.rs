@@ -1,37 +1,37 @@
 //! Leader-owned watcher and durable FIFO share one native publication stream.
-use baleyg::{
-    index_coordinator::{self, LeaderWork},
-    indexer::IndexOptions,
-    store::Store,
-};
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
+};
+use trellis::{
+    index_coordinator::{self, LeaderWork},
+    indexer::IndexOptions,
+    store::Store,
 };
 
 // Child-process fixture for the pre-daemon HTTP serving path. This preserves
 // selected API and watcher assertions while the production CLI uses its daemon.
 #[tokio::test]
 async fn legacy_http_fixture_entry() -> anyhow::Result<()> {
-    use baleyg::{
+    use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering};
+    use trellis::{
         auth,
         dependencies::CatalogOptions,
         http,
         store::topology::{TopologyRoots, WorkspaceIdentity},
     };
-    use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering};
-    if std::env::var("BALEYG_LEGACY_HTTP_FIXTURE").as_deref() != Ok("1") {
+    if std::env::var("TRELLIS_LEGACY_HTTP_FIXTURE").as_deref() != Ok("1") {
         return Ok(());
     }
     let cwd = std::env::current_dir()?;
     let workspace =
-        PathBuf::from(std::env::var_os("BALEYG_LEGACY_WORKSPACE").expect("fixture workspace"));
-    let bind: SocketAddr = std::env::var("BALEYG_LEGACY_BIND")?.parse()?;
+        PathBuf::from(std::env::var_os("TRELLIS_LEGACY_WORKSPACE").expect("fixture workspace"));
+    let bind: SocketAddr = std::env::var("TRELLIS_LEGACY_BIND")?.parse()?;
     anyhow::ensure!(bind.ip().is_loopback(), "fixture requires loopback bind");
     let token_path =
-        PathBuf::from(std::env::var_os("BALEYG_LEGACY_TOKEN_FILE").expect("fixture token file"));
-    let max_file_bytes = std::env::var("BALEYG_LEGACY_MAX_FILE_BYTES")
+        PathBuf::from(std::env::var_os("TRELLIS_LEGACY_TOKEN_FILE").expect("fixture token file"));
+    let max_file_bytes = std::env::var("TRELLIS_LEGACY_MAX_FILE_BYTES")
         .unwrap_or_else(|_| "2097152".into())
         .parse::<u64>()?;
     anyhow::ensure!(
@@ -44,8 +44,8 @@ async fn legacy_http_fixture_entry() -> anyhow::Result<()> {
     roots.validate_external(&identity, std::slice::from_ref(&token_path))?;
     let identity = identity.attach_marker()?;
     let mut options = IndexOptions::new(identity.root.clone());
-    options.scip_path = std::env::var_os("BALEYG_LEGACY_SCIP").map(PathBuf::from);
-    options.manifest_path = std::env::var_os("BALEYG_LEGACY_MANIFEST").map(PathBuf::from);
+    options.scip_path = std::env::var_os("TRELLIS_LEGACY_SCIP").map(PathBuf::from);
+    options.manifest_path = std::env::var_os("TRELLIS_LEGACY_MANIFEST").map(PathBuf::from);
     options.anchor_optional_inputs(&cwd)?;
     options.max_file_bytes = max_file_bytes;
     let store = Store::open(roots, identity)?;
@@ -61,7 +61,7 @@ async fn legacy_http_fixture_entry() -> anyhow::Result<()> {
     let token = auth::load_or_create_token(&token_path)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let address = listener.local_addr()?;
-    let cargo_home = std::env::var_os("BALEYG_LEGACY_CARGO_HOME")
+    let cargo_home = std::env::var_os("TRELLIS_LEGACY_CARGO_HOME")
         .or_else(|| std::env::var_os("CARGO_HOME"))
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")));
@@ -86,7 +86,7 @@ async fn legacy_http_fixture_entry() -> anyhow::Result<()> {
         state.retry_failed_serving_startup();
     }
     state.start_dependency_index();
-    eprintln!("Baleyg: http://{address}/");
+    eprintln!("Trellis: http://{address}/");
     let shutdown_state = state.clone();
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(async move {
@@ -126,12 +126,12 @@ fn legacy_http_fixture(
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
         .env_remove("XDG_DATA_HOME")
-        .env("BALEYG_LEGACY_HTTP_FIXTURE", "1")
-        .env("BALEYG_LEGACY_WORKSPACE", root)
-        .env("BALEYG_LEGACY_BIND", bind.to_string())
-        .env("BALEYG_LEGACY_TOKEN_FILE", token);
+        .env("TRELLIS_LEGACY_HTTP_FIXTURE", "1")
+        .env("TRELLIS_LEGACY_WORKSPACE", root)
+        .env("TRELLIS_LEGACY_BIND", bind.to_string())
+        .env("TRELLIS_LEGACY_TOKEN_FILE", token);
     if let Some(max_file_bytes) = max_file_bytes {
-        command.env("BALEYG_LEGACY_MAX_FILE_BYTES", max_file_bytes);
+        command.env("TRELLIS_LEGACY_MAX_FILE_BYTES", max_file_bytes);
     }
     command
 }
@@ -242,7 +242,7 @@ fn post_cutoff_hint_stays_pending_after_first_publication() {
             true,
             (
                 |_, _| {},
-                |watch: &baleyg::watch::WatchSignals| {
+                |watch: &trellis::watch::WatchSignals| {
                     fs::write(&source, "function last() {}\n").unwrap();
                     watch.submit_event(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
                         DataChange::Content,
@@ -485,7 +485,7 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
                 "step {step}: {path} declaration missing"
             );
             let summarized =
-                |store: &Store, pin, declarations: Vec<baleyg::native_evidence::Declaration>| {
+                |store: &Store, pin, declarations: Vec<trellis::native_evidence::Declaration>| {
                     declarations
                         .into_iter()
                         .map(|d| {
@@ -553,7 +553,7 @@ fn edits_creates_renames_atomic_saves_and_deletes_match_cold_full() {
         let diagram = |store: &Store, pin| {
             let mut diagram = serde_json::to_value(
                 store
-                    .class_diagram_at(&baleyg::class_diagram::ClassDiagramRequest {
+                    .class_diagram_at(&trellis::class_diagram::ClassDiagramRequest {
                         seed: seed.clone(),
                         expected_revision: pin,
                         expanded: vec![],
@@ -739,7 +739,7 @@ fn cold_cli_failure(
 }
 
 fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::process::Command {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_trellis"));
     child
         .env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
@@ -754,12 +754,12 @@ fn cli(root: &std::path::Path, home: &std::path::Path, command: &str) -> std::pr
 fn finite_cli_owner_child() {
     use std::io::{Read, Write};
     use std::os::{fd::FromRawFd, unix::net::UnixStream};
-    let Ok(root) = std::env::var("BALEYG_TEST_FINITE_CLI_ROOT") else {
+    let Ok(root) = std::env::var("TRELLIS_TEST_FINITE_CLI_ROOT") else {
         return;
     };
     let root = std::path::PathBuf::from(root);
-    let roots = baleyg::store::topology::TopologyRoots::production().unwrap();
-    let identity = baleyg::store::topology::WorkspaceIdentity::discover(
+    let roots = trellis::store::topology::TopologyRoots::production().unwrap();
+    let identity = trellis::store::topology::WorkspaceIdentity::discover(
         Some(&root),
         &std::env::current_dir().unwrap(),
     )
@@ -1819,12 +1819,12 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
     }
     let cli_log = temp.path().join("actual-cli-stderr.log");
     let cli_output = temp.path().join("actual-cli-stdout.json");
-    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_baleyg"));
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_trellis"));
     let executable_before = sha2::Sha256::digest(fs::read(executable).unwrap());
     let actual = cli(&root, &home, "index")
         .arg("--max-file-bytes")
         .arg(B_MAX_BYTES.to_string())
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::from(
             fs::File::create(&cli_output).unwrap(),
         ))
@@ -1898,7 +1898,7 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
     drop(listener);
     let daemon_log = temp.path().join("follower-daemon-stderr.log");
     let daemon = legacy_http_fixture(&root, &home, address, &token, None)
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(
             fs::File::create(&daemon_log).unwrap(),
@@ -1994,7 +1994,7 @@ fn actual_cli_owner_edit_then_daemon_takeover_keeps_selected_b_options() {
                 |r| r.get(0),
             )
             .unwrap();
-        serde_json::from_str::<baleyg::indexer::ReconcileOptions>(&payload)
+        serde_json::from_str::<trellis::indexer::ReconcileOptions>(&payload)
             .unwrap()
             .max_file_bytes
     };
@@ -2311,7 +2311,7 @@ fn real_cli_preclaim_barrier_withheld_g_keeps_own_request_queued() {
         });
     }
     let child = command
-        .env("BALEYG_TEST_FINITE_CLI_FD", "3")
+        .env("TRELLIS_TEST_FINITE_CLI_FD", "3")
         .stdout(std::process::Stdio::from(
             fs::File::create(&owner_stdout).unwrap(),
         ))
@@ -2535,8 +2535,8 @@ async fn completed_cli_result_read_busy_keeps_done_and_requires_successor_reconc
         });
     }
     let child = command
-        .env("BALEYG_TEST_FINITE_CLI_FD", "3")
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .env("TRELLIS_TEST_FINITE_CLI_FD", "3")
+        .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .stdout(std::process::Stdio::from(
             fs::File::create(&owner_stdout).unwrap(),
         ))
@@ -2899,7 +2899,7 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
             .env("HOME", &home)
             .env_remove("XDG_CACHE_HOME")
             .env_remove("XDG_DATA_HOME")
-            .env("BALEYG_TEST_FINITE_CLI_ROOT", &root);
+            .env("TRELLIS_TEST_FINITE_CLI_ROOT", &root);
         command
     } else {
         cli(&root, &home, "index")
@@ -2915,12 +2915,12 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
     if direct_child {
         // The historical direct child did not write progress diagnostics
         // inside the EX/SQLite handoff. Keep its contention timing intact.
-        owner_command.env_remove("BALEYG_INDEX_DIAGNOSTICS");
+        owner_command.env_remove("TRELLIS_INDEX_DIAGNOSTICS");
     } else {
-        owner_command.env("BALEYG_INDEX_DIAGNOSTICS", "1");
+        owner_command.env("TRELLIS_INDEX_DIAGNOSTICS", "1");
     }
     let child = owner_command
-        .env("BALEYG_TEST_FINITE_CLI_FD", "3")
+        .env("TRELLIS_TEST_FINITE_CLI_FD", "3")
         .env("RUST_LIB_BACKTRACE", "1")
         .env("RUST_BACKTRACE", "1")
         .stdout(std::process::Stdio::from(
@@ -3046,12 +3046,12 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
     );
     let job: serde_json::Value = accepted.json().await.unwrap();
     assert_eq!(job["state"], "queued");
-    // The second process is the actual `baleyg index` CLI. Both foreign rows
+    // The second process is the actual `trellis index` CLI. Both foreign rows
     // must exist DURABLY before the first owner reaches its finite cutoff.
     let contender_log = temp.path().join("contender-stderr.log");
     let contender_stdout = temp.path().join("contender-stdout.log");
     let contender_process = cli(&root, &home, "index")
-        .env_remove("BALEYG_INDEX_DIAGNOSTICS")
+        .env_remove("TRELLIS_INDEX_DIAGNOSTICS")
         .env("RUST_LIB_BACKTRACE", "1")
         .stdout(std::process::Stdio::from(
             fs::File::create(&contender_stdout).unwrap(),
@@ -3688,14 +3688,14 @@ async fn cli_daemon_handoff_fixture(direct_child: bool) {
 
 #[tokio::test]
 async fn real_serve_pending_takeover_preserves_h_before_distinct_a_b_ack_pins() {
-    use baleyg::{
-        indexer::ReconcileOptions,
-        model::IndexPin,
-        store::topology::{TopologyRoots, WorkspaceIdentity},
-    };
     use std::os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, PermissionsExt},
+    };
+    use trellis::{
+        indexer::ReconcileOptions,
+        model::IndexPin,
+        store::topology::{TopologyRoots, WorkspaceIdentity},
     };
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const BEFORE: &str = "function a() {}\n";
@@ -3886,7 +3886,7 @@ async fn real_serve_pending_takeover_preserves_h_before_distinct_a_b_ack_pins() 
         let first = match store.request_by_id(&q1.id) {
             Ok(Some(row)) => row,
             Err(error)
-                if baleyg::store::terminal_status_sqlite_contention(&error)
+                if trellis::store::terminal_status_sqlite_contention(&error)
                     && Instant::now() < observation_until =>
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3897,7 +3897,7 @@ async fn real_serve_pending_takeover_preserves_h_before_distinct_a_b_ack_pins() 
         let second = match store.request_by_id(&q2.id) {
             Ok(Some(row)) => row,
             Err(error)
-                if baleyg::store::terminal_status_sqlite_contention(&error)
+                if trellis::store::terminal_status_sqlite_contention(&error)
                     && Instant::now() < observation_until =>
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4467,7 +4467,7 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
     let cancel = Arc::new(AtomicBool::new(false));
     let owner =
         index_coordinator::establish_serving_session(&store, Some(&options), &cancel).unwrap();
-    let daemon = baleyg::http::new(
+    let daemon = trellis::http::new(
         store.clone(),
         options.clone(),
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
@@ -4540,11 +4540,11 @@ fn daemon_root_loss_retries_busy_terminal_transition_without_serving_old_root() 
 
 #[test]
 fn ingress_filters_only_certain_excluded_noise_before_debounce() {
-    use baleyg::watch::WatchSignals;
     use notify::{
         Event, EventKind,
         event::{DataChange, ModifyKind, RenameMode},
     };
+    use trellis::watch::WatchSignals;
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path();
     fs::create_dir(root.join("target")).unwrap();
@@ -4611,11 +4611,11 @@ fn ingress_filters_only_certain_excluded_noise_before_debounce() {
 
 #[test]
 fn selected_input_inside_excluded_subtree_is_accepted() {
-    use baleyg::watch::WatchSignals;
     use notify::{
         Event, EventKind,
         event::{DataChange, ModifyKind},
     };
+    use trellis::watch::WatchSignals;
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path();
     fs::create_dir(root.join("target")).unwrap();
@@ -4634,12 +4634,12 @@ fn selected_input_inside_excluded_subtree_is_accepted() {
 
 #[test]
 fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
-    use baleyg::index_coordinator::{self, IndexJobCoordinator};
     use notify::{
         Event, EventKind,
         event::{DataChange, ModifyKind},
     };
     use std::sync::{Mutex, mpsc};
+    use trellis::index_coordinator::{self, IndexJobCoordinator};
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -4693,7 +4693,7 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
     release_tx.send(()).unwrap();
     assert_eq!(
         maintenance.join().unwrap().unwrap(),
-        baleyg::store::MaintenanceOutcome::Deferred
+        trellis::store::MaintenanceOutcome::Deferred
     );
     assert!(
         store.source_at("a.js", Some(old)).unwrap().is_some(),
@@ -4717,6 +4717,6 @@ fn accepted_watcher_intent_before_debounce_preempts_writer_unit() {
             .unwrap()
             .accepted_watch_intent(&options))
         .unwrap(),
-        baleyg::store::MaintenanceOutcome::Progress
+        trellis::store::MaintenanceOutcome::Progress
     );
 }

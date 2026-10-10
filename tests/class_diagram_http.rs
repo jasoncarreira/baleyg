@@ -5,19 +5,19 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use baleyg::{
-    class_diagram::ClassDiagramRequest,
-    http,
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-    store::Store,
-};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, atomic::AtomicBool},
 };
 use tower::ServiceExt;
+use trellis::{
+    class_diagram::ClassDiagramRequest,
+    http,
+    indexer::{IndexOptions, index_workspace},
+    model::*,
+    store::Store,
+};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const JAVA: &str = r#"package demo;
 class A extends B {
@@ -54,7 +54,7 @@ fn setup_with(
     Store,
     Graph,
     Router,
-    Arc<baleyg::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::LeaderSession>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -71,7 +71,7 @@ fn setup_with(
             &graph,
             &workspace,
             session.leader_guard().unwrap(),
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0
             },
@@ -97,7 +97,7 @@ fn setup() -> (
     Store,
     Graph,
     Router,
-    Arc<baleyg::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::LeaderSession>,
 ) {
     setup_with(JAVA)
 }
@@ -263,7 +263,7 @@ async fn authentication_strict_requests_revision_and_disconnected_expansion() {
         &graph,
         &dir.path().join("workspace"),
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation,
             index_revision: 1,
         },
@@ -379,7 +379,7 @@ fn selected_class_pagination_spans_paths_in_one_revision() {
 #[test]
 #[ignore = "release medium cohort: cargo test --release --test class_diagram_http selected_class_pages_medium_release_latency -- --ignored"]
 fn selected_class_pages_medium_release_latency() {
-    use baleyg::index_coordinator::IndexJobCoordinator;
+    use trellis::index_coordinator::IndexJobCoordinator;
     let scratch = tempfile::tempdir().unwrap();
     let canonical = scratch.path().join("canonical");
     let generated = std::process::Command::new("node")
@@ -568,7 +568,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
             &graph,
             &dir.path().join("workspace"),
             &leader,
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation: control.index_generation,
                 index_revision: 0
             },
@@ -586,7 +586,7 @@ fn failed_publication_keeps_projection_atomic_with_graph() {
             &graph,
             &dir.path().join("workspace"),
             &leader,
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation: control.index_generation,
                 index_revision: 1
             },
@@ -792,7 +792,7 @@ fn edge_limit_is_explicit_without_dangling_nodes() {
 }
 #[test]
 fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() {
-    use baleyg::classes::{ClassDefinition, ClassMember};
+    use trellis::classes::{ClassDefinition, ClassMember};
     // Real native multi-document source creates measured fields across multiple pages.
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
@@ -808,7 +808,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
     }
     let store = crate::common::open_store(&dir.path().join("state"), &workspace).unwrap();
     let session = store.leader_session().unwrap();
-    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(workspace.clone()),
         store.root_id(),
         &cancel(),
@@ -834,7 +834,7 @@ fn presentation_byte_budget_clips_members_and_paginates_without_skipping_rows() 
             .classes_at(None, "", Some(revision), offset, 100)
             .unwrap();
         assert!(
-            serde_json::to_vec(&page).unwrap().len() <= baleyg::class_diagram::MAX_RESPONSE_BYTES
+            serde_json::to_vec(&page).unwrap().len() <= trellis::class_diagram::MAX_RESPONSE_BYTES
         );
         for class in page.items {
             assert!(!class.truncated, "real measured fields must not be clipped");
@@ -1138,15 +1138,15 @@ fn hierarchy_mandatory_paths_reject_total_response_byte_overflow() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},
@@ -1413,15 +1413,15 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
     ).unwrap();
     assert_eq!(state, "ready");
     let file = graph.files.iter().find(|f| f.path == "Types.java").unwrap();
-    let expected = baleyg::classes::FileExtraction::extract_file(
+    let expected = trellis::classes::FileExtraction::extract_file(
         file,
         &graph.nodes,
         &cancel(),
-        baleyg::classes::Limits::default(),
+        trellis::classes::Limits::default(),
     )
     .unwrap();
     assert_eq!(
-        serde_json::from_str::<baleyg::classes::FileExtraction>(&stored).unwrap(),
+        serde_json::from_str::<trellis::classes::FileExtraction>(&stored).unwrap(),
         expected
     );
     let source = format!("/api/source?path=Types.java&{}", pin_query(pin));
@@ -1440,7 +1440,7 @@ async fn ready_file_extraction_is_persisted_and_selected_http_reads_attest_it() 
         "SELECT class_extraction_payload FROM graph_projections WHERE id=(SELECT graph_projection_id FROM revision_documents WHERE path='Types.java')",
         [], |r| r.get(0),
     ).unwrap();
-    let changed: baleyg::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
+    let changed: trellis::classes::FileExtraction = serde_json::from_str(&mutated).unwrap();
     assert!(expected.source_bytes > 0);
     assert_eq!(changed.source_bytes, 0);
     assert_ne!(changed, expected);
@@ -1526,7 +1526,7 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
     for version in ["one", "two"] {
         write_class_scip_labels(dir.path(), version);
         let (graph, native, capture) =
-            baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel(), |_| {})
+            trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel(), |_| {})
                 .unwrap();
         for (path, name) in [("A.java", "A"), ("a.py", "P"), ("a.js", "J")] {
             let symbol = graph
@@ -1641,7 +1641,7 @@ async fn changed_captured_class_scip_label_recomputes_f_and_new_revision_class_p
 
 #[tokio::test]
 async fn normal_size_captured_java_python_cold_oracle_attests_full_published_catalog() {
-    use baleyg::{
+    use trellis::{
         classes::{Catalog, FileExtraction, Limits},
         indexer::index_workspace_bundle,
     };
@@ -1904,7 +1904,7 @@ async fn retained_class_page_and_diagram_are_byte_stable_after_full_rewrite() {
     )
     .unwrap();
     assert_ne!(old, new_pin);
-    use baleyg::{
+    use trellis::{
         classes::{Catalog, FileExtraction, Limits},
         indexer::index_workspace_bundle,
     };

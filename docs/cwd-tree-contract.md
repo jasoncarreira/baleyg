@@ -8,7 +8,7 @@ Daemon browse root: explicit CLI --browse-root (optional); defaults to process c
 at startup. Existing API constructors/tests can default to IndexOptions.root; add
 new_with_browser_root(store,options,token,address,jev,acp,browse_root:PathBuf) for CLI.
 Root is immutable for server lifetime; client cannot choose an absolute root. Label it in UI.
-Current configured index workspace is a nested feature-factory sample under Baleyg cwd;
+Current configured index workspace is a nested feature-factory sample under Trellis cwd;
 map tree file absolute paths inside that workspace back to relative indexedPath when present
 in cache. Other files remain visible, labeled not indexed; never fabricate methods for Rust/etc.
 No implicit indexing or new workspace switch. Existing saved views/budgets stay bound to sample.

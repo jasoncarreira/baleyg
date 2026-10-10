@@ -3,7 +3,7 @@
 > Current language update: native Java and Python navigation/static sequences are now available.
 > See [support and boundaries](java-python-support.md). Historical first-pass limits below remain dated.
 
-This is a runnable foundation, not the complete Baleyg product. It implements explicit
+This is a runnable foundation, not the complete Trellis product. It implements explicit
 full JavaScript indexing, SQLite snapshots, a loopback API and an inspection client.
 No provider, ACP agent, shell, semantic indexer or source package script runs implicitly.
 
@@ -11,9 +11,9 @@ No provider, ACP agent, shell, semantic indexer or source package script runs im
 
 ```sh
 cargo run --locked -- index --workspace /path/to/repository
-mkdir -m 700 -p "$HOME/.baleyg-private"
+mkdir -m 700 -p "$HOME/.trellis-private"
 cargo run --locked -- serve --workspace /path/to/repository \
-  --token-file "$HOME/.baleyg-private/token"
+  --token-file "$HOME/.trellis-private/token"
 ```
 
 Open http://127.0.0.1:8877/. Read the private token file at the path printed by `serve`
@@ -29,7 +29,7 @@ stops serving. A cancellation request cannot undo a revision already committed.
 
 `--state-dir` is removed; there is no placement override or automatic old-state migration.
 Keep the token and optional Jev/ACP ledgers at explicit private paths outside the selected
-checkout and fixed topology. Move old in-checkout token/ledger data manually with Baleyg stopped.
+checkout and fixed topology. Move old in-checkout token/ledger data manually with Trellis stopped.
 The example above creates a private parent; a new token file is created with private permissions.
 
 `--bind 127.0.0.1:0` selects a free port. Non-loopback addresses are rejected. The first
@@ -47,12 +47,12 @@ cargo run --locked -- index \
   --scip tests/fixtures/extraction/feature-factory.scip \
   --manifest tests/fixtures/extraction/feature-factory.hashes.json
 
-mkdir -m 700 -p "$HOME/.baleyg-private"
+mkdir -m 700 -p "$HOME/.trellis-private"
 cargo run --locked -- serve \
   --workspace tests/fixtures/extraction/inputs/feature-factory \
   --scip tests/fixtures/extraction/feature-factory.scip \
   --manifest tests/fixtures/extraction/feature-factory.hashes.json \
-  --token-file "$HOME/.baleyg-private/token"
+  --token-file "$HOME/.trellis-private/token"
 ```
 
 Search for `transition`, select it, and inspect its immediate call sites. Read source
@@ -171,8 +171,8 @@ The disposable index schema is version **4**; durable record schema is version *
 Graph JSON schema version is **1**. Incompatible or incomplete durable records are refused,
 not silently reset or migrated. No downgrade or legacy-state migration is supplied.
 
-**Manual cleanup:** `baleyg gc --report` only prints read-only JSON inventory; it does
-not delete indexes. `baleyg forget <record-id>` removes one saved record only after
+**Manual cleanup:** `trellis gc --report` only prints read-only JSON inventory; it does
+not delete indexes. `trellis forget <record-id>` removes one saved record only after
 verified exclusive use and exact-ID interactive confirmation (or explicit `--yes`).
 It refuses unsafe contents and SQLite recovery sidecars even with `--yes`; resolve those
 manually rather than deleting them. Never remove a durable `workspace.db` to refresh an

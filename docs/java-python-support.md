@@ -1,6 +1,6 @@
 # Java and Python support
 
-Baleyg indexes `.java` and `.py` files with native tree-sitter adapters. They use the same
+Trellis indexes `.java` and `.py` files with native tree-sitter adapters. They use the same
 file → method → static sequence → cached source workflow as JavaScript and Rust.
 
 ## Included
@@ -38,7 +38,7 @@ output is bounded to 200 steps, 20 participants and depth 24, with explicit part
 ## Read-only operation and scope
 
 Indexing never runs Gradle/Maven, annotation processors, Python imports, build scripts, package
-installation or providers. Build/test commands for Baleyg itself are separate development work.
+installation or providers. Build/test commands for Trellis itself are separate development work.
 Supported root configuration files are hashed as data; nested/transitive compiler configuration
 and package environments are not attested.
 
@@ -53,14 +53,14 @@ files are not silently treated as JavaScript.
 
 ## Inspect another repository
 
-Run Baleyg from its own directory. Indexes and saved records use fixed per-user storage;
+Run Trellis from its own directory. Indexes and saved records use fixed per-user storage;
 `--state-dir` is removed. Put the required private token outside the inspected checkout:
 
 ```sh
-mkdir -m 700 -p "$HOME/.baleyg-private"
-target/debug/baleyg index --workspace /path/to/repository
-target/debug/baleyg serve --workspace /path/to/repository \
-  --token-file "$HOME/.baleyg-private/token" --bind 127.0.0.1:8879
+mkdir -m 700 -p "$HOME/.trellis-private"
+target/debug/trellis index --workspace /path/to/repository
+target/debug/trellis serve --workspace /path/to/repository \
+  --token-file "$HOME/.trellis-private/token" --bind 127.0.0.1:8879
 ```
 
 The file tree and index use the same workspace by default. Serving does not run the application

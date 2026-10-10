@@ -1,8 +1,3 @@
-use baleyg::{
-    classes::Catalog,
-    indexer::{IndexOptions, index_workspace},
-    model::{CancelFlag, Graph},
-};
 use std::{
     cell::Cell,
     fs,
@@ -10,6 +5,11 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+};
+use trellis::{
+    classes::Catalog,
+    indexer::{IndexOptions, index_workspace},
+    model::{CancelFlag, Graph},
 };
 thread_local! { static GOLDEN_ORDINAL: Cell<usize> = const { Cell::new(0) }; }
 fn golden(catalog: &Catalog) {
@@ -35,7 +35,7 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let git = temp.path().join(".git");
-    let private = git.join("baleyg");
+    let private = git.join("trellis");
     fs::create_dir(&git).unwrap();
     fs::create_dir(&private).unwrap();
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
@@ -54,7 +54,7 @@ fn fixture(files: &[(&str, &str)]) -> (Graph, Catalog) {
     golden(&catalog);
     (graph, catalog)
 }
-fn class<'a>(c: &'a Catalog, name: &str) -> &'a baleyg::classes::ClassDefinition {
+fn class<'a>(c: &'a Catalog, name: &str) -> &'a trellis::classes::ClassDefinition {
     c.classes
         .iter()
         .find(|c| c.qualified_name == name)
@@ -383,7 +383,7 @@ fn direct_python_methods_keep_measured_ids_including_legacy_function_kind() {
     assert!(method.symbol_id.is_some());
     assert_eq!(class(&c, "a.Owner").methods.len(), 1);
     let id = method.symbol_id.clone().unwrap();
-    g.nodes.iter_mut().find(|s| s.id == id).unwrap().kind = baleyg::model::SymbolKind::Function;
+    g.nodes.iter_mut().find(|s| s.id == id).unwrap().kind = trellis::model::SymbolKind::Function;
     let c = Catalog::build(&g.files, &g.nodes, &Arc::new(AtomicBool::new(false))).unwrap();
     assert_eq!(
         class(&c, "a.Owner").methods[0].symbol_id.as_ref(),
@@ -440,7 +440,7 @@ fn recovered_syntax_and_oversized_cached_sources_report_incompleteness() {
     assert!(c.truncated);
     assert!(c.warnings.iter().any(|w| w.contains("recovered syntax")));
     assert!(c.relations.iter().all(|r| r.target.is_none()));
-    let file = baleyg::model::SourceFile {
+    let file = trellis::model::SourceFile {
         path: "huge.py".into(),
         hash: "cached".into(),
         language: "python".into(),
@@ -592,15 +592,15 @@ fn cap_file(
     source_bytes: usize,
     registry_bytes: usize,
     class: bool,
-) -> baleyg::classes::FileExtraction {
-    let mut definition: baleyg::classes::ClassDefinition = serde_json::from_value(
+) -> trellis::classes::FileExtraction {
+    let mut definition: trellis::classes::ClassDefinition = serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][0].clone()
     ).unwrap();
     definition.symbol.path = path.into();
     definition.symbol.id = format!("class-{path}");
     definition.symbol.name = path.trim_end_matches(".java").into();
     definition.qualified_name = definition.symbol.name.clone();
-    baleyg::classes::FileExtraction {
+    trellis::classes::FileExtraction {
         path: path.into(),
         source_bytes,
         registry_bytes,
@@ -611,8 +611,8 @@ fn cap_file(
         items: if class { vec![cap_ref(path)] } else { vec![] },
     }
 }
-fn cap_ref(path: &str) -> baleyg::classes::DetailItem {
-    use baleyg::classes::{ClassRelation, DetailItem, DetailValue};
+fn cap_ref(path: &str) -> trellis::classes::DetailItem {
+    use trellis::classes::{ClassRelation, DetailItem, DetailValue};
     DetailItem {
         class_index: 0,
         records: 0,
@@ -632,10 +632,10 @@ fn cap_ref(path: &str) -> baleyg::classes::DetailItem {
 }
 fn cap_expected(
     name: &str,
-    files: &[baleyg::classes::FileExtraction],
+    files: &[trellis::classes::FileExtraction],
     count: usize,
     symbols: usize,
-    limits: baleyg::classes::Limits,
+    limits: trellis::classes::Limits,
 ) -> Catalog {
     let actual = Catalog::compose(files, count, symbols, limits).unwrap();
     let expected = fs::read(format!("tests/fixtures/classes/caps/{name}.json")).unwrap();
@@ -648,12 +648,12 @@ fn cap_expected(
 }
 #[test]
 fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
-    use baleyg::classes::{DetailItem, DetailValue, Limits};
+    use trellis::classes::{DetailItem, DetailValue, Limits};
     let ordinary = Limits::default();
     let a = cap_file("A.java", 1, 1, true);
     let b = cap_file("B.java", 1, 1, true);
     let empty = cap_file("0.java", 1, 1, false);
-    let warned = baleyg::classes::FileExtraction {
+    let warned = trellis::classes::FileExtraction {
         warnings: vec!["excluded warning".into()],
         truncated: true,
         ..b.clone()
@@ -683,7 +683,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     limits.classes = 1;
     cap_expected("classes-equal", std::slice::from_ref(&a), 1, 1, limits);
     cap_expected("classes-over", &[a.clone(), b.clone()], 2, 2, limits);
-    let member: baleyg::classes::ClassMember=serde_json::from_value(
+    let member: trellis::classes::ClassMember=serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
     ).unwrap();
     let mut first = member.clone();
@@ -741,7 +741,7 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     limits.output_text = 1;
     cap_expected("output-over", &[detailed_a, detailed_b], 2, 2, limits);
     let mut inside = cap_file("A.java", 1, 1, true);
-    let original: baleyg::classes::ClassMember = serde_json::from_value(
+    let original: trellis::classes::ClassMember = serde_json::from_value(
         serde_json::from_slice::<serde_json::Value>(include_bytes!("fixtures/classes/below-cap/java_members_inheritance_generics_and_nested_classes_are_source_bound-0.json")).unwrap()["classes"][4]["fields"][0].clone()
     ).unwrap();
     inside.items = std::iter::once(cap_ref("A.java"))
@@ -785,8 +785,8 @@ fn hand_authored_workspace_cap_boundaries_and_moving_cut() {
     );
     #[derive(serde::Serialize)]
     struct LaterProjection<'a> {
-        classes: Vec<&'a baleyg::classes::ClassDefinition>,
-        relations: Vec<&'a baleyg::classes::ClassRelation>,
+        classes: Vec<&'a trellis::classes::ClassDefinition>,
+        relations: Vec<&'a trellis::classes::ClassRelation>,
     }
     let later_projection = |catalog: &Catalog| {
         serde_json::to_vec(&LaterProjection {
@@ -824,7 +824,7 @@ fn warnings_dedupe_at_100_then_append_ordered_closers() {
     f.warnings = (0..105).map(|n| format!("warning-{n}")).collect();
     f.warnings.push("warning-3".into());
     f.registry_incomplete = true;
-    let c = Catalog::compose(&[f], 1, 1, baleyg::classes::Limits::default()).unwrap();
+    let c = Catalog::compose(&[f], 1, 1, trellis::classes::Limits::default()).unwrap();
     assert_eq!(c.warnings.len(), 102);
     assert_eq!(c.warnings[0], "warning-0");
     assert_eq!(c.warnings[99], "warning-99");
@@ -837,11 +837,11 @@ fn warnings_dedupe_at_100_then_append_ordered_closers() {
 
 #[test]
 fn class_registry_import_charge_tiny_native_pilot() {
-    use baleyg::{
+    use sha2::{Digest, Sha256};
+    use trellis::{
         indexer::{IndexOptions, index_workspace_bundle},
         store::topology::WorkspaceIdentity,
     };
-    use sha2::{Digest, Sha256};
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path();
     eprintln!(
@@ -892,7 +892,7 @@ fn class_registry_import_charge_tiny_native_pilot() {
             .filter(|s| {
                 s.path == "z.java"
                     && s.name == "Selected"
-                    && s.kind == baleyg::model::SymbolKind::Class
+                    && s.kind == trellis::model::SymbolKind::Class
             })
             .collect();
         assert_eq!(symbol.len(), 1, "measured class must be unique");
@@ -931,11 +931,11 @@ fn class_registry_import_charge_tiny_native_pilot() {
                 .unwrap();
             assert_eq!(document.content_hash, sha);
             assert_eq!(document.byte_length, size);
-            let f = baleyg::classes::FileExtraction::extract_file(
+            let f = trellis::classes::FileExtraction::extract_file(
                 file,
                 &graph.nodes,
                 &cancel,
-                baleyg::classes::Limits::default(),
+                trellis::classes::Limits::default(),
             )
             .unwrap();
             assert_eq!(f.source_bytes, size, "{path}");
@@ -958,7 +958,7 @@ fn class_registry_import_charge_tiny_native_pilot() {
 
 #[test]
 fn production_class_limits_are_fixed_at_decision_0004_values() {
-    let limits = baleyg::classes::Limits::default();
+    let limits = trellis::classes::Limits::default();
     assert_eq!(limits.file_bytes, 2 * 1024 * 1024);
     assert_eq!(limits.total_bytes, 256 * 1024 * 1024);
     assert_eq!(limits.visits, 100_000);
@@ -977,7 +977,7 @@ fn production_class_limits_are_fixed_at_decision_0004_values() {
 
 #[test]
 fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details() {
-    use baleyg::classes::{DetailValue, FileExtraction, Limits};
+    use trellis::classes::{DetailValue, FileExtraction, Limits};
     let extract = |path: &str, source: &str, limits: Limits| {
         let work = tempfile::tempdir().unwrap();
         fs::write(work.path().join(path), source).unwrap();
@@ -1076,7 +1076,7 @@ fn tiny_limits_control_measured_names_import_bindings_and_type_parameter_details
 
 #[test]
 fn decision_0004_per_file_f_is_independent_of_other_workspace_documents() {
-    use baleyg::classes::{FileExtraction, Limits};
+    use trellis::classes::{FileExtraction, Limits};
     let temp = tempfile::tempdir().unwrap();
     let a = temp.path().join("A.java");
     let b = temp.path().join("B.java");

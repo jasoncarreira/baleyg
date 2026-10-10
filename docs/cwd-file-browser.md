@@ -8,7 +8,7 @@ Contiguous directories with exactly one child directory and no other complete en
 compact `/`-joined row. Opening that row follows the chain with bounded sequential metadata reads.
 Branches, files, incomplete pages, truncation, loading and errors remain separate and visible.
 
-The running inspector now browses and indexes Baleyg itself. A file gets methods only when
+The running inspector now browses and indexes Trellis itself. A file gets methods only when
 it belongs to the cached index. Unsupported files remain visible with explicit reasons;
 Rust parsing and static sequences are supported; see [Rust support](rust-support.md). The previous sample index, saved views, notes and provider
 allowances remain preserved in their original state directories. They were not reset or

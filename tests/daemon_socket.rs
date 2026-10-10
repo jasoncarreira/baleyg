@@ -1,6 +1,3 @@
-use baleyg::daemon::client::{self, CallError, StartOutcome};
-use baleyg::daemon::protocol::{self, Reply, Request};
-use baleyg::daemon::{SocketOwner, SocketPaths};
 use serde_json::json;
 use std::io::{self, Cursor};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -9,9 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
+use trellis::daemon::client::{self, CallError, StartOutcome};
+use trellis::daemon::protocol::{self, Reply, Request};
+use trellis::daemon::{SocketOwner, SocketPaths};
 
 fn paths(temp: &tempfile::TempDir) -> SocketPaths {
-    SocketPaths::new(&temp.path().join("baleyg"))
+    SocketPaths::new(&temp.path().join("trellis"))
 }
 fn request() -> Request {
     Request {
@@ -174,7 +174,7 @@ fn no_listener_is_typed_unavailable_and_demand_start_is_socket_only() {
 #[test]
 fn nested_cold_start_does_not_activate_a_checkout() {
     let temp = tempfile::tempdir().unwrap();
-    let paths = SocketPaths::new(&temp.path().join("one/two/three/baleyg"));
+    let paths = SocketPaths::new(&temp.path().join("one/two/three/trellis"));
     let owner = SocketOwner::acquire(&paths).unwrap().unwrap();
     for dir in [
         temp.path().join("one"),

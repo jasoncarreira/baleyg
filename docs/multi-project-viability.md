@@ -2,14 +2,14 @@
 
 > **Topology decision (2026-09-23).** The facts below about the current code still hold. For agents, the
 > chosen topology is not the one-daemon registry recommended here but one index per checkout reached through
-> a stdio `baleyg mcp` server; see the [local topology](local-topology.md). A registry may still back a
+> a stdio `trellis mcp` server; see the [local topology](local-topology.md). A registry may still back a
 > future browser project picker.
 
 ## Decision summary
 
-**Yes, one multi-project SQLite database is viable. It is not needed to get one Baleyg window with a project/space selector.** The smallest safe approach is one daemon with a small project registry, routing to the existing per-workspace stores. Keep independent project context, index state, notes and provider allowances. Add cross-project search or links only when needed.
+**Yes, one multi-project SQLite database is viable. It is not needed to get one Trellis window with a project/space selector.** The smallest safe approach is one daemon with a small project registry, routing to the existing per-workspace stores. Keep independent project context, index state, notes and provider allowances. Add cross-project search or links only when needed.
 
-A set of Herdr spaces, such as `project-a`, `project-b` and `baleyg` (illustrative names), is a useful interaction model: switch context without closing other work. It is not evidence that Baleyg needs shared storage, nor that Herdr must be integrated. This review did not inspect or control Herdr or inspect other projects.
+A set of Herdr spaces, such as `project-a`, `project-b` and `trellis` (illustrative names), is a useful interaction model: switch context without closing other work. It is not evidence that Trellis needs shared storage, nor that Herdr must be integrated. This review did not inspect or control Herdr or inspect other projects.
 
 Separate three product decisions:
 
@@ -69,7 +69,7 @@ Recommended initial model:
 - **Project:** stable opaque ID and editable display label, such as “mimir.” Do not use a basename, remote URL or branch name as a unique key.
 - **Workspace:** stable opaque ID for one registered canonical source root and its existing state pair. Start with one workspace per project. Add multiple checkouts/worktrees under a project only when required. The database tenant key should be this workspace ID if a project can contain several checkouts.
 - **Space:** initially the selected project/workspace UI context, not a new storage owner. Several UI tabs/agents may target the same workspace without creating duplicate stores.
-- **Branch:** optional observed metadata, not required identity or authority. Switching branches in place currently changes the next indexed snapshot, not the workspace. Two worktrees need separate workspace IDs even if their repository origin and branch labels match. Baleyg itself need not be a Git repository.
+- **Branch:** optional observed metadata, not required identity or authority. Switching branches in place currently changes the next indexed snapshot, not the workspace. Two worktrees need separate workspace IDs even if their repository origin and branch labels match. Trellis itself need not be a Git repository.
 
 Canonical-root hashing already deduplicates path aliases but does not survive moves as a stable identity. Do not silently rebind an old store when a directory moves or a different checkout occupies its path. Provide explicit relocation verification or register a new workspace and import durable data. Current `Store::open` and provider ledger bindings intentionally refuse root changes. Nested registrations and overlapping browse roots need an explicit policy rather than name-based merging.
 

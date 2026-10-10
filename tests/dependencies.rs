@@ -1,12 +1,12 @@
-fn test_pin(revision: u64) -> baleyg::model::IndexPin {
-    baleyg::model::IndexPin {
+fn test_pin(revision: u64) -> trellis::model::IndexPin {
+    trellis::model::IndexPin {
         index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
         index_revision: revision,
     }
 }
-use baleyg::dependencies::{Catalog, CatalogOptions};
 use std::{fs, path::Path, sync::atomic::AtomicBool};
 use tempfile::TempDir;
+use trellis::dependencies::{Catalog, CatalogOptions};
 fn put(root: &Path, path: &str, text: &str) {
     let path = root.join(path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -324,12 +324,12 @@ fn package_discovery_bound_is_explicit() {
 #[test]
 #[ignore = "explicit local-source smoke; uses only configured roots"]
 fn local_catalog_smoke() {
-    let workspace = std::env::var_os("BALEYG_CATALOG_WORKSPACE")
+    let workspace = std::env::var_os("TRELLIS_CATALOG_WORKSPACE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap());
     let options = CatalogOptions {
         cargo_home: std::env::var_os("CARGO_HOME").map(Into::into),
-        rust_library: std::env::var_os("BALEYG_RUST_LIBRARY").map(Into::into),
+        rust_library: std::env::var_os("TRELLIS_RUST_LIBRARY").map(Into::into),
     };
     let c = build(&workspace, &options);
     println!(

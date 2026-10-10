@@ -1,5 +1,5 @@
-use baleyg::native_ids::{IdentityRegistry, canonical};
 use serde_json::json;
+use trellis::native_ids::{IdentityRegistry, canonical};
 
 #[test]
 fn identity_excludes_body_and_revision_and_occurrence_is_document_version_local() {
@@ -7,10 +7,10 @@ fn identity_excludes_body_and_revision_and_occurrence_is_document_version_local(
         "declaration":{"kind":"method", "name":"run", "signature":{"parameterTypes":[],"typeParameterCount":0,"variadic":false},"ordinal":0}});
     let mut registry = IdentityRegistry::default();
     let syntax = registry.stable(&descriptor).unwrap();
-    assert_eq!(syntax, "sid:v1:42d51f619d3e03c37a1629b6a01af34a");
-    let context = baleyg::native_ids::extraction_context("java", &[]).unwrap();
+    assert_eq!(syntax, "sid:v1:a786650724b9d739d4b37f52082b66c4");
+    let context = trellis::native_ids::extraction_context("java", &[]).unwrap();
     let occurrence = |content: &str, context: &str, version: &str, kind: &str| {
-        json!({"contentHash":content,"extractionContext":context,"nativeProducerId":"baleyg.native.syntax",
+        json!({"contentHash":content,"extractionContext":context,"nativeProducerId":"trellis.native.syntax",
             "nativeProducerVersion":version,"ownerSyntaxId":syntax,"kind":kind,"ordinal":0})
     };
     let bytes = "a".repeat(64);
@@ -62,18 +62,18 @@ fn canonical_controls_are_six_ascii_bytes_and_unicode_is_not_normalized() {
 
 #[test]
 fn four_languages_and_empty_workspace_share_closed_native_memory() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
     let root = tempfile::tempdir().unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let (_, empty) = index_workspace_with_native(
         &IndexOptions::new(root.path().into()),
@@ -120,7 +120,7 @@ fn four_languages_and_empty_workspace_share_closed_native_memory() {
 
 #[test]
 fn unicode_lookup_normalizes_without_changing_exact_identity_bytes() {
-    use baleyg::native_evidence::lookup;
+    use trellis::native_evidence::lookup;
     assert_eq!(lookup("rust", "e\u{301}").unwrap(), "é");
     assert_eq!(lookup("python", "Ａ").unwrap(), "A");
     assert_eq!(lookup("java", "e\u{301}").unwrap(), "e\u{301}");
@@ -144,8 +144,8 @@ fn unicode_lookup_normalizes_without_changing_exact_identity_bytes() {
 
 #[test]
 fn closed_records_reject_unknown_fields_and_fabricated_semantics() {
-    use baleyg::native_evidence::{Call, Coverage, Provenance};
     use serde_json::json;
+    use trellis::native_evidence::{Call, Coverage, Provenance};
     assert!(serde_json::from_value::<Call>(json!({"id":"occ:v2:dead","ownerSyntaxId":"sid:v1:dead","ordinal":0,"document":{"sourceSetId":"s","language":"rust","path":"a.rs"},"revisionId":"r","range":{"start":0,"end":1},"calleeRange":null,"spelling":null,"regionIds":[],"provenanceId":"p","target":"guessed"})).is_err());
     assert!(serde_json::from_value::<Provenance>(json!({"id":"p","producerId":"n","document":{"sourceSetId":"s","language":"rust","path":"a.rs"},"revisionId":"r","contentHash":"h","evidenceKind":"measuredSyntax","basis":null,"freshness":"fresh","derivedFrom":null,"receiver":"guessed"})).is_err());
     assert!(serde_json::from_value::<Coverage>(json!({"producerId":"n","language":"rust","sourceSetId":"s","documentPath":"a.rs","revisionId":"r","requested":true,"selected":true,"state":"complete","supportedRoles":["definition","call"],"observedRoles":[],"diagnostic":null,"reference":"inferred"})).is_err());
@@ -153,16 +153,16 @@ fn closed_records_reject_unknown_fields_and_fabricated_semantics() {
 
 #[test]
 fn source_body_only_changes_revision_not_stable_declaration() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     let source = root.path().join("a.py");
     fs::write(&source, "def greet():\n    return 1\n").unwrap();
@@ -182,7 +182,7 @@ fn source_body_only_changes_revision_not_stable_declaration() {
         |_| {},
     )
     .unwrap();
-    let declaration = |a: &baleyg::native_evidence::Artifact| {
+    let declaration = |a: &trellis::native_evidence::Artifact| {
         a.declarations
             .iter()
             .find(|d| d.name.as_deref() == Some("greet"))
@@ -200,16 +200,16 @@ fn source_body_only_changes_revision_not_stable_declaration() {
 
 #[test]
 fn editing_one_document_reidentifies_only_its_own_occurrences() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     fs::write(
         root.path().join("a.js"),
@@ -232,7 +232,7 @@ fn editing_one_document_reidentifies_only_its_own_occurrences() {
     fs::write(root.path().join("b.js"), "function g() { k(); k(); }\n").unwrap();
     let after = index();
     assert_ne!(before.revision.id, after.revision.id);
-    let ids = |a: &baleyg::native_evidence::Artifact, path: &str| {
+    let ids = |a: &trellis::native_evidence::Artifact, path: &str| {
         let calls = a.calls.iter().filter(|c| c.document.path == path);
         let regions = a.control_regions.iter().filter(|r| r.document.path == path);
         calls
@@ -257,16 +257,16 @@ fn editing_one_document_reidentifies_only_its_own_occurrences() {
 
 #[test]
 fn unverifiable_expression_keeps_independent_nullable_callee() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     fs::write(root.path().join("a.js"), "function go() { obj[key](); }").unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
@@ -290,16 +290,16 @@ fn unverifiable_expression_keeps_independent_nullable_callee() {
 
 #[test]
 fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullable() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
     let root = tempfile::tempdir().unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     for (path, source) in [
         (
@@ -449,8 +449,8 @@ fn nested_occurrences_sort_before_hashing_and_unverifiable_callees_remain_nullab
 
 #[test]
 fn every_nullable_native_field_requires_presence_even_when_null() {
-    use baleyg::native_evidence::*;
     use serde::{Serialize, de::DeserializeOwned};
+    use trellis::native_evidence::*;
     fn check<T: Serialize + DeserializeOwned>(row: &T, fields: &[&str]) {
         let baseline = serde_json::to_value(row).unwrap();
         assert!(serde_json::from_value::<T>(baseline.clone()).is_ok());
@@ -580,18 +580,18 @@ fn every_nullable_native_field_requires_presence_even_when_null() {
 
 #[test]
 fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
-    use baleyg::{
+    use std::{
+        fs,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
         capture::Capture,
         indexer::IndexOptions,
         model::CancelFlag,
         native_evidence::{Artifact, from_capture},
     };
-    use std::{
-        fs,
-        sync::{Arc, atomic::AtomicBool},
-    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     fs::write(
         root.path().join("A.java"),
@@ -849,15 +849,15 @@ fn every_native_kind_rejects_well_shaped_forgery_against_immutable_capture() {
 
 #[test]
 fn parser_recovery_reports_partial_not_false_complete() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     fs::write(root.path().join("broken.js"), "function broken( { foo(); }").unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
@@ -878,15 +878,15 @@ fn parser_recovery_reports_partial_not_false_complete() {
 
 #[test]
 fn validation_refuses_cutoff_drift_without_source_reread() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     let source = root.path().join("a.js");
     fs::write(&source, "function f() { foo(); }").unwrap();
@@ -905,15 +905,15 @@ fn validation_refuses_cutoff_drift_without_source_reread() {
 
 #[test]
 fn source_grounded_four_language_headers_owners_and_control_regions() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
+    };
     let root = tempfile::tempdir().unwrap();
-    let id = baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+    let id = trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
         .unwrap();
     for (path, source) in [
         (
@@ -1035,12 +1035,12 @@ fn source_grounded_four_language_headers_owners_and_control_regions() {
 
 #[test]
 fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
     };
     let root = tempfile::tempdir().unwrap();
     let source = format!(
@@ -1050,7 +1050,7 @@ fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
     );
     fs::write(root.path().join("a.rs"), source).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
@@ -1081,12 +1081,12 @@ fn direct_native_opaque_macro_does_not_overflow_or_invent_calls() {
 
 #[test]
 fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
-    use baleyg::{
-        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        capture::Capture, indexer::IndexOptions, model::CancelFlag, native_evidence::from_capture,
     };
     let root = tempfile::tempdir().unwrap();
     let source = format!(
@@ -1096,7 +1096,7 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
     );
     fs::write(root.path().join("deep.rs"), source).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let capture = Capture::admit(&IndexOptions::new(root.path().into()), &cancel, &|_| {}).unwrap();
@@ -1111,18 +1111,18 @@ fn nonopaque_rust_nesting_retains_fail_closed_depth_guard() {
 
 #[test]
 fn max_file_bytes_and_previously_absent_required_input_change_native_basis() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
     };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
+    };
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let first_options = IndexOptions::new(root.path().to_owned());
@@ -1152,14 +1152,14 @@ fn max_file_bytes_and_previously_absent_required_input_change_native_basis() {
 #[cfg(unix)]
 #[test]
 fn required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are_native_config() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         os::unix::{ffi::OsStrExt, fs::MetadataExt},
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
     };
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1168,7 +1168,7 @@ fn required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are
     let ignore = root.path().join(".gitignore");
     fs::write(&ignore, "first.js\n").unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let options = IndexOptions::new(root.path().to_owned());
@@ -1209,13 +1209,13 @@ fn required_inputs_are_rehashed_when_stats_look_unchanged_and_ignore_changes_are
 
 #[test]
 fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
     };
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1227,7 +1227,7 @@ fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity
     options.scip_path = Some(scip.clone());
     options.manifest_path = Some(manifest.clone());
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let (_, first) =
@@ -1242,14 +1242,14 @@ fn presentation_inputs_are_recaptured_but_excluded_from_native_revision_identity
 #[cfg(unix)]
 #[test]
 fn unreadable_required_input_fails_closed() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_with_native},
-        model::CancelFlag,
-    };
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_with_native},
+        model::CancelFlag,
     };
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.js"), "function a() {}\n").unwrap();
@@ -1257,7 +1257,7 @@ fn unreadable_required_input_fails_closed() {
     fs::write(&package, "{}").unwrap();
     fs::set_permissions(&package, fs::Permissions::from_mode(0o000)).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
     let result = index_workspace_with_native(

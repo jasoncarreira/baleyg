@@ -35,7 +35,7 @@ const canonical = (value) => {
 };
 const hash = (domain, value) =>
   createHash("sha256")
-    .update(`baleyg.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
+    .update(`trellis.${domain}.${domain === "occurrence" ? "v2" : "v1"}\0`)
     .update(canonical(value))
     .digest("hex");
 const orderSyntax = (a, b) =>
@@ -55,7 +55,7 @@ const syntax = (value) => `sid:v1:${hash("syntax", value).slice(0, 32)}`;
 // native producer descriptor; it never binds a revision.
 const extractionContext = (language) =>
   sha(
-    "baleyg.extraction-context.v1\0" + canonical({ language, components: [] }),
+    "trellis.extraction-context.v1\0" + canonical({ language, components: [] }),
   );
 const occurrence = (
   value,
@@ -702,7 +702,7 @@ test("64 independent vector descriptor encodings, full domain hashes and literal
         c.caseId + " " + entry.label + " canonical input",
       );
       assert.equal(
-        Buffer.from(`baleyg.${domain}.v1\0`).toString("hex"),
+        Buffer.from(`trellis.${domain}.v1\0`).toString("hex"),
         entry.domainHex,
         c.caseId + " domain",
       );

@@ -61,7 +61,7 @@ fn every_normative_stable_id_vector() {
     ))
     .unwrap();
     let mut languages = BTreeMap::new();
-    let mut production_ids = baleyg::native_ids::IdentityRegistry::default();
+    let mut production_ids = trellis::native_ids::IdentityRegistry::default();
     let cases = root["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 64);
     for case in cases {
@@ -86,7 +86,7 @@ fn every_normative_stable_id_vector() {
             "{} canonical bytes",
             case["caseId"]
         );
-        let full = Sha256::digest([b"baleyg.syntax.v1\0".as_slice(), bytes.as_slice()].concat());
+        let full = Sha256::digest([b"trellis.syntax.v1\0".as_slice(), bytes.as_slice()].concat());
         let expected = format!("sid:v1:{}", hex::encode(&full[..16]));
         assert_eq!(
             expected,
@@ -167,10 +167,10 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
         assert_eq!(input["components"][0]["hash"], json!(capture));
         let bytes = encode(&input);
         assert_eq!(bytes, text.as_bytes(), "canonical context bytes");
-        assert_eq!(baleyg::native_ids::canonical(&input), bytes);
+        assert_eq!(trellis::native_ids::canonical(&input), bytes);
         let digest = Sha256::digest(
             [
-                b"baleyg.extraction-context.v1\0".as_slice(),
+                b"trellis.extraction-context.v1\0".as_slice(),
                 bytes.as_slice(),
             ]
             .concat(),
@@ -178,11 +178,11 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
         assert_eq!(&hex::encode(digest), full);
         let components = vec![("config".to_owned(), capture.clone())];
         assert_eq!(
-            &baleyg::native_ids::extraction_context("javascript", &components).unwrap(),
+            &trellis::native_ids::extraction_context("javascript", &components).unwrap(),
             full
         );
     }
-    let mut production = baleyg::native_ids::IdentityRegistry::default();
+    let mut production = trellis::native_ids::IdentityRegistry::default();
     let mut ids = vec![];
     for (text, full, id) in &occurrences {
         let input: Value = serde_json::from_str(text).unwrap();
@@ -193,9 +193,9 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
         );
         let bytes = encode(&input);
         assert_eq!(bytes, text.as_bytes(), "canonical occurrence bytes");
-        assert_eq!(baleyg::native_ids::canonical(&input), bytes);
+        assert_eq!(trellis::native_ids::canonical(&input), bytes);
         let digest = hex::encode(Sha256::digest(
-            [b"baleyg.occurrence.v2\0".as_slice(), bytes.as_slice()].concat(),
+            [b"trellis.occurrence.v2\0".as_slice(), bytes.as_slice()].concat(),
         ));
         assert_eq!(&digest, full);
         assert_eq!(id, &format!("occ:v2:{}", &digest[..32]));
@@ -208,7 +208,11 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
                 "kind":input["kind"],"ordinal":input["ordinal"]});
             assert!(production.occurrence(&v1).is_err());
             let v1_digest = hex::encode(Sha256::digest(
-                [b"baleyg.occurrence.v1\0".as_slice(), encode(&v1).as_slice()].concat(),
+                [
+                    b"trellis.occurrence.v1\0".as_slice(),
+                    encode(&v1).as_slice(),
+                ]
+                .concat(),
             ));
             assert!(
                 occurrences
@@ -221,36 +225,36 @@ fn every_decision_0003_extraction_context_and_occurrence_vector() {
     let unique: std::collections::BTreeSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), 4);
     // The decision's reproduction check of the withdrawn v1 r1/call digest.
-    let v1_call = json!({"revisionId":"r1","ownerSyntaxId":"sid:v1:6cce6099437ddb2256f7ae368d29c0b5","kind":"call","ordinal":0});
+    let v1_call = json!({"revisionId":"r1","ownerSyntaxId":"sid:v1:7fd250597c82d08fcb73cabd62e89893","kind":"call","ordinal":0});
     let v1_digest = hex::encode(Sha256::digest(
         [
-            b"baleyg.occurrence.v1\0".as_slice(),
+            b"trellis.occurrence.v1\0".as_slice(),
             encode(&v1_call).as_slice(),
         ]
         .concat(),
     ));
-    assert!(v1_digest.starts_with("ccc4d599"), "{v1_digest}");
+    assert!(v1_digest.starts_with("959c5606"), "{v1_digest}");
 }
 
 #[test]
 fn native_v4_occurrence_changes_only_descriptor_input() {
     let content_hash = hex::encode(Sha256::digest(b"f();"));
-    let context = baleyg::native_ids::extraction_context("javascript", &[]).unwrap();
+    let context = trellis::native_ids::extraction_context("javascript", &[]).unwrap();
     let input = |version| {
         json!({"contentHash":content_hash,"extractionContext":context,
-            "nativeProducerId":"baleyg.native.syntax","nativeProducerVersion":version,
-            "ownerSyntaxId":"sid:v1:6cce6099437ddb2256f7ae368d29c0b5",
+            "nativeProducerId":"trellis.native.syntax","nativeProducerVersion":version,
+            "ownerSyntaxId":"sid:v1:7fd250597c82d08fcb73cabd62e89893",
             "kind":"call","ordinal":0})
     };
     let v3 = input("native-v3");
     let v4 = input("native-v4");
-    let mut registry = baleyg::native_ids::IdentityRegistry::default();
+    let mut registry = trellis::native_ids::IdentityRegistry::default();
     let old = registry.occurrence(&v3).unwrap();
     let current = registry.occurrence(&v4).unwrap();
     assert_ne!(old, current);
     let canonical = encode(&v4);
-    assert_eq!(canonical, baleyg::native_ids::canonical(&v4));
+    assert_eq!(canonical, trellis::native_ids::canonical(&v4));
     let digest =
-        Sha256::digest([b"baleyg.occurrence.v2\0".as_slice(), canonical.as_slice()].concat());
+        Sha256::digest([b"trellis.occurrence.v2\0".as_slice(), canonical.as_slice()].concat());
     assert_eq!(current, format!("occ:v2:{}", &hex::encode(digest)[..32]));
 }

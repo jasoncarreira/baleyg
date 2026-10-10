@@ -30,7 +30,7 @@ All object types are closed. Every listed field is required, arrays are non-null
 | DocumentKey | `{sourceSetId:Text,language:Language,path:Path}` |
 | AnchorResult | `{status:attached\|orphaned,targetId:SyntaxId?,reason:none\|missing\|headerMismatch\|groupChanged\|unprovenContinuity}` |
 
-`Language`, `Kind`, `Text`, `UInt`, `Hash`, `Path`, and `SyntaxId` have the exact meanings in `../contract-v1.md`. Hex is an even-length lowercase byte string. The only digest domains are the UTF-8 bytes of `baleyg.syntax.v1\0`, `baleyg.header.v1\0`, and `baleyg.sibling-group.v1\0`; their trailing NUL is present in `domainHex`.
+`Language`, `Kind`, `Text`, `UInt`, `Hash`, `Path`, and `SyntaxId` have the exact meanings in `../contract-v1.md`. Hex is an even-length lowercase byte string. The only digest domains are the UTF-8 bytes of `trellis.syntax.v1\0`, `trellis.header.v1\0`, and `trellis.sibling-group.v1\0`; their trailing NUL is present in `domainHex`.
 
 A descriptor's `siblingHeaders` is the complete focused ordinal namespace in measured source order and includes the focused declaration. Each case has a `syntax` digest, one `header-N` digest for each byte-distinct header in that list, and a `sibling-group` digest. Labels are unique within the case. Repeated identical headers intentionally share one header digest row.
 

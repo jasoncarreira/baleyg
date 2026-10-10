@@ -1,14 +1,4 @@
 use anyhow::{Context, Result, ensure};
-use baleyg::{
-    daemon::{self, client, protocol, registry},
-    indexer::IndexOptions,
-    mcp,
-    model::{CancelFlag, ViewQuery},
-    store::{
-        Store,
-        topology::{TopologyRoots, WorkspaceIdentity},
-    },
-};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use std::{
@@ -19,6 +9,16 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
+};
+use trellis::{
+    daemon::{self, client, protocol, registry},
+    indexer::IndexOptions,
+    mcp,
+    model::{CancelFlag, ViewQuery},
+    store::{
+        Store,
+        topology::{TopologyRoots, WorkspaceIdentity},
+    },
 };
 
 // Finite retry budget between terminal selected-status attempts, not a synchronous
@@ -46,7 +46,7 @@ fn fixture_index_exchange(
 
 #[derive(Parser)]
 #[command(
-    name = "baleyg",
+    name = "trellis",
     version,
     about = "Local, read-only JavaScript, Rust, Java and Python code index and inspection daemon"
 )]
@@ -257,12 +257,12 @@ fn cli_read_with_retry_until<T>(
             }
             Err(error) => {
                 verify()?;
-                if !baleyg::store::cli_read_retryable_contention(&error) {
+                if !trellis::store::cli_read_retryable_contention(&error) {
                     return Err(error);
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return Err(baleyg::store::cli_read_busy_expired());
+                    return Err(trellis::store::cli_read_busy_expired());
                 }
                 std::thread::sleep(backoff.min(remaining));
                 backoff = backoff.saturating_mul(2).min(Duration::from_millis(250));
@@ -277,17 +277,17 @@ fn cli_read_admit(
     args: &WorkspaceArgs,
     identity: &WorkspaceIdentity,
     deadline: Instant,
-) -> Result<(Store, Arc<baleyg::store::topology::LeaderSession>)> {
+) -> Result<(Store, Arc<trellis::store::topology::LeaderSession>)> {
     let store = cli_read_with_retry_until(deadline, || identity.verify(), || args.store())?;
     identity.verify()?;
     let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-    let result = baleyg::index_coordinator::establish_serving_session(&store, None, &cancel);
+    let result = trellis::index_coordinator::establish_serving_session(&store, None, &cancel);
     identity.verify()?;
     let session = match result {
         Ok(session) => session,
-        Err(error) if baleyg::store::cli_read_retryable_contention(&error) => {
+        Err(error) if trellis::store::cli_read_retryable_contention(&error) => {
             // This may be after COMMIT; return typed contention without rerunning it.
-            return Err(baleyg::store::cli_read_busy_expired());
+            return Err(trellis::store::cli_read_busy_expired());
         }
         Err(error) => return Err(error),
     };
@@ -301,12 +301,12 @@ fn terminal_status_retryable_after_guard(
     verify: impl FnOnce() -> Result<()>,
 ) -> Result<bool> {
     verify()?;
-    Ok(baleyg::store::terminal_status_sqlite_contention(error))
+    Ok(trellis::store::terminal_status_sqlite_contention(error))
 }
 
 fn write_session_json(
     value: &impl Serialize,
-    session: &Arc<baleyg::store::topology::LeaderSession>,
+    session: &Arc<trellis::store::topology::LeaderSession>,
     mut writer: impl std::io::Write,
 ) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
@@ -338,8 +338,8 @@ mod session_output_tests {
         assert!(terminal_status_retryable_after_guard(&busy, || Ok(())).unwrap());
     }
 
-    use baleyg::store::topology::{LeaderSession, TopologyRoots, WorkspaceIdentity};
     use std::io::Write;
+    use trellis::store::topology::{LeaderSession, TopologyRoots, WorkspaceIdentity};
 
     struct ProbeWriter {
         roots: TopologyRoots,
@@ -407,13 +407,13 @@ async fn shutdown_signal() {
 async fn main() -> Result<()> {
     let command = Cli::parse().command;
     if matches!(&command, Command::Index(_) | Command::Serve(_)) {
-        baleyg::capture::pin_running_executable()?;
+        trellis::capture::pin_running_executable()?;
     }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "baleyg=info".into()),
+                .unwrap_or_else(|_| "trellis=info".into()),
         )
         .init();
     if matches!(&command, Command::Daemon) {
@@ -471,12 +471,12 @@ async fn main() -> Result<()> {
             eprintln!("Forgot record {}", args.record_id);
         }
         Command::Index(args) => {
-            let diagnostics = std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
+            let diagnostics = std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1");
             let command_start = Instant::now();
             let (store, options, _) = args.resolve()?;
             // Fixture-only owner barrier: unset for every normal CLI invocation.
             #[cfg(unix)]
-            let fixture_socket = std::env::var_os("BALEYG_TEST_FINITE_CLI_FD")
+            let fixture_socket = std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD")
                 .map(|fd| -> Result<_> {
                     use std::os::fd::FromRawFd;
                     use std::os::unix::net::UnixStream;
@@ -494,7 +494,7 @@ async fn main() -> Result<()> {
                 .transpose()?;
             #[cfg(not(unix))]
             ensure!(
-                std::env::var_os("BALEYG_TEST_FINITE_CLI_FD").is_none(),
+                std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none(),
                 "fixture index IPC requires Unix"
             );
             let fixture_seen = Arc::new(AtomicBool::new(false));
@@ -519,7 +519,7 @@ async fn main() -> Result<()> {
             #[cfg(unix)]
             let fixture_socket_worker = fixture_socket.clone();
             let work = tokio::task::spawn_blocking(move || {
-                baleyg::index_coordinator::enqueue_and_wait_observed_with_request(
+                trellis::index_coordinator::enqueue_and_wait_observed_with_request(
                     &worker_store,
                     &options,
                     &cancel,
@@ -636,10 +636,10 @@ async fn main() -> Result<()> {
             if session.is_leader() {
                 for _ in 0..2 {
                     let priority = || session.verify().is_ok() && store.verify_root().is_ok();
-                    match baleyg::index_coordinator::cooperative_maintenance_unit(
+                    match trellis::index_coordinator::cooperative_maintenance_unit(
                         &store, &session, priority,
                     ) {
-                        Ok(baleyg::store::MaintenanceOutcome::Progress) => {}
+                        Ok(trellis::store::MaintenanceOutcome::Progress) => {}
                         Ok(_) | Err(_) => break, // Durable debt belongs to the next owner.
                     }
                 }
@@ -752,7 +752,7 @@ mod workspace_defaults {
     fn serve_defaults_to_cwd_and_browses_the_index_workspace() {
         let Cli {
             command: Command::Serve(args),
-        } = Cli::try_parse_from(["baleyg", "serve"]).unwrap()
+        } = Cli::try_parse_from(["trellis", "serve"]).unwrap()
         else {
             panic!("expected serve");
         };
@@ -803,7 +803,7 @@ mod rust_source_arguments {
         }
         let Cli {
             command: Command::Serve(args),
-        } = Cli::try_parse_from(["baleyg", "serve"]).unwrap()
+        } = Cli::try_parse_from(["trellis", "serve"]).unwrap()
         else {
             panic!("serve")
         };
@@ -998,7 +998,7 @@ fn try_existing_daemon(command: &Command) -> Result<bool> {
             serde_json::json!({"output": args.output}),
             true,
         ),
-        Command::Index(args) if std::env::var_os("BALEYG_TEST_FINITE_CLI_FD").is_none() => (
+        Command::Index(args) if std::env::var_os("TRELLIS_TEST_FINITE_CLI_FD").is_none() => (
             "index",
             &args.workspace,
             serde_json::json!({
@@ -1174,14 +1174,14 @@ async fn serve_via_daemon(args: &ServeArgs) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("outcome_unknown: inspect daemon listener status"))?;
     let address = checked_reply(reply)?;
     eprintln!(
-        "Baleyg: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
+        "Trellis: http://{}/\nState: {}\nToken file: {}\nRefresh is explicit. No repository commands run.",
         address.as_str().unwrap_or("unknown"),
         roots.cache.display(),
         token_file.display()
     );
     // The opt-in test pause exposes the banner-to-select window. SIGTERM must
     // already be armed; normal serve executions never pause here.
-    if std::env::var("BALEYG_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
+    if std::env::var("TRELLIS_TEST_SERVE_AFTER_BANNER_PAUSE").as_deref() == Ok("1") {
         std::thread::sleep(Duration::from_millis(750));
     }
     // The registration is a control connection, not a checkout attachment. Its
@@ -1221,7 +1221,7 @@ async fn run_daemon() -> Result<()> {
         return Ok(());
     };
     // Test-only ownership marker: only the elected daemon records its PID.
-    if let Some(path) = std::env::var_os("BALEYG_TEST_DAEMON_PID_FILE") {
+    if let Some(path) = std::env::var_os("TRELLIS_TEST_DAEMON_PID_FILE") {
         std::fs::write(path, std::process::id().to_string())?;
     }
     owner.listener().set_nonblocking(true)?;
@@ -1235,7 +1235,7 @@ async fn run_daemon() -> Result<()> {
     tokio::pin!(idle);
     // A single injected accept fault tests that the elected socket survives it.
     let mut injected_accept_errno =
-        match std::env::var("BALEYG_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
+        match std::env::var("TRELLIS_TEST_DAEMON_ACCEPT_ERROR_ONCE").as_deref() {
             Ok("emfile") => Some(libc::EMFILE),
             Ok("econnaborted") => Some(libc::ECONNABORTED),
             _ => None,

@@ -64,7 +64,7 @@ fn state_and_databases_are_private_and_symlink_safe() {
     drop(public_store);
     let alias = temp.path().join("alias");
     symlink(&state, &alias).unwrap();
-    // The existing parent alias is not itself a Baleyg-managed component.
+    // The existing parent alias is not itself a Trellis-managed component.
     assert!(crate::common::open_store(&alias, &source).is_ok());
     fs::remove_file(index.join("index.db")).unwrap();
     let other = temp.path().join("not-a-cache");

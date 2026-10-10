@@ -12,7 +12,7 @@ const hashes=JSON.parse(fs.readFileSync(fixturePath('fixture.hashes.json'),'utf8
 const g=extract(fixturePath('fixture'),fixturePath('fixture.scip'),hashes).graph;
 
 test('real reindex preserves an exported symbol across body edits but not a rename', ()=>{
-  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'baleyg-identity-'));
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'trellis-identity-'));
   try {
     fs.cpSync(fixturePath('fixture'),dir,{recursive:true});
     const original=g.nodes.find(n=>n.name==='transform');

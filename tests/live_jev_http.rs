@@ -7,15 +7,15 @@ mod offline {
         body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
-    use baleyg::{
+    use serde_json::{Value, json};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use tower::ServiceExt;
+    use trellis::{
         http,
         indexer::{IndexOptions, index_workspace_bundle},
         model::*,
         store::Store,
     };
-    use serde_json::{Value, json};
-    use std::sync::{Arc, atomic::AtomicBool};
-    use tower::ServiceExt;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     pub(super) fn setup(
         padding: usize,
@@ -25,7 +25,7 @@ mod offline {
         Graph,
         Router,
         Value,
-        Arc<baleyg::store::topology::LeaderSession>,
+        Arc<trellis::store::topology::LeaderSession>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -106,11 +106,11 @@ mod offline {
     }
 }
 use axum::{body::Body, http::Request};
-use baleyg::{http, indexer::IndexOptions, live_jev::LiveJev};
 use offline::{call, setup};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
+use trellis::{http, indexer::IndexOptions, live_jev::LiveJev};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 #[tokio::test]
 async fn offline_constructor_exposes_disabled_status_and_never_runs() {
@@ -222,7 +222,7 @@ async fn enabled_status_exhaustion_and_stale_preflight_are_offline() {
     );
     assert_eq!(call(&app, "POST", &url, json!({})).await.0, 429);
     let cancel = Arc::new(AtomicBool::new(false));
-    let (_, native, capture) = baleyg::indexer::index_workspace_bundle(
+    let (_, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(dir.path().join("workspace")),
         store.root_id(),
         &cancel,
@@ -252,7 +252,7 @@ async fn imported_rounded_response_adds_warning_only_after_validation() {
     let (_dir, _, _, app, request, _session) = setup(0);
     let (status, preview) = call(&app, "POST", "/api/questions/preview", request).await;
     assert_eq!(status, 200);
-    let packet: baleyg::planning::QuestionPacket =
+    let packet: trellis::planning::QuestionPacket =
         serde_json::from_value(preview["packet"].clone()).unwrap();
     let path = format!("/api/questions/{}/jev-response", packet.packet_id);
     for essential in [0.69, 0.71, 0.60, 0.70] {
@@ -262,7 +262,7 @@ async fn imported_rounded_response_adds_warning_only_after_validation() {
                 "probabilities":{"essential":essential,"supporting":0.2,"incidental":0.1,"uncertain":0.0}}),
         )).collect();
         let response = json!({"model":"jev-1.13.0","answers":answers});
-        let warnings = baleyg::jev::response_warnings(&response);
+        let warnings = trellis::jev::response_warnings(&response);
         let (status, body) = call(&app, "POST", &path, response).await;
         if essential == 0.60 {
             assert!(!status.is_success());

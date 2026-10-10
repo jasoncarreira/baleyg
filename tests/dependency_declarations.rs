@@ -1,6 +1,6 @@
-use baleyg::dependency_rust_symbols::extract;
+use trellis::dependency_rust_symbols::extract;
 
-fn declarations(text: &str) -> baleyg::dependency_rust_symbols::Declarations {
+fn declarations(text: &str) -> trellis::dependency_rust_symbols::Declarations {
     extract("pkg:one@1", "demo", "src/lib.rs", text, "source:one").unwrap()
 }
 

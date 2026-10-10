@@ -17,7 +17,7 @@
     if (!Object.hasOwn(views, name)) return;
     activeView = name;
     document.body.classList.toggle("classes-view", name === "classes");
-    window.BaleygClasses?.closeContextMenu?.();
+    window.TrellisClasses?.closeContextMenu?.();
     if (name === "sequence" || name === "classes") drawer("explorer", false);
     for (const [key, panel] of Object.entries(views)) {
       hide(panel, key !== name);
@@ -154,6 +154,6 @@
     else if (mobile && document.body.classList.contains("explorer-open")) { drawer("explorer", false); get("explorer-toggle")?.focus(); }
     else if (get("source-dock") && !get("source-dock").hidden) closeSource();
   });
-  window.BaleygShell = {setConnected, updateWorkspace, showView, showSource, closeSource, selectStep, resetInspector, reset};
+  window.TrellisShell = {setConnected, updateWorkspace, showView, showSource, closeSource, selectStep, resetInspector, reset};
   reset();
 })();

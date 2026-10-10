@@ -1,4 +1,4 @@
-# Baleyg extraction tools
+# Trellis extraction tools
 
 A disposable JavaScript spike for joining tree-sitter call sites with SCIP symbols,
 viewing bounded static call sequences, and testing SQLite revision publication.

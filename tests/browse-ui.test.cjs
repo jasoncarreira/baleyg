@@ -541,7 +541,7 @@ test("workspace change invalidates selections and source even when revision stay
 
 test("class context actions use cached file/method identity and never fetch source automatically", async () => {
   const h = harness(), opened = [], menus = [];
-  h.context.window.BaleygClasses = {showContextMenu: (event, actions) => menus.push(actions), open: opts => opened.push(opts)};
+  h.context.window.TrellisClasses = {showContextMenu: (event, actions) => menus.push(actions), open: opts => opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'src/Thing.java'}); attachClassMenu($('class-method'), {path:'src/Thing.java',seed:'method'});`);
   let prevented = false;
   h.get("class-file").listeners.contextmenu({preventDefault(){prevented=true;}});
@@ -553,7 +553,7 @@ test("class context actions use cached file/method identity and never fetch sour
 
 test("obsolete class context actions cannot cross revision or session changes", async () => {
   const h = harness(), menus = [], opened = [];
-  h.context.window.BaleygClasses = {showContextMenu: (e,a)=>menus.push(a),open:opts=>opened.push(opts)};
+  h.context.window.TrellisClasses = {showContextMenu: (e,a)=>menus.push(a),open:opts=>opened.push(opts)};
   h.run(`attachClassMenu($('class-file'), {path:'Thing.py'});`);
   h.get("class-file").listeners.contextmenu({preventDefault(){}});
   h.run("status={revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:2}}"); await menus[0][0].run();
@@ -564,7 +564,7 @@ test("obsolete class context actions cannot cross revision or session changes", 
 
 test("class controller uses authenticated API and clears pending source on navigation", async () => {
   const h = harness(); let hooks;
-  h.context.window.BaleygClasses={init:value=>{hooks=value;}}; h.run("initClassView()");
+  h.context.window.TrellisClasses={init:value=>{hooks=value;}}; h.run("initClassView()");
   const requests=[];
   h.context.fetch=async(p,o)=>{requests.push([p,o]);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1}});};
   await hooks.request('/api/class-diagram',{method:'POST',body:{seed:'class',expectedRevision:1}});
@@ -577,7 +577,7 @@ test("class controller uses authenticated API and clears pending source on navig
 });
 
 test("unsupported class languages keep their ordinary file and method interactions", () => {
-  const h=harness();h.context.window.BaleygClasses={showContextMenu(){throw new Error('unexpected menu');}};
+  const h=harness();h.context.window.TrellisClasses={showContextMenu(){throw new Error('unexpected menu');}};
   h.run(`attachClassMenu($('rust-file'),{path:'src/main.rs'}); attachClassMenu($('js-file'),{path:'app.js'});`);
   assert.equal(h.get('rust-file').listeners.contextmenu,undefined);
   assert.equal(h.get('js-file').listeners.contextmenu,undefined);
@@ -586,8 +586,8 @@ test("unsupported class languages keep their ordinary file and method interactio
 
 test("source navigation attaches without lookup and follows source serial and dock visibility", async () => {
   const h=harness(), attached=[]; let resets=0;
-  h.context.window.BaleygNavigation={reset(){resets++;},attachSource(node,options){attached.push({node,options});}};
-  h.context.window.BaleygShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
+  h.context.window.TrellisNavigation={reset(){resets++;},attachSource(node,options){attached.push({node,options});}};
+  h.context.window.TrellisShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
   h.get('source').scrollIntoView=()=>{};
   const requests=[];h.context.fetch=async p=>{requests.push(p);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:'sample.py',text:'def run():\n    work()\n'}});};
   await h.run("showSource({path:'sample.py',range:{startLine:2,endLine:2}},status.revision)");
@@ -601,8 +601,8 @@ test("source navigation attaches without lookup and follows source serial and do
 
 test("class member navigation forwards exact selectors and scope without fetching automatically", () => {
   const h=harness(), lookups=[];let hooks;
-  h.context.window.BaleygClasses={init:opts=>{hooks=opts;}};
-  h.context.window.BaleygNavigation={reset(){},open:(...args)=>lookups.push(args)};
+  h.context.window.TrellisClasses={init:opts=>{hooks=opts;}};
+  h.context.window.TrellisNavigation={reset(){},open:(...args)=>lookups.push(args)};
   h.run('initClassView()');assert.equal(lookups.length,0);
   const event={type:'contextmenu'},selector={classId:'class-a',memberName:'field',startByte:10,endByte:20},options={isCurrent:()=>true};
   hooks.navigateMember(event,selector,options);
@@ -612,8 +612,8 @@ test("class member navigation forwards exact selectors and scope without fetchin
 
 test("clearing stale source closes the empty dock after navigation", () => {
   const h=harness();let closed=0,resets=0;
-  h.context.window.BaleygNavigation={reset(){resets++;}};
-  h.context.window.BaleygShell={closeSource(){closed++;h.get('source-dock').hidden=true;}};
+  h.context.window.TrellisNavigation={reset(){resets++;}};
+  h.context.window.TrellisShell={closeSource(){closed++;h.get('source-dock').hidden=true;}};
   h.get('source-dock').hidden=false;h.get('source').append({textContent:'old'});
   h.run('clearSource()');assert.equal(closed,1);assert.equal(resets,1);assert.equal(h.get('source').children.length,0);
   h.run('clearSource()');assert.equal(closed,1);
@@ -621,9 +621,9 @@ test("clearing stale source closes the empty dock after navigation", () => {
 
 
 test("navigation source action forwards measured range and snapshot without selecting a sequence", async () => {
-  let hooks;const h=harness({BaleygNavigation:{init(options){hooks=options;},reset(){},attachSource(){}}});
+  let hooks;const h=harness({TrellisNavigation:{init(options){hooks=options;},reset(){},attachSource(){}}});
   const requests=[];h.get('source').scrollIntoView=()=>{};
-  h.context.window.BaleygShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
+  h.context.window.TrellisShell={showSource(){h.get('source-dock').hidden=false;h.get('workspace-source-panel').hidden=false;}};
   h.context.fetch=async p=>{requests.push(p);return response({revision:{indexGeneration:'12345678-1234-4123-8123-123456789abc',indexRevision:1},file:{path:'A.java',text:'class A {\n void target() {}\n}\n'}});};
   h.run("selectedMethod={id:'caller'}");
   const target={id:'target',path:'A.java',range:{startLine:2,endLine:2}};

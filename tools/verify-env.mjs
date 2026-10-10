@@ -72,12 +72,12 @@ function ensureLockedPackage(cache, dir, required, env) {
 
 function main() {
   if (realpathSync(process.cwd()) !== root) throw new Error("Run ./tools/verify from the repository root");
-  if (process.env.BALEYG_RUN_CACHE === "") throw new Error("BALEYG_RUN_CACHE must not be empty");
+  if (process.env.TRELLIS_RUN_CACHE === "") throw new Error("TRELLIS_RUN_CACHE must not be empty");
   if (process.env.PLAYWRIGHT_BROWSERS_PATH === "") throw new Error("PLAYWRIGHT_BROWSERS_PATH must not be empty");
-  const defaultParent = join(tmpdir(), "baleyg-verify");
+  const defaultParent = join(tmpdir(), "trellis-verify");
   const defaultCache = join(defaultParent, digest(`${process.getuid?.() ?? "user"}:${root}`).slice(0, 24));
-  if (process.env.BALEYG_RUN_CACHE === undefined) externalDirectory(defaultParent, "default cache parent", true);
-  const cache = externalDirectory(process.env.BALEYG_RUN_CACHE ?? defaultCache, "BALEYG_RUN_CACHE", process.env.BALEYG_RUN_CACHE === undefined);
+  if (process.env.TRELLIS_RUN_CACHE === undefined) externalDirectory(defaultParent, "default cache parent", true);
+  const cache = externalDirectory(process.env.TRELLIS_RUN_CACHE ?? defaultCache, "TRELLIS_RUN_CACHE", process.env.TRELLIS_RUN_CACHE === undefined);
   const browsers = externalDirectory(process.env.PLAYWRIGHT_BROWSERS_PATH ?? join(cache, "playwright-browsers"), "PLAYWRIGHT_BROWSERS_PATH", process.env.PLAYWRIGHT_BROWSERS_PATH === undefined);
   const npmCache = externalDirectory(join(cache, "npm-cache"), "npm cache", true);
   process.env.PLAYWRIGHT_BROWSERS_PATH = browsers;

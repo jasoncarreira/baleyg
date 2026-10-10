@@ -301,4 +301,4 @@ function drawSequence(container, view, readSource, expandedGroups, options, sele
   return groupControls;
 }
 
-window.BaleygSequence = {render: renderSequence};
+window.TrellisSequence = {render: renderSequence};

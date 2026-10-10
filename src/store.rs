@@ -2335,7 +2335,7 @@ fn selected_integrity(error: anyhow::Error) -> anyhow::Error {
 
 /// Opt-in, best-effort diagnostic stage; never carries IDs, paths, or pins.
 pub(crate) fn index_diagnostic_stage(stage: &'static str) {
-    if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+    if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
         use std::io::Write as _;
         let stderr = std::io::stderr();
         let mut locked = stderr.lock();
@@ -3069,7 +3069,7 @@ fn v8_document_projection(
     )?;
     let version_id = v8_id(
         "document:v1",
-        b"baleyg.document-version.v1\0",
+        b"trellis.document-version.v1\0",
         serde_json::json!({
             "sourceSetId": native.source_set.id, "language": file.language, "path": file.path,
             "contentHash": file.hash, "extractionContext": context,
@@ -3084,7 +3084,7 @@ fn v8_document_projection(
     regions.sort_by(|a, b| a.id.cmp(&b.id));
     let graph_hash = v8_id(
         "",
-        b"baleyg.graph-projection.v1\0",
+        b"trellis.graph-projection.v1\0",
         serde_json::json!({
             "documentVersionId": version_id,
             "nodes": nodes, "calls": calls, "regions": regions,
@@ -3098,7 +3098,7 @@ fn v8_document_projection(
     selected_relations.sort_by(|a, b| a.id.cmp(&b.id));
     let class_hash = v8_id(
         "",
-        b"baleyg.class-projection.v1\0",
+        b"trellis.class-projection.v1\0",
         serde_json::json!({
             "graphProjectionId": graph_id,
             "classes": selected_classes, "relations": selected_relations,
@@ -4114,7 +4114,7 @@ fn revision_producer_binding(db: &Connection, revision_key: &str) -> Result<(Str
     }));
     Ok((
         executable,
-        crate::native_ids::digest(b"baleyg.revision-producer-binding.v1\0", &canonical),
+        crate::native_ids::digest(b"trellis.revision-producer-binding.v1\0", &canonical),
     ))
 }
 
@@ -4287,7 +4287,7 @@ fn validate_paired_metadata(
     control_ensure!(
         producer
             .as_ref()
-            .is_some_and(|(id, kind)| id == "baleyg.native.syntax" && kind == "native")
+            .is_some_and(|(id, kind)| id == "trellis.native.syntax" && kind == "native")
             && source
                 .as_ref()
                 .is_some_and(|(id, root)| id == &expected_source && root == root_id)
@@ -4917,7 +4917,7 @@ impl V8NativeScope {
         format!(
             "native-proof:v1:{}",
             crate::native_ids::digest(
-                b"baleyg.native-proof.v1\0",
+                b"trellis.native-proof.v1\0",
                 &crate::native_ids::canonical(&serde_json::json!({
                     "producerId":self.producer_id,"document":self.key,
                     "revisionId":self.native_revision_id
@@ -5733,7 +5733,7 @@ impl Store {
         let db = open_index(&index, false).map_err(|error| {
             if recovery_class(&error) == RecoveryClass::RecreatePending {
                 anyhow::anyhow!(
-                    "recovery_required: exceptional index format; run explicit baleyg index"
+                    "recovery_required: exceptional index format; run explicit trellis index"
                 )
             } else {
                 error
@@ -5755,7 +5755,7 @@ impl Store {
             "incompatible_index: unsupported reconcile options"
         );
         options.require_absolute_optional_inputs().context(
-            "recovery_required: recorded relative index input; run explicit baleyg index",
+            "recovery_required: recorded relative index input; run explicit trellis index",
         )?;
         let status = store.read_status(&db)?;
         store.identity.verify_readonly()?;
@@ -6698,7 +6698,7 @@ impl Store {
                     db.blob_open(rusqlite::MAIN_DB, "index_metadata", column_name, 1, true)?;
                 let byte_length = blob.len();
                 let mut digest = Sha256::new();
-                digest.update(b"baleyg-index-metadata-witness-v1\0");
+                digest.update(b"trellis-index-metadata-witness-v1\0");
                 digest.update(tag);
                 digest.update([u8::from(text)]);
                 digest.update((byte_length as u64).to_le_bytes());
@@ -7114,7 +7114,7 @@ impl Store {
             "incompatible_index: unsupported reconcile options"
         );
         options.require_absolute_optional_inputs().context(
-            "recovery_required: recorded relative index input; run explicit baleyg index",
+            "recovery_required: recorded relative index input; run explicit trellis index",
         )?;
         let mut result =
             crate::indexer::IndexOptions::new(Path::new(&self.workspace_root).to_owned());
@@ -9075,7 +9075,7 @@ impl Store {
             )?;
             let projected = v8_id(
                 "",
-                b"baleyg.graph-projection.v1\0",
+                b"trellis.graph-projection.v1\0",
                 serde_json::json!({
                     "documentVersionId":version,"nodes":nodes,"calls":calls,"regions":regions
                 }),
@@ -9105,7 +9105,7 @@ impl Store {
             )?;
             let projected = v8_id(
                 "",
-                b"baleyg.class-projection.v1\0",
+                b"trellis.class-projection.v1\0",
                 serde_json::json!({
                     "graphProjectionId":graph_id,"classes":classes,"relations":relations
                 }),
@@ -13564,7 +13564,7 @@ mod rebaseline_fault_tests {
         let cancel = Arc::new(AtomicBool::new(false));
         for size in ["medium", "large"] {
             // Explicit diagnostic only; the default proof always measures both pinned cohorts.
-            if size == "large" && std::env::var_os("BALEYG_ONLY_MEDIUM_DIAGNOSTIC").is_some() {
+            if size == "large" && std::env::var_os("TRELLIS_ONLY_MEDIUM_DIAGNOSTIC").is_some() {
                 break;
             }
             let state = tempfile::tempdir().unwrap();
@@ -16184,12 +16184,12 @@ mod live_sqlite_witness_tests {
     // independent check-handle close erased SQLite's POSIX fcntl locks.
     #[test]
     fn sqlite_lock_contender_child() {
-        let Some(path) = std::env::var_os("BALEYG_LIVE_SQLITE_LOCK_CHILD") else {
+        let Some(path) = std::env::var_os("TRELLIS_LIVE_SQLITE_LOCK_CHILD") else {
             return;
         };
         let db = Connection::open(path).unwrap();
         db.busy_timeout(Duration::ZERO).unwrap();
-        let update = match std::env::var("BALEYG_LIVE_SQLITE_LOCK_TABLE").as_deref() {
+        let update = match std::env::var("TRELLIS_LIVE_SQLITE_LOCK_TABLE").as_deref() {
             Ok("queue") => "UPDATE queue_identity SET root_key=root_key",
             Ok("index") => "UPDATE index_metadata SET last_opened_at=last_opened_at",
             _ => std::process::exit(19),
@@ -16209,9 +16209,9 @@ mod live_sqlite_witness_tests {
         Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("store::live_sqlite_witness_tests::sqlite_lock_contender_child")
-            .env("BALEYG_LIVE_SQLITE_LOCK_CHILD", path)
+            .env("TRELLIS_LIVE_SQLITE_LOCK_CHILD", path)
             .env(
-                "BALEYG_LIVE_SQLITE_LOCK_TABLE",
+                "TRELLIS_LIVE_SQLITE_LOCK_TABLE",
                 if path.file_name().is_some_and(|name| name == "requests.db") {
                     "queue"
                 } else {
@@ -16333,11 +16333,11 @@ mod sqlite_deleted_witness_tests {
 
     #[test]
     fn fixed_capacity_fails_before_opening_another_sqlite_inode() {
-        if std::env::var_os("BALEYG_WITNESS_CAP_CHILD").is_none() {
+        if std::env::var_os("TRELLIS_WITNESS_CAP_CHILD").is_none() {
             let outcome = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("store::sqlite_deleted_witness_tests::fixed_capacity_fails_before_opening_another_sqlite_inode")
-                .env("BALEYG_WITNESS_CAP_CHILD", "1")
+                .env("TRELLIS_WITNESS_CAP_CHILD", "1")
                 .output().unwrap();
             assert!(
                 outcome.status.success(),
@@ -16419,11 +16419,11 @@ mod sqlite_deleted_witness_tests {
     }
     #[test]
     fn aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses() {
-        if std::env::var_os("BALEYG_STAGE_RETRY_CHILD").is_none() {
+        if std::env::var_os("TRELLIS_STAGE_RETRY_CHILD").is_none() {
             let outcome = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("store::sqlite_deleted_witness_tests::aborted_stage_retries_and_successful_recreations_do_not_accumulate_witnesses")
-                .env("BALEYG_STAGE_RETRY_CHILD", "1")
+                .env("TRELLIS_STAGE_RETRY_CHILD", "1")
                 .output().unwrap();
             assert!(
                 outcome.status.success(),
@@ -16476,11 +16476,11 @@ mod sqlite_deleted_witness_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn isolated_filesystem_returns_allocated_blocks_only_after_verified_release() {
-        if std::env::var_os("BALEYG_SPACE_CHILD").is_none() {
+        if std::env::var_os("TRELLIS_SPACE_CHILD").is_none() {
             let outcome = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("store::sqlite_deleted_witness_tests::isolated_filesystem_returns_allocated_blocks_only_after_verified_release")
-                .env("BALEYG_SPACE_CHILD", "1")
+                .env("TRELLIS_SPACE_CHILD", "1")
                 .output().unwrap();
             assert!(
                 outcome.status.success(),
@@ -16504,7 +16504,7 @@ mod sqlite_deleted_witness_tests {
                 "-fs",
                 "HFS+",
                 "-volname",
-                "baleyg-witness-test",
+                "trellis-witness-test",
                 "-type",
                 "SPARSE",
                 "-quiet",
@@ -16635,11 +16635,11 @@ mod sqlite_deleted_witness_tests {
     }
     #[test]
     fn foreign_replacement_stage_refuses_release_and_preserves_foreign_inode() {
-        if std::env::var_os("BALEYG_FOREIGN_STAGE_CHILD").is_none() {
+        if std::env::var_os("TRELLIS_FOREIGN_STAGE_CHILD").is_none() {
             let outcome = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg("store::sqlite_deleted_witness_tests::foreign_replacement_stage_refuses_release_and_preserves_foreign_inode")
-                .env("BALEYG_FOREIGN_STAGE_CHILD", "1")
+                .env("TRELLIS_FOREIGN_STAGE_CHILD", "1")
                 .output().unwrap();
             assert!(
                 outcome.status.success(),

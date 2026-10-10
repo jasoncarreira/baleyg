@@ -8,22 +8,22 @@ Neither output proves runtime ordering or constitutes a sequence diagram.
 ## Authorization and startup
 
 The user authorized a $5 budget for the feature-factory snapshot. Its original independent
-ledger was `.baleyg/jev-question-budget`; that in-checkout path is no longer allowed. With
-Baleyg stopped, manually move the existing ledger to an external private directory before
+ledger was `.trellis/jev-question-budget`; that in-checkout path is no longer allowed. With
+Trellis stopped, manually move the existing ledger to an external private directory before
 reopening it; do not create a fresh ledger to reset its balance. The previous experiment
 ledger stays closed.
 Supply `JEV_KEY` through the process environment from a local secret store. The daemon
 never reads `.env` itself. Do not put the key in command arguments, source or logs.
 
 ```sh
-mkdir -m 700 -p "$HOME/.baleyg-private"
-# With Baleyg stopped, first move the old ledger here if it still exists in .baleyg/.
+mkdir -m 700 -p "$HOME/.trellis-private"
+# With Trellis stopped, first move the old ledger here if it still exists in .trellis/.
 cargo run --locked -- serve \
   --workspace tests/fixtures/extraction/inputs/feature-factory \
-  --token-file "$HOME/.baleyg-private/token" \
+  --token-file "$HOME/.trellis-private/token" \
   --scip tests/fixtures/extraction/feature-factory.scip \
   --manifest tests/fixtures/extraction/feature-factory.hashes.json \
-  --jev-budget-dir "$HOME/.baleyg-private/jev-question-budget" \
+  --jev-budget-dir "$HOME/.trellis-private/jev-question-budget" \
   --jev-budget-cents 500
 ```
 
@@ -61,7 +61,7 @@ There is no API for changing provider URL, credentials or budget authorization.
 
 ## Evidence encoding and current quality limits
 
-The provider-only `baleyg-evidence-tables-v1` encoding interns repeated identities and
+The provider-only `trellis-evidence-tables-v1` encoding interns repeated identities and
 stores graph objects as column/row tables with explicit source-range columns. Independent
 test decoding reconstructs the exact native packet. Full source text is never truncated.
 Candidate aliases still bind to the full native packet hash.

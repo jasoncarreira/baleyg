@@ -1,13 +1,13 @@
 mod common;
-use baleyg::{
-    indexer::{IndexOptions, index_workspace},
-    model::*,
-};
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
 };
 use tempfile::TempDir;
+use trellis::{
+    indexer::{IndexOptions, index_workspace},
+    model::*,
+};
 #[test]
 fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
     let temp = TempDir::new().unwrap();
@@ -30,7 +30,7 @@ fn real_syntax_rename_orphans_notes_and_cached_graph_preserves_call_order() {
         &graph,
         &root,
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
         },
@@ -163,7 +163,7 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
         &first,
         &root,
         session.leader_guard().unwrap(),
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: store.index_baseline().unwrap().index_generation,
             index_revision: 0,
         },
@@ -225,15 +225,15 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

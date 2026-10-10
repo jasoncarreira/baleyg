@@ -1,5 +1,7 @@
 # Decision 0005: same-generation executable drift (PR #98 owner ruling)
 
+> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
+
 **Status:** owner-ratified PR repair for schema 8 / current native extractor.
 
 `native_producers.executable_hash` is the immutable **generation-origin** descriptor, not a gate against an ordinary executable rebuild. A new executable hash keeps the generation, old pins and `requests.db`. It requires FULL fresh capture, measurement, extraction and validation. New revisions retain their own executable Present SHA and an additive per-revision binding over canonical persisted selector observations, executing producer identity and revision-header hashes. Selected new-pin reads recompute the binding and refuse missing or mismatched fields. Existing validated pins remain readable under their original T00 trust-as-written publication boundary.

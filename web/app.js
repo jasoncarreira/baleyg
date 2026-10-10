@@ -26,7 +26,7 @@ const IndexPin = Object.freeze({
   label(value) { const pin = this.copy(value); return `${pin.indexGeneration.slice(0, 8)}:${pin.indexRevision}`; },
   isConflict(error) { return error?.status === 409 && error.code === "revision_conflict"; },
 });
-window.BaleygIndexPin = IndexPin;
+window.TrellisIndexPin = IndexPin;
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const objectValue = value => !!value && typeof value === "object" && !Array.isArray(value);
 const savedReasonText = Object.freeze({
@@ -170,7 +170,7 @@ async function api(path, method = "GET", body) {
     error.status = response.status;
     error.code = data?.error?.code;
     error.reason = data?.error?.reason;
-    error.workspaceRoot = response.headers?.get?.("X-Baleyg-Workspace") || null;
+    error.workspaceRoot = response.headers?.get?.("X-Trellis-Workspace") || null;
     if (error.status === 401 || error.status === 403) disconnect("Authentication failed. Connect with a daemon token again.");
     else if (root && error.code === "workspace_selection_failed") invalidateSelection("Checkout identity changed. Choose an available checkout again.");
     throw error;
@@ -189,7 +189,7 @@ async function perform(action, control) {
     current = operationGuard();
     await pending;
   }
-  catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.BaleygShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
+  catch (error) { if (error.name !== "AbortError" && current()) { if (IndexPin.isConflict(error)) { void refreshStatus().catch(() => {}); window.TrellisShell?.resetInspector(); diagramSerial++; invalidateFocus("Index changed. Preview again after refreshing."); clearSource(); renderResult(); stale("The index revision changed. Refresh this view before reading source."); } $("error").textContent = error.message; $("error").hidden = false; if ($("focus-state").textContent.startsWith("Preparing")) $("focus-state").textContent = "Preview failed. Check the error and try again."; } }
   finally { if (control) control.disabled = false; syncFocusControls(); syncSavedControls(); }
 }
 function form(id, action) {
@@ -197,9 +197,9 @@ function form(id, action) {
 }
 function stale(message) { $("stale").textContent = message; $("stale").hidden = false; }
 function clearSource() {
-  sourceSerial++; window.BaleygNavigation?.reset(); $("source").replaceChildren();
+  sourceSerial++; window.TrellisNavigation?.reset(); $("source").replaceChildren();
   $("source-path").textContent = "Choose a call to read its cached source snapshot.";
-  if (!$("source-dock")?.hidden) window.BaleygShell?.closeSource?.();
+  if (!$("source-dock")?.hidden) window.TrellisShell?.closeSource?.();
 }
 function changedCount(value) { return Array.isArray(value) ? value.length : Number(value || 0); }
 async function refreshStatus(followup = false) {
@@ -217,7 +217,7 @@ async function refreshStatus(followup = false) {
       $("checkout-select").value = root;
       $("checkout-root").textContent = workspaceRoot || "Selected checkout · verified root unavailable until status responds";
       $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
-      window.BaleygShell?.setConnected(true);
+      window.TrellisShell?.setConnected(true);
       $("status").textContent = "No validated index head is available yet.";
       $("checkout-state").textContent = "Index not ready. Retry status after indexing starts.";
       stale("Index not ready. Retry status after indexing starts.");
@@ -246,7 +246,7 @@ async function refreshStatus(followup = false) {
   status = {...data, revision:nextPin};
   data = status;
   if (hadStatus && browseChanged && !workspaceChanged) { renderViews(); renderNotes(); }
-  window.BaleygShell?.updateWorkspace(nextPin ? status : null);
+  window.TrellisShell?.updateWorkspace(nextPin ? status : null);
   $("catching-up").hidden = data.catchingUp !== true || !nextPin;
   if (browseChanged && nextPin) await loadTreeRoot();
   if (serial !== statusSerial || session !== epoch || status !== data) return;
@@ -314,7 +314,7 @@ async function loadSaved() {
   }
   renderViews(); renderNotes();
 }
-const tokenStorageKey = "baleyg.daemonToken.v1";
+const tokenStorageKey = "trellis.daemonToken.v1";
 let tokenFileSerial = 0;
 const safeTokenText = value => value.length <= 512 && /^[A-Za-z0-9_-]+$/.test(value);
 function forgetStoredToken() {
@@ -365,7 +365,7 @@ function resetCheckout() {
   $("stale").hidden = true; $("catching-up").hidden = true;
   $("checkout-root").textContent = "No checkout selected";
   $("workspace").hidden = true; $("index").disabled = true; $("cancel").hidden = true;
-  window.BaleygShell?.setConnected(false);
+  window.TrellisShell?.setConnected(false);
 }
 function disconnect(message) {
   tokenFileSerial++; const forgotten = forgetStoredToken();
@@ -463,7 +463,7 @@ async function selectCheckout(key) {
   $("checkout-root").textContent = "Verifying selected checkout…";
   $("checkout-state").textContent = "Loading selected checkout…";
   $("workspace").hidden = false; $("refresh").disabled = false; $("index").disabled = false;
-  window.BaleygShell?.setConnected(true);
+  window.TrellisShell?.setConnected(true);
   const session = epoch;
   try {
     await refreshStatus();
@@ -528,7 +528,7 @@ form("search-form", async () => {
   if (!data.items.length) $("search-state").textContent = "No symbols found. Try another name or index the workspace.";
 });
 async function selectSymbol(symbol) {
-  diagramSerial++; window.BaleygShell?.resetInspector();
+  diagramSerial++; window.TrellisShell?.resetInspector();
   seed = symbol.id; $("seed").textContent = `${symbol.name} · ${symbol.path}`;
   $("depth").value = "1"; $("callbacks").checked = false; renderNotes(); await runQuery();
 }
@@ -641,7 +641,7 @@ async function showSource(item, revision) {
   if (!sourceWitness(item)) throw new Error("Measured source path and range unavailable.");
   if (!status?.revision || !IndexPin.equal(revision, status.revision)) throw new Error("This source has no current paired snapshot. Refresh the view first.");
   const serial = ++sourceSerial; const key = `${IndexPin.key(revision)}:${item.path}`;
-  window.BaleygNavigation?.reset();
+  window.TrellisNavigation?.reset();
   $("source-path").textContent = `Loading ${item.path}…`; $("source").replaceChildren();
   const data = sourceCache.get(key) || await api(`/api/source?path=${encodeURIComponent(item.path)}&${IndexPin.query(revision)}`);
   if (serial !== sourceSerial || !IndexPin.equal(status?.revision, revision)) return;
@@ -655,8 +655,8 @@ async function showSource(item, revision) {
     line.append(element("span", String(number), "line-number"), document.createTextNode(text)); fragment.append(line);
   });
   $("source").replaceChildren(fragment);
-  window.BaleygShell?.showSource("workspace");
-  window.BaleygNavigation?.attachSource($("source"), {
+  window.TrellisShell?.showSource("workspace");
+  window.TrellisNavigation?.attachSource($("source"), {
     path:data.file.path, revision:data.revision, startLine:item.range.startLine,
     isCurrent: () => serial === sourceSerial && !!token && IndexPin.equal(status?.revision, revision) &&
       !$("source-dock")?.hidden && !$("workspace-source-panel")?.hidden,
@@ -827,8 +827,8 @@ function schedulePoll() {
   }), 700);
 }
 $("index").addEventListener("click", () => perform(async () => {
-  window.BaleygClasses?.reset();
-  diagramSerial++; window.BaleygShell?.resetInspector(); clearSource();
+  window.TrellisClasses?.reset();
+  diagramSerial++; window.TrellisShell?.resetInspector(); clearSource();
   job = await api("/api/index", "POST", {}); waitingForJob = true; showJob(); schedulePoll();
 }, $("index")).then(() => { if (job) showJob(); }));
 $("cancel").addEventListener("click", () => {
@@ -935,7 +935,7 @@ $("export-jev").addEventListener("click", () => perform(async () => {
   if (bytes.byteLength > 176000) throw new Error(`Provider request is ${bytes.byteLength} bytes; the limit is 176000 bytes. Nothing was downloaded. Reduce evidence depth or select a smaller root and preview again.`);
   const blob = new Blob([bytes], {type: "application/json"});
   const url = URL.createObjectURL(blob), link = element("a");
-  link.href = url; link.download = "baleyg-jev-request.json"; document.body.append(link); link.click(); link.remove();
+  link.href = url; link.download = "trellis-jev-request.json"; document.body.append(link); link.click(); link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
   $("focus-state").textContent = "Provider request downloaded with source code. No provider call was made.";
 }, $("export-jev")));
@@ -1085,9 +1085,9 @@ const fileStates = new Map(), closedDirectories = new Set();
 let treeMode = false, treeRoot = null, indexedWorkspace = "";
 const directories = new Map();
 function clearBrowse(message = "Expand a file and select a method.") {
-  window.BaleygClasses?.reset();
+  window.TrellisClasses?.reset();
   if ($("method-class")) $("method-class").disabled = true;
-  window.BaleygShell?.resetInspector();
+  window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   browseSerial++; diagramSerial++; catalogSerial++; directoryRefreshSerial++; files = []; nextFileOffset = null; selectedMethod = null;
   directories.clear(); treeMode = false; treeRoot = null; indexedWorkspace = "";
@@ -1189,7 +1189,7 @@ async function toggleFile(file) {
   } finally { if (current()) { state.loading = false; renderFiles(); } }
 }
 async function selectMethod(symbol) {
-  window.BaleygShell?.showView("sequence");
+  window.TrellisShell?.showView("sequence");
   if ($("method-class")) $("method-class").disabled = !classLanguage(symbol.path);
   selectedMethod = symbol; $("method-source").disabled = false; seed = symbol.id; querySerial++; invalidateFocus(); result = null;
   $("seed").textContent = `${symbol.name} · ${symbol.path}`;
@@ -1198,7 +1198,7 @@ async function selectMethod(symbol) {
   if (selectedMethod === symbol && window.matchMedia?.("(max-width: 850px)").matches) $("sequence-title").scrollIntoView?.({block:"start"});
 }
 async function loadSequence() {
-  window.BaleygShell?.resetInspector();
+  window.TrellisShell?.resetInspector();
   if ($("sequence-warning-count")) $("sequence-warning-count").textContent = "0";
   if (!selectedMethod || !status) return;
   const serial = ++diagramSerial, guard = browseGuard(), symbol = selectedMethod, revision = IndexPin.copy(status.revision);
@@ -1212,10 +1212,10 @@ async function loadSequence() {
     if (data.seed.id !== symbol.id) throw new Error("Sequence provenance mismatch. Nothing displayed.");
     const readSource = step => { if (current()) return perform(() => showSource(step, revision)); };
     const options = {showDetails: !!$("all-steps").checked, isCurrent: () => current() && IndexPin.equal(status?.revision, revision)};
-    if (window.BaleygShell) options.onSelect = step => {
-      if (current()) window.BaleygShell?.selectStep(step, data, () => readSource(step));
+    if (window.TrellisShell) options.onSelect = step => {
+      if (current()) window.TrellisShell?.selectStep(step, data, () => readSource(step));
     };
-    window.BaleygSequence.render($("sequence-diagram"), data, readSource, new Set(), options);
+    window.TrellisSequence.render($("sequence-diagram"), data, readSource, new Set(), options);
     if ($("sequence-warning-count")) $("sequence-warning-count").textContent = String((data.warnings || []).length);
     $("sequence-state").textContent = `${symbol.name} · ${symbol.path} · revision ${IndexPin.label(revision)} · ${data.hiddenSteps} incidental steps hidden${data.truncated ? " · truncated" : ""}${!data.steps.length ? " · No visible behavior steps. Read method source for context." : ""}`;
     for (const warning of data.warnings || []) $("sequence-warnings").append(element("li", warning, "warning"));
@@ -1575,7 +1575,7 @@ async function loadExternalFile(root, path) {
     for (const warning of data.warnings || []) $("external-warnings").append(element("li", warning, "warning"));
     $("external-filter").disabled = false; $("external-filter").value = "";
     $("external-state").textContent = `Candidate snapshot opened: ${data.rootLabel} · ${data.path}. Not workspace evidence.`;
-    window.BaleygShell?.showSource("library");
+    window.TrellisShell?.showSource("library");
     renderExternalDefinitions(); renderExternalSource();
   } catch (error) {
     if (current() && error.name !== "AbortError") {
@@ -1769,7 +1769,7 @@ async function loadDependencySource(symbol) {
     for (const warning of data.warnings || []) $("external-warnings").append(element("li", warning, "warning"));
     $("external-filter").disabled = false; $("external-filter").value = "";
     $("dependency-symbol-state").textContent = `Candidate snapshot opened: ${symbol.qualifiedName || symbol.name}. Not workspace evidence.`;
-    window.BaleygShell?.showSource("library");
+    window.TrellisShell?.showSource("library");
     renderExternalDefinitions(); renderExternalSource(symbol.range);
   } catch (error) {
     if (current() && error.name !== "AbortError") {
@@ -1788,18 +1788,18 @@ $("dependency-next")?.addEventListener("click", () => { if (!$("dependency-next"
 // a sequence participant's type or call a provider.
 function classLanguage(path) { return /\.(?:java|py)$/i.test(path || ""); }
 async function openClasses(options = {}) {
-  if (!token || !status || !window.BaleygClasses) return;
-  clearSource(); window.BaleygShell?.resetInspector();
-  window.BaleygShell?.showView("classes");
-  return window.BaleygClasses.open(options.seed ? {seed:options.seed} : options);
+  if (!token || !status || !window.TrellisClasses) return;
+  clearSource(); window.TrellisShell?.resetInspector();
+  window.TrellisShell?.showView("classes");
+  return window.TrellisClasses.open(options.seed ? {seed:options.seed} : options);
 }
 function attachClassMenu(node, options) {
-  if (!classLanguage(options.path) || !window.BaleygClasses?.showContextMenu) return;
+  if (!classLanguage(options.path) || !window.TrellisClasses?.showContextMenu) return;
   const current = browseGuard();
   const show = event => {
     if (!current() || !token || !status) return;
     event.preventDefault();
-    window.BaleygClasses.showContextMenu(event, [{
+    window.TrellisClasses.showContextMenu(event, [{
       label: options.seed ? "Show enclosing class diagram" : "Show class diagram",
       run: () => { if (current()) return perform(() => openClasses(options)); },
     }]);
@@ -1809,7 +1809,7 @@ function attachClassMenu(node, options) {
     if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) show(event);
   });
 }
-window.BaleygNavigation?.init({
+window.TrellisNavigation?.init({
   request: (path, options = {}) => api(path, options.method || "GET", options.body),
   onStale: unexpectedPair,
   currentRevision: () => status?.revision,
@@ -1817,18 +1817,18 @@ window.BaleygNavigation?.init({
   openClass: symbol => perform(() => openClasses({seed:symbol.id})),
   selectMethod: symbol => perform(() => selectMethod(symbol)),
   openSource: (symbol, revision) => perform(() => showSource(symbol, revision)),
-  showMenu: (event, actions, options) => window.BaleygClasses?.showContextMenu(event, actions, options),
+  showMenu: (event, actions, options) => window.TrellisClasses?.showContextMenu(event, actions, options),
 });
 function initClassView() {
-  window.BaleygClasses?.init({
+  window.TrellisClasses?.init({
     request: (path, options = {}) => api(path, options.method || "GET", options.body),
     onStale: unexpectedPair,
     currentRevision: () => status?.revision,
     currentSession: () => `${epoch}:${status?.workspaceRoot || ""}`,
-    onChange: () => { clearSource(); window.BaleygShell?.resetInspector(); },
+    onChange: () => { clearSource(); window.TrellisShell?.resetInspector(); },
     readSource: (item, revision) => perform(() => showSource(item, revision)),
     selectMethod: symbol => perform(() => selectMethod(symbol)),
-    navigateMember: (event, selector, options) => window.BaleygNavigation?.open(event, selector, options),
+    navigateMember: (event, selector, options) => window.TrellisNavigation?.open(event, selector, options),
   });
 }
 initClassView();

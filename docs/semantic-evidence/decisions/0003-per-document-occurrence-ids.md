@@ -1,5 +1,7 @@
 # Decision 0003: per-document occurrence identity, revision-scoped semantic validity
 
+> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
+
 - **Status:** proposed amendment for owner ratification. It changes normative text in `../contract-v1.md` (#22), `0002-publication-rejoin.md` and `../publication-rejoin-vectors-v1.md` (#11A). It changes no deployed schema by itself; implementation follows in separate reviewed work (see [Implementation impact](#implementation-impact)).
 - **Scope:** occurrence identity (`OccurrenceId`), the extraction-context digest it depends on, and the rules that relied on occurrence IDs being revision-bound. Syntax identity (`SyntaxId`), canonical bytes, `Revision.id`, coverage, freshness, warnings-v1, and the 11A raw envelope and proof rules are unchanged.
 - **Compatibility: none.** Pre-release, the owner requires no backward compatibility. There is **one** occurrence identity, `occ:v2`. The revision-bound `occ:v1` derivation is withdrawn everywhere. This supersedes Decision 0002's clause keeping legacy #26 `formatVersion:1` example bytes immutable, as far as those bytes carry occurrence IDs: the frozen normalized `formatVersion:1` fixture records and the #57 v1 vector rows are regenerated under `occ:v2`.
@@ -16,7 +18,7 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
 
 ## Decision
 
-1. **Extraction context.** For each document, `extractionContext` is the full SHA-256 over domain `baleyg.extraction-context.v1\0` and the #22 canonical bytes of `{language:Language, components:[{name:Text, hash:Hash}]}`.
+1. **Extraction context.** For each document, `extractionContext` is the full SHA-256 over domain `trellis.extraction-context.v1\0` and the #22 canonical bytes of `{language:Language, components:[{name:Text, hash:Hash}]}`.
    - `components` lists **every** non-source input that the native producer reads for that document's language and that can affect any native measured field or projection: configuration, toolchain and dependency captures, each by its captured component digest. They are sorted by `name`, then `hash`, and unique.
    - A producer that reads no such input has `components: []`.
    - The native producer declares which components it reads. Starting to read another input is a native producer version change (item 3).
@@ -29,7 +31,7 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
    {contentHash:Hash, extractionContext:Hash, nativeProducerId:Text, nativeProducerVersion:Text, ownerSyntaxId:SyntaxId, kind:call|reference|control, ordinal:UInt}
    ```
 
-   - The domain is `baleyg.occurrence.v2\0`, and the emitted form is `occ:v2:` followed by the first 32 lowercase hex characters (16 bytes) of the full SHA-256.
+   - The domain is `trellis.occurrence.v2\0`, and the emitted form is `occ:v2:` followed by the first 32 lowercase hex characters (16 bytes) of the full SHA-256.
    - `contentHash` is the containing document's exact content digest.
    - `nativeProducerId`/`nativeProducerVersion` are the native producer descriptor's `id` and `version`.
    - `ownerSyntaxId` is the emitted 128-bit owner ID, which binds the source set, path and language.
@@ -62,13 +64,13 @@ The v1 rule "occurrence-keyed evidence never crosses revisions" protects **seman
 
 ## Vectors
 
-[`../publication-rejoin-vectors-v1.md`](../publication-rejoin-vectors-v1.md#occurrence-identity-v2-decision-0003) gives the exact `extractionContext` and `occ:v2` rows for the #57 fixture's A.js call and reference. They include controls for a changed native producer version and a changed extraction context, and they replace the withdrawn v1 rows. They were computed from #22 canonical bytes with `tools/semantic-contract/json.mjs::canonicalBytes` and independently re-canonicalized and hashed with Python `hashlib`. The same method reproduces the withdrawn v1 `r1/call` digest (`ccc4d599…`).
+[`../publication-rejoin-vectors-v1.md`](../publication-rejoin-vectors-v1.md#occurrence-identity-v2-decision-0003) gives the exact `extractionContext` and `occ:v2` rows for the #57 fixture's A.js call and reference. They include controls for a changed native producer version and a changed extraction context, and they replace the withdrawn v1 rows. They were computed from #22 canonical bytes with `tools/semantic-contract/json.mjs::canonicalBytes` and independently re-canonicalized and hashed with Python `hashlib`. The same method reproduces the withdrawn v1 `r1/call` digest (`959c5606…`).
 
 ## Implementation impact
 
 None of this is done by this docs change:
 
-- **`src/native_ids.rs`:** occurrence registration switches to domain `baleyg.occurrence.v2\0`, prefix `occ:v2:` and the new input. `src/native_evidence.rs`: compute and declare `extractionContext`, and bump the native producer version.
+- **`src/native_ids.rs`:** occurrence registration switches to domain `trellis.occurrence.v2\0`, prefix `occ:v2:` and the new input. `src/native_evidence.rs`: compute and declare `extractionContext`, and bump the native producer version.
 - **`src/mcp/catalog.rs`, `src/mcp/tools.rs`:** the `occ:v1:` ID patterns become `occ:v2:`.
 - **`tools/semantic-contract/identity.mjs`** and every semantic-contract test and fixture that computes or pins occurrence IDs (`formats`, `identity`, `normalization`, `record-*`, `graph*`, `answers`, `counts`, `example-fixture`). That includes the frozen normalized `formatVersion:1` records (`tools/semantic-contract/schema.mjs` normalized record shapes), regenerated under `occ:v2` with their published hashes updated.
 - **Native tests** (e.g. `tests/python_indexer.rs`) that pin occurrence IDs.

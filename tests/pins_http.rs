@@ -4,15 +4,15 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
+use trellis::{
     http,
     indexer::{IndexOptions, index_workspace_bundle},
     model::{CancelFlag, Graph, IndexPin},
     store::Store,
 };
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn fixture_with_state() -> (
     tempfile::TempDir,
@@ -381,7 +381,7 @@ async fn index_admission_and_publication_pair() {
 
 #[test]
 fn sqlite_journal_child() {
-    let Some(path) = std::env::var_os("BALEYG_SQLITE_JOURNAL_CHILD") else {
+    let Some(path) = std::env::var_os("TRELLIS_SQLITE_JOURNAL_CHILD") else {
         return;
     };
     let db = rusqlite::Connection::open(path).unwrap();
@@ -420,7 +420,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     let leader = state.retained_serving_session().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "sqlite_journal_child", "--nocapture"])
-        .env("BALEYG_SQLITE_JOURNAL_CHILD", &db_path)
+        .env("TRELLIS_SQLITE_JOURNAL_CHILD", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -469,7 +469,7 @@ async fn active_and_hot_journal_keep_pinned_http_safe() {
     }
     assert_eq!(std::fs::read(&journal).unwrap(), hot_journal);
     let unrelated =
-        baleyg::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
+        trellis::store::topology::UseGuard::acquire_existing(&leader_path, true, true).unwrap();
     let state = http::new(
         store.clone(),
         IndexOptions::new(temp.path().join("workspace")),

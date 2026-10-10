@@ -1,5 +1,4 @@
 //! Real-process MCP socket ownership, framing, and interrupted-session checks.
-use baleyg::daemon::protocol;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -10,6 +9,7 @@ use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
+use trellis::daemon::protocol;
 
 struct Peer {
     child: Child,
@@ -21,14 +21,14 @@ struct Peer {
 impl Peer {
     fn start(home: &Path, root: &Path) -> Self {
         let stderr = home.join(format!("stderr-{}.log", rand::random::<u64>()));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_trellis"))
             .arg("mcp")
             .arg("--workspace")
             .arg(root)
             .env("HOME", home)
             .env("XDG_CACHE_HOME", home.join("cache"))
             .env("XDG_DATA_HOME", home.join("data"))
-            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+            .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -147,7 +147,7 @@ fn owned_daemon_connection(home: &Path, pid: u32) -> Option<UnixStream> {
         .ok()?;
     (output.status.success()
         && String::from_utf8_lossy(&output.stdout).trim()
-            == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+            == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
     .then_some(stream)
 }
 
@@ -189,7 +189,7 @@ fn socket_under(home: &Path) -> Option<PathBuf> {
             let path = entry.path();
             let meta = fs::symlink_metadata(&path).ok()?;
             if meta.is_file() && path.file_name().is_some_and(|name| name == "daemon.lock") {
-                return Some(baleyg::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
+                return Some(trellis::daemon::SocketPaths::new(path.parent()?.parent()?).socket);
             }
             if meta.is_dir() {
                 dirs.push(path);
@@ -245,7 +245,7 @@ fn checkout(home: &Path) -> PathBuf {
 #[test]
 fn wrong_pid_marker_never_signals_test_owned_unrelated_process() {
     let home = tempfile::tempdir().unwrap();
-    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(
+    let owner = trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(
         &home.path().join("private-data"),
     ))
     .unwrap()
@@ -331,7 +331,7 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
     }});
     let sequence = [
         json!({"jsonrpc":"2.0","id":"cancelled","method":"tools/call","params":{
-            "name":"baleyg_find_symbols","arguments":{"schemaVersion":1,"query":"x"},
+            "name":"trellis_find_symbols","arguments":{"schemaVersion":1,"query":"x"},
             "_meta":metadata["_meta"]
         }}),
         json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancelled"}}),
@@ -395,7 +395,7 @@ fn concurrent_clients_share_single_socket_and_survive_bad_private_frame() {
 fn daemon_death_interrupts_session_and_next_launch_recovers() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -424,7 +424,7 @@ fn daemon_death_interrupts_session_and_next_launch_recovers() {
             .unwrap()
             .contains("root_changed")
     );
-    assert!(!root.join(".git/baleyg/workspace-id").exists());
+    assert!(!root.join(".git/trellis/workspace-id").exists());
     let mut client = Peer::start(home.path(), &root);
     assert_eq!(
         client.ask(
@@ -494,7 +494,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
         ],
     );
     let linked = linked.canonicalize().unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -528,7 +528,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
         20,
         "tools/call",
         json!({
-            "name":"baleyg_workspace_describe",
+            "name":"trellis_workspace_describe",
             "arguments":{"schemaVersion":1,"workspace":linked}
         }),
     );
@@ -543,7 +543,7 @@ fn legacy_mcp_reconnect_restores_handshake_without_new_client() {
         3,
         "tools/call",
         json!({
-            "name":"baleyg_workspace_describe",
+            "name":"trellis_workspace_describe",
             "arguments":{"schemaVersion":1,"workspace":linked}
         }),
     );
@@ -567,17 +567,17 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
         let phase_path = PathBuf::from(format!(
-            "/tmp/baleyg-107-mcp-{}.sock",
+            "/tmp/trellis-107-mcp-{}.sock",
             rand::random::<u64>()
         ));
         let listener = UnixListener::bind(&phase_path).unwrap();
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
             .arg("daemon")
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
             .env("XDG_DATA_HOME", home.path().join("data"))
-            .env("BALEYG_TEST_MCP_PHASE", "launch_final")
-            .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+            .env("TRELLIS_TEST_MCP_PHASE", "launch_final")
+            .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -594,7 +594,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             "{}",
             json!({
                 "jsonrpc":"2.0","id":"cancel-A","method":"tools/call",
-                "params":{"name":"baleyg_workspace_describe",
+                "params":{"name":"trellis_workspace_describe",
                     "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}
             })
         )
@@ -623,7 +623,7 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
             let call = match n {
                 16 | 17 | 24 if n != 24 || count == 26 => {
                     json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
-                    "params":{"name":"baleyg_workspace_describe",
+                    "params":{"name":"trellis_workspace_describe",
                         "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}})
                 }
                 19 => json!({"jsonrpc":"2.0","id":119,"method":"no/such/method","params":metadata}),
@@ -632,9 +632,9 @@ fn cancellation_precedes_invalid_queue_and_sixteen_follow_ons() {
                 21 => json!({"jsonrpc":"2.0","id":121,"method":"tools/list",
                     "params":{"cursor":"unexpected","_meta":metadata["_meta"]}}),
                 22 => json!({"jsonrpc":"2.0","id":122,"method":"tools/call",
-                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}}}),
+                    "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1}}}),
                 23 => json!({"jsonrpc":"2.0","id":123,"method":"tools/call",
-                    "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+                    "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
                         "_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01",
                             "io.modelcontextprotocol/clientCapabilities":{}}}}),
                 _ => json!({"jsonrpc":"2.0","id":id,"method":"tools/list","params":metadata}),
@@ -770,17 +770,17 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let phase_path = PathBuf::from(format!(
-        "/tmp/baleyg-107-dup-{}.sock",
+        "/tmp/trellis-107-dup-{}.sock",
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env("XDG_DATA_HOME", home.path().join("data"))
-        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
-        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .env("TRELLIS_TEST_MCP_PHASE", "launch_final")
+        .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -794,7 +794,7 @@ fn duplicate_within_bounded_pending_queue_is_rejected_before_first_completes() {
         peer.stdin.as_mut().unwrap(),
         "{}",
         json!({"jsonrpc":"2.0","id":1,
-        "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+        "method":"tools/call","params":{"name":"trellis_workspace_describe",
             "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
     )
     .unwrap();
@@ -864,17 +864,17 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let phase_path = PathBuf::from(format!(
-        "/tmp/baleyg-107-eof-{}.sock",
+        "/tmp/trellis-107-eof-{}.sock",
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env("XDG_DATA_HOME", home.path().join("data"))
-        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
-        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .env("TRELLIS_TEST_MCP_PHASE", "launch_final")
+        .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -887,7 +887,7 @@ fn stdin_eof_cancels_in_flight_call_without_stdout() {
         "{}",
         json!({
             "jsonrpc":"2.0","id":91,"method":"tools/call",
-            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+            "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
             "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                 "io.modelcontextprotocol/clientCapabilities":{}}}
         })
@@ -923,17 +923,17 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
     let phase_path = PathBuf::from(format!(
-        "/tmp/baleyg-107-kill-{}.sock",
+        "/tmp/trellis-107-kill-{}.sock",
         rand::random::<u64>()
     ));
     let listener = UnixListener::bind(&phase_path).unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
         .env("XDG_DATA_HOME", home.path().join("data"))
-        .env("BALEYG_TEST_MCP_PHASE", "launch_final")
-        .env("BALEYG_TEST_MCP_PHASE_SOCKET", &phase_path)
+        .env("TRELLIS_TEST_MCP_PHASE", "launch_final")
+        .env("TRELLIS_TEST_MCP_PHASE_SOCKET", &phase_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -950,7 +950,7 @@ fn canceled_read_is_not_replayed_after_daemon_death() {
         "{}",
         json!({
             "jsonrpc":"2.0","id":"cancel-A","method":"tools/call",
-            "params":{"name":"baleyg_workspace_describe",
+            "params":{"name":"trellis_workspace_describe",
                 "arguments":{"schemaVersion":1},"_meta":metadata["_meta"]}
         })
     )
@@ -1009,7 +1009,7 @@ fn legacy_cancel_during_failed_synthetic_reattach_is_silent() {
 fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1056,7 +1056,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         }
     }
     let owner =
-        baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
+        trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(&data.unwrap()))
             .unwrap()
             .expect("killed daemon released singleton lock");
     let listener = owner.listener().try_clone().unwrap();
@@ -1099,7 +1099,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
                         "{}",
                         json!({"jsonrpc":"2.0","id":1,"result":{
                             "protocolVersion":"2025-11-25","capabilities":{"tools":{}},
-                            "serverInfo":{"name":"baleyg","version":"fixture"}}
+                            "serverInfo":{"name":"trellis","version":"fixture"}}
                         })
                     )
                     .unwrap();
@@ -1189,7 +1189,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
         6,
         "tools/call",
         json!({
-            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+            "name":"trellis_workspace_describe","arguments":{"schemaVersion":1}
         }),
     );
     assert_eq!(call["id"], 6, "{call}");
@@ -1207,7 +1207,7 @@ fn check_legacy_synthetic_reattach_cancel(cancel_id: u64, fail_setup: bool) {
 fn legacy_await_initialized_refuses_tool_after_daemon_death() {
     let home = tempfile::tempdir().unwrap();
     let root = checkout(home.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1234,7 +1234,7 @@ fn legacy_await_initialized_refuses_tool_after_daemon_death() {
         2,
         "tools/call",
         json!({
-            "name":"baleyg_workspace_describe","arguments":{"schemaVersion":1}
+            "name":"trellis_workspace_describe","arguments":{"schemaVersion":1}
         }),
     );
     assert_eq!(rejected["id"], 2, "{rejected}");
@@ -1262,7 +1262,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
     for close_stdin in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let root = checkout(home.path());
-        let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+        let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
             .arg("daemon")
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1293,10 +1293,11 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
                 }
             }
         }
-        let owner =
-            baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(&data.unwrap()))
-                .unwrap()
-                .unwrap();
+        let owner = trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(
+            &data.unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
         let listener = owner.listener().try_clone().unwrap();
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
@@ -1322,7 +1323,7 @@ fn failed_reattach_drains_pending_cancel_and_stdin_eof_before_failure() {
             peer.stdin.as_mut().unwrap(),
             "{}",
             json!({"jsonrpc":"2.0","id":7,
-            "method":"tools/call","params":{"name":"baleyg_workspace_describe",
+            "method":"tools/call","params":{"name":"trellis_workspace_describe",
                 "arguments":{"schemaVersion":1},"_meta":meta["_meta"]}})
         )
         .unwrap();
@@ -1394,7 +1395,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     let root = checkout(home.path());
     // Start once to create the production private directory, then replace its
     // stale socket under the same singleton lock with a controlled socket peer.
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("daemon")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
@@ -1423,7 +1424,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
     }
     let lock = lock.unwrap();
     let data = lock.parent().unwrap().parent().unwrap();
-    let owner = baleyg::daemon::SocketOwner::acquire(&baleyg::daemon::SocketPaths::new(data))
+    let owner = trellis::daemon::SocketOwner::acquire(&trellis::daemon::SocketPaths::new(data))
         .unwrap()
         .expect("the killed daemon released its lock");
     let listener = owner.listener().try_clone().unwrap();
@@ -1455,7 +1456,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
             .unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("mcp")
         .arg("--workspace")
         .arg(&root)
@@ -1472,7 +1473,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         "{}",
         json!({
             "jsonrpc":"2.0", "id":1,"method":"tools/call",
-            "params":{"name":"baleyg_workspace_describe","arguments":{"schemaVersion":1},
+            "params":{"name":"trellis_workspace_describe","arguments":{"schemaVersion":1},
                 "_meta":{
                     "io.modelcontextprotocol/protocolVersion":"2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities":{}
@@ -1541,7 +1542,7 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         "{}",
         json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"baleyg_workspace_describe",
+            "params":{"name":"trellis_workspace_describe",
                 "arguments":{"schemaVersion":1,"workspace":root.canonicalize().unwrap()},
                 "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities":{}}}
@@ -1581,14 +1582,14 @@ fn partial_daemon_reply_is_typed_and_never_reaches_stdout() {
         (
             3,
             "tools/call",
-            json!({"name":"baleyg_workspace_describe",
+            json!({"name":"trellis_workspace_describe",
             "arguments":{"schemaVersion":1}}),
             -32602,
         ),
         (
             4,
             "tools/call",
-            json!({"name":"baleyg_workspace_describe",
+            json!({"name":"trellis_workspace_describe",
             "arguments":{"schemaVersion":1},"_meta":{
                 "io.modelcontextprotocol/protocolVersion":"2099-01-01",
                 "io.modelcontextprotocol/clientCapabilities":{}}}),

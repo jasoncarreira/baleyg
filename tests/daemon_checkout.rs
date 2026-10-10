@@ -1,11 +1,11 @@
-use baleyg::{
+use std::{fs, path::Path, time::Duration};
+use trellis::{
     daemon::registry::{CheckoutOptions, CheckoutRegistry},
     store::{
         Store,
         topology::{TopologyRoots, WorkspaceIdentity},
     },
 };
-use std::{fs, path::Path, time::Duration};
 
 fn identity(root: &Path) -> WorkspaceIdentity {
     WorkspaceIdentity::discover(Some(root), root)
@@ -16,7 +16,7 @@ fn identity(root: &Path) -> WorkspaceIdentity {
 fn roots(state: &Path) -> TopologyRoots {
     TopologyRoots::isolated_for_tests(state.join("cache"), state.join("data"))
 }
-async fn ready(runtime: &baleyg::daemon::registry::CheckoutRuntime) {
+async fn ready(runtime: &trellis::daemon::registry::CheckoutRuntime) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok((response, catching_up)) = runtime.evidence_response() {
@@ -100,9 +100,9 @@ async fn external_standalone_leader_keeps_daemon_a_follower() {
     let topology = roots(base.path());
     let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let leader = baleyg::index_coordinator::establish_serving_session(
+    let leader = trellis::index_coordinator::establish_serving_session(
         &standalone,
-        Some(&baleyg::indexer::IndexOptions::new(checkout.clone())),
+        Some(&trellis::indexer::IndexOptions::new(checkout.clone())),
         &cancel,
     )
     .unwrap();
@@ -194,7 +194,7 @@ async fn committed_queue_survives_runtime_restart() {
     let id = identity(&checkout);
     let topology = roots(base.path());
     let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let accepted = store.enqueue_request(&options, None).unwrap();
     drop(store);
     let mut restarted = CheckoutRegistry::with_roots(topology.clone());
@@ -318,10 +318,10 @@ async fn queued_follower_is_pending_even_after_client_disconnect() {
     let id = identity(&checkout);
     let topology = roots(base.path());
     let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let leader =
-        baleyg::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
+        trellis::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
             .unwrap();
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
@@ -348,10 +348,10 @@ async fn follower_takeover_marks_h_pending_and_next_reattach_admits_old_head() {
     let id = identity(&checkout);
     let topology = roots(base.path());
     let standalone = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    let options = trellis::indexer::IndexOptions::new(checkout.clone());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let leader =
-        baleyg::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
+        trellis::index_coordinator::establish_serving_session(&standalone, Some(&options), &cancel)
             .unwrap();
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
@@ -465,7 +465,7 @@ async fn root_loss_fails_accepted_work_then_releases_old_runtime_handles() {
     ready(&old).await;
     let store = Store::open(topology, identity(&checkout)).unwrap();
     let row = store
-        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout.clone()), None)
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout.clone()), None)
         .unwrap();
     drop(store);
     fs::rename(&checkout, &moved).unwrap();
@@ -623,12 +623,12 @@ async fn cold_activation_preserves_recorded_scip_option() {
     let id = identity(&checkout);
     let topology = roots(base.path());
     let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let mut options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
     options.scip_path = Some(checkout.join("recorded.scip"));
     options.max_file_bytes = 8192;
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let owner =
-        baleyg::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
+        trellis::index_coordinator::establish_serving_session(&store, Some(&options), &cancel)
             .unwrap();
     assert!(owner.is_leader());
     drop(owner);
@@ -726,7 +726,7 @@ async fn failed_h_backoff_never_releases_accepted_fifo_work() {
     let topology = roots(base.path());
     let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
     let queued = store
-        .enqueue_request(&baleyg::indexer::IndexOptions::new(checkout), None)
+        .enqueue_request(&trellis::indexer::IndexOptions::new(checkout), None)
         .unwrap();
     let mut registry = CheckoutRegistry::with_roots(topology);
     registry.attach_launch(1, &id).unwrap();
@@ -797,8 +797,8 @@ async fn replaced_path_cold_runtime_publishes_new_identity_not_old_head() {
 
 #[tokio::test]
 async fn browser_identity_retires_replaced_root_after_lease_and_reads_finish() {
-    use baleyg::daemon::registry::{BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY};
     use std::time::Instant;
+    use trellis::daemon::registry::{BROWSER_IDLE_DELAY, CHECKOUT_RELEASE_DELAY};
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     let moved = base.path().join("old");
@@ -957,7 +957,7 @@ async fn browser_listing_and_discovery_do_not_reopen_released_sqlite_witnesses()
         "discovery must not pin released index"
     );
     let independent = Store::open(topology, identity(&checkout)).unwrap();
-    let owner = baleyg::index_coordinator::establish_serving_session(
+    let owner = trellis::index_coordinator::establish_serving_session(
         &independent,
         None,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1014,9 +1014,9 @@ async fn explicit_null_scip_clears_recorded_input_on_cold_activation() {
     let id = identity(&checkout);
     let topology = roots(base.path());
     let store = Store::open(topology.clone(), identity(&checkout)).unwrap();
-    let mut options = baleyg::indexer::IndexOptions::new(checkout.clone());
+    let mut options = trellis::indexer::IndexOptions::new(checkout.clone());
     options.scip_path = Some(checkout.join("old.scip"));
-    let owner = baleyg::index_coordinator::establish_serving_session(
+    let owner = trellis::index_coordinator::establish_serving_session(
         &store,
         Some(&options),
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1077,7 +1077,7 @@ fn browser_listing_does_not_offer_ambiguous_same_inode_git_transition() {
 
 #[tokio::test]
 async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
-    use baleyg::daemon::BrowserProvisioner;
+    use trellis::daemon::BrowserProvisioner;
     let base = tempfile::tempdir().unwrap();
     let checkout = base.path().join("work");
     let moved = base.path().join("old");
@@ -1184,8 +1184,8 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
 }
 
 async fn root_loss_restricted_ex_case(owner_mode: u8) {
-    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{Arc, atomic::AtomicU64};
+    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     let moved = base.path().join("moved");
@@ -1270,11 +1270,11 @@ async fn root_loss_drops_restricted_ex_before_old_path_returns() {
 }
 
 async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
-    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
+    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     let moved = base.path().join("old-work");
@@ -1365,11 +1365,11 @@ async fn failed_metadata_admission_disposes_old_root_fifo_before_ex_release() {
 
 #[tokio::test]
 async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
-    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64},
     };
+    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     fs::create_dir(&work).unwrap();
@@ -1441,11 +1441,11 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
 
 #[tokio::test]
 async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
-    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64},
     };
+    use trellis::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     let moved = base.path().join("old-work");

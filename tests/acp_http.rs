@@ -6,19 +6,19 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
-    acp::{Acp, AcpConfig},
-    http,
-    indexer::{IndexOptions, index_workspace},
-    model::Graph,
-    store::{Store, topology::LeaderSession},
-};
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{Arc, atomic::AtomicBool},
 };
 use tower::ServiceExt;
+use trellis::{
+    acp::{Acp, AcpConfig},
+    http,
+    indexer::{IndexOptions, index_workspace},
+    model::Graph,
+    store::{Store, topology::LeaderSession},
+};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const CODE: &str = "function seed() { console.log('synthetic'); }";
 struct Fixture {
@@ -53,7 +53,7 @@ impl Fixture {
             &graph,
             &workspace,
             session.leader_guard().unwrap(),
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation: store.index_baseline().unwrap().index_generation,
                 index_revision: 0,
             },
@@ -144,7 +144,7 @@ impl Fixture {
             &self.graph,
             &self.dir.path().join("workspace"),
             self.session.leader_guard().unwrap(),
-            baleyg::model::IndexPin {
+            trellis::model::IndexPin {
                 index_generation,
                 index_revision: 1,
             },
@@ -411,15 +411,15 @@ async fn controlled_process_diagnostics_are_actionable_but_never_echo_output() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},

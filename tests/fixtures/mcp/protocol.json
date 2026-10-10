@@ -12,10 +12,10 @@
     }
   },
   "names": [
-    "baleyg_workspace_describe",
-    "baleyg_find_symbols",
-    "baleyg_inspect",
-    "baleyg_read_source"
+    "trellis_workspace_describe",
+    "trellis_find_symbols",
+    "trellis_inspect",
+    "trellis_read_source"
   ],
   "validArguments": [
     {
@@ -388,7 +388,7 @@
           },
           "_meta": {
             "io.modelcontextprotocol/serverInfo": {
-              "name": "baleyg",
+              "name": "trellis",
               "version": "$VERSION"
             }
           }
@@ -418,7 +418,7 @@
             "tools": {}
           },
           "serverInfo": {
-            "name": "baleyg",
+            "name": "trellis",
             "version": "$VERSION"
           }
         }

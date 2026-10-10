@@ -329,7 +329,7 @@ fn walk(root: &Path, cancel: &CancelFlag) -> Result<(BTreeMap<PathBuf, Stamp>, V
                 return true;
             }
             match e.file_name().to_str() {
-                Some(".git" | "node_modules" | ".venv" | ".baleyg") => false,
+                Some(".git" | "node_modules" | ".venv" | ".trellis") => false,
                 Some("target" | "dist" | "build") => e
                     .path()
                     .strip_prefix(&filter_root)

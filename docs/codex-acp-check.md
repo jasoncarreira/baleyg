@@ -15,7 +15,7 @@ requests is not proof that every read operation requires permission. Ambient con
 also needs isolation. Codex is therefore not silently substituted for the Claude runner.
 
 Native structured-output enforcement is absent in the checked ACP prompt paths, but that
-alone is **not a blocker**: Baleyg can validate prompted JSON text independently. The open
+alone is **not a blocker**: Trellis can validate prompted JSON text independently. The open
 issue is limiting source/file/tool access without weakening the declared evidence-only
 boundary. A separately reviewed isolated runtime or a tool-disable adapter change is
 needed before enabling Codex under the same promise.

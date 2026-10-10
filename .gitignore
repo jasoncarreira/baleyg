@@ -9,7 +9,7 @@ __pycache__/
 .DS_Store
 
 /target/
-/.baleyg/
+/.trellis/
 /.factory-sandboxes/
 .factory/
 /.pre-git-archive/

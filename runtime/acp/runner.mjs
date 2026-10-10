@@ -170,7 +170,7 @@ export function collector(onInvalid = () => {}) {
 export async function runSession(agent, input, scratch, state, setPhase = () => {}) {
   setPhase('initialize');
   const initialized = await agent.request('initialize', {protocolVersion: PROTOCOL_VERSION,
-    clientInfo: {name: 'baleyg-evidence-answer', version: '1.0.0'},
+    clientInfo: {name: 'trellis-evidence-answer', version: '1.0.0'},
     clientCapabilities: {fs: {readTextFile: false, writeTextFile: false}, terminal: false}});
   if (initialized.protocolVersion !== PROTOCOL_VERSION) fail();
   setPhase('session');
@@ -218,7 +218,7 @@ export async function readBounded(stream, limit) {
 }
 export async function main() {
   if (process.platform === 'win32') fail();
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'baleyg-acp-'));
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'trellis-acp-'));
   let child, connection, timer, state;
   let phase = 'input';
   let rejectAbort;
@@ -243,7 +243,7 @@ export async function main() {
       let wireBytes = 0;
       child.stdout.on('data', chunk => { wireBytes += chunk.length; if (wireBytes > LIMITS.wire) abort('oversize'); });
       state = collector(abort);
-      connection = client({name: 'baleyg-evidence-answer'})
+      connection = client({name: 'trellis-evidence-answer'})
         .onRequest(methods.client.session.requestPermission, () => state.permission())
         .onNotification('_auth/status_update', value => value, ({params}) => state.auth(params))
         .onNotification(methods.client.session.update, ({params}) => state.update(params))

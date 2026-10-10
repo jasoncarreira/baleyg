@@ -1,14 +1,14 @@
 # Feature Factory operations
 
-Baleyg uses GitHub Issues as the durable intake queue for Feature Factory runs.
+Trellis uses GitHub Issues as the durable intake queue for Feature Factory runs.
 The tracked [`.factory.json`](../.factory.json) recognizes these exact references:
 
 - `123`
 - `#123`
-- `https://github.com/jasoncarreira/baleyg/issues/123`
+- `https://github.com/SquashMerge/trellis/issues/123`
 
 Other text remains a normal free-text feature request. A recognized reference is resolved with
-`gh issue view` in `jasoncarreira/baleyg`; its issue number becomes the stable factory run ID and its
+`gh issue view` in `SquashMerge/trellis`; its issue number becomes the stable factory run ID and its
 title and body become untrusted story input.
 
 ## Operator prerequisites
@@ -44,7 +44,7 @@ publication.
 
 ## Starting a run
 
-From a clean Baleyg checkout on the desired PR base, invoke Feature Factory with one issue reference:
+From a clean Trellis checkout on the desired PR base, invoke Feature Factory with one issue reference:
 
 ```text
 /feature #123
@@ -85,8 +85,8 @@ either only through a separately reviewed repository-maintenance PR.
 
 ## GitHub issue policy
 
-The current semantic-index program is tracked in [#8](https://github.com/jasoncarreira/baleyg/issues/8),
-with dependency-ordered stage epics [#9–#18](https://github.com/jasoncarreira/baleyg/milestone/1).
+The current semantic-index program is tracked in [#8](https://github.com/SquashMerge/trellis/issues/8),
+with dependency-ordered stage epics [#9–#18](https://github.com/SquashMerge/trellis/milestone/1).
 
 The staged semantic-index issues use the `epic`, `semantic-index`, and where applicable `mcp` labels.
 Run one stage at a time after its dependencies are closed. Do not ask one run to implement later stages

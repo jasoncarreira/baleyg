@@ -1,5 +1,5 @@
 {
-  "name": "@baleyg/semantic-contract",
+  "name": "@trellis/semantic-contract",
   "version": "1.0.0",
   "private": true,
   "type": "module",

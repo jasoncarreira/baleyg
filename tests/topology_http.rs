@@ -4,15 +4,15 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
+use trellis::{
     http,
     indexer::{IndexOptions, index_workspace},
     model::{CancelFlag, Graph},
     store::{Store, topology::LeaderSession},
 };
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn fixture() -> (
     tempfile::TempDir,
@@ -69,7 +69,7 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (u16, Valu
         .unwrap();
     (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
-fn pinned(route: &str, pin: &baleyg::model::IndexPin) -> String {
+fn pinned(route: &str, pin: &trellis::model::IndexPin) -> String {
     let separator = if route.contains('?') { '&' } else { '?' };
     format!(
         "{route}{separator}indexGeneration={}&indexRevision={}",
@@ -112,7 +112,7 @@ async fn durable_crud_matrix() {
     .unwrap();
     let view = json!({"id":"view","title":"Keep","query":{"seed":seed},"pins":{},"hidden":[]});
     let canonical = serde_json::to_value(
-        serde_json::from_value::<baleyg::model::SavedView>(view.clone()).unwrap(),
+        serde_json::from_value::<trellis::model::SavedView>(view.clone()).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -392,7 +392,7 @@ async fn saved_read_pin_and_ownership_matrix() {
         "omitted optional title preserves the stored title"
     );
 
-    let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
+    let legacy: trellis::model::SavedView = serde_json::from_value(json!({
         "id":"legacy","title":"Legacy","query":{"seed":seed}
     }))
     .unwrap();
@@ -456,7 +456,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
     let session = store.leader_session().unwrap();
     let (graph, native, capture) =
-        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+        trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
             .unwrap();
     let stable = native
         .declarations
@@ -550,7 +550,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
 
     std::fs::remove_file(root.join("b.js")).unwrap();
     let (graph, native, capture) =
-        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+        trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
             .unwrap();
     let second = store
         .publish_native(
@@ -670,7 +670,7 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
 async fn schema5_is_not_native_anchor_evidence() {
     let (_temp, store, _graph, app, seed, _session) = fixture();
     let legacy_pin = store.index_baseline().unwrap();
-    let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
+    let legacy: trellis::model::SavedView = serde_json::from_value(json!({
         "id":"legacy","title":"Legacy","query":{"seed":seed}
     }))
     .unwrap();
@@ -721,15 +721,15 @@ async fn workspace_root_changed() {
 }
 
 fn publish_bundle(
-    store: &baleyg::store::Store,
-    graph: &baleyg::model::Graph,
+    store: &trellis::store::Store,
+    graph: &trellis::model::Graph,
     workspace: &std::path::Path,
-    leader: &baleyg::store::topology::LeaderGuard,
-    expected: baleyg::model::IndexPin,
-    cancel: &baleyg::model::CancelFlag,
-) -> anyhow::Result<baleyg::model::IndexPin> {
-    let (indexed, native, capture) = baleyg::indexer::index_workspace_bundle(
-        &baleyg::indexer::IndexOptions::new(workspace.to_owned()),
+    leader: &trellis::store::topology::LeaderGuard,
+    expected: trellis::model::IndexPin,
+    cancel: &trellis::model::CancelFlag,
+) -> anyhow::Result<trellis::model::IndexPin> {
+    let (indexed, native, capture) = trellis::indexer::index_workspace_bundle(
+        &trellis::indexer::IndexOptions::new(workspace.to_owned()),
         store.root_id(),
         cancel,
         |_| {},
@@ -746,10 +746,10 @@ fn publish_bundle(
 fn retained_release_snapshot(
     state: &std::path::Path,
     root: &std::path::Path,
-    pin: &baleyg::model::IndexPin,
+    pin: &trellis::model::IndexPin,
 ) -> String {
-    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
     use std::{os::unix::fs::MetadataExt, time::Duration};
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
 
     let observed = (|| -> anyhow::Result<String> {
         let identity = WorkspaceIdentity::discover(Some(root), root)?;
@@ -906,7 +906,7 @@ async fn saved_views_and_annotations_attach_to_the_requested_retained_manifest()
             }
             Err(error)
                 if error
-                    .downcast_ref::<baleyg::store::SqliteContention>()
+                    .downcast_ref::<trellis::store::SqliteContention>()
                     .is_some() =>
             {
                 release_deferred.push(format!(

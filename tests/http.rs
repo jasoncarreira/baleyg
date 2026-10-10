@@ -4,10 +4,10 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use baleyg::{auth, http, indexer::IndexOptions, model::*, store::Store};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::AtomicBool};
 use tower::ServiceExt;
+use trellis::{auth, http, indexer::IndexOptions, model::*, store::Store};
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn setup() -> (tempfile::TempDir, Store, Arc<http::DaemonState>, Router) {
@@ -190,7 +190,7 @@ async fn source_is_snapshot_and_revision_checked() {
     let workspace = _d.path().join("workspace");
     std::fs::write(workspace.join("a.js"), "cached secret-free source").unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
         &IndexOptions::new(workspace),
         store.root_id(),
         &cancel,
@@ -254,7 +254,7 @@ async fn dependency_status_whole_response_fence() {
     let options = IndexOptions::new(dir.path().join("workspace"));
     let cancel = Arc::new(AtomicBool::new(false));
     let (graph, native, capture) =
-        baleyg::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
+        trellis::indexer::index_workspace_bundle(&options, store.root_id(), &cancel, |_| {})
             .unwrap();
     let pin = store
         .publish_native(
@@ -508,7 +508,7 @@ async fn live_control_corruption_returns_typed_503_and_hard_latches_clones() {
         let workspace = dir.path().join("workspace");
         std::fs::write(workspace.join("a.js"), "function go() { measured(); }\n").unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
             &IndexOptions::new(workspace),
             store.root_id(),
             &cancel,
@@ -596,11 +596,11 @@ fn corrupt_recovery_fixture(
     Arc<http::DaemonState>,
     Router,
     std::path::PathBuf,
-    baleyg::store::topology::TopologyRoots,
-    baleyg::store::topology::WorkspaceIdentity,
+    trellis::store::topology::TopologyRoots,
+    trellis::store::topology::WorkspaceIdentity,
     IndexPin,
 ) {
-    use baleyg::store::topology::{TopologyRoots, WorkspaceIdentity};
+    use trellis::store::topology::{TopologyRoots, WorkspaceIdentity};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -616,7 +616,7 @@ fn corrupt_recovery_fixture(
     options.max_file_bytes = 2_097_152;
     let cancel = Arc::new(AtomicBool::new(false));
     let (pin, old_owner) =
-        baleyg::index_coordinator::reconcile_workspace(&initial, &options, &cancel, |_| {})
+        trellis::index_coordinator::reconcile_workspace(&initial, &options, &cancel, |_| {})
             .unwrap();
     std::fs::write(&index, b"bad sqlite index header").unwrap();
     let pending = Store::open_for_tests(&dir.path().join("state"), &root).unwrap();
@@ -817,7 +817,7 @@ async fn released_matching_pin_is_typed_http_conflict_without_head_fallback() {
     let cancel = Arc::new(AtomicBool::new(false));
     let session = state.retained_serving_session().unwrap();
     let publish = |expected| {
-        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
             &IndexOptions::new(workspace.clone()),
             store.root_id(),
             &cancel,
@@ -872,7 +872,7 @@ async fn verified_leader_expires_due_pin_on_idle_tick_without_publication() {
     let cancel = Arc::new(AtomicBool::new(false));
     let session = state.retained_serving_session().unwrap();
     let publish = |expected| {
-        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
             &IndexOptions::new(workspace.clone()),
             store.root_id(),
             &cancel,
@@ -924,7 +924,7 @@ async fn expired_pin_saved_items_require_explicit_head_reattachment() {
     let cancel = Arc::new(AtomicBool::new(false));
     let session = state.retained_serving_session().unwrap();
     let publish = |expected| {
-        let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+        let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
             &IndexOptions::new(workspace.clone()),
             store.root_id(),
             &cancel,
@@ -1067,7 +1067,7 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
     let owner = state.retained_serving_session().unwrap();
     let options = IndexOptions::new(dir.path().join("workspace"));
     let first =
-        baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(&store, None, owner)
+        trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(&store, None, owner)
             .unwrap()
             .run(&options, &Arc::new(AtomicBool::new(false)), |_| {})
             .unwrap();
@@ -1111,8 +1111,8 @@ async fn browser_claimed_unchanged_publishes_new_manifest_before_done() {
 #[ignore]
 fn maintenance_external_fifo_child() {
     use std::io::Write;
-    let root = std::path::PathBuf::from(std::env::var_os("BALEYG_MAINTENANCE_ROOT").unwrap());
-    let state = std::path::PathBuf::from(std::env::var_os("BALEYG_MAINTENANCE_STATE").unwrap());
+    let root = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_ROOT").unwrap());
+    let state = std::path::PathBuf::from(std::env::var_os("TRELLIS_MAINTENANCE_STATE").unwrap());
     let store = Store::open_for_tests(&state, &root).unwrap();
     let queued = store
         .enqueue_request(&IndexOptions::new(root), None)
@@ -1130,8 +1130,8 @@ fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path)
             "maintenance_external_fifo_child",
             "--nocapture",
         ])
-        .env("BALEYG_MAINTENANCE_ROOT", root)
-        .env("BALEYG_MAINTENANCE_STATE", state)
+        .env("TRELLIS_MAINTENANCE_ROOT", root)
+        .env("TRELLIS_MAINTENANCE_STATE", state)
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -1150,8 +1150,8 @@ fn external_maintenance_request(root: &std::path::Path, state: &std::path::Path)
 
 #[test]
 fn queued_second_process_preempts_maintenance_before_writer_admission() {
-    use baleyg::index_coordinator::{self, IndexJobCoordinator};
     use std::sync::mpsc;
+    use trellis::index_coordinator::{self, IndexJobCoordinator};
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     let data = dir.path().join("state");
@@ -1208,8 +1208,8 @@ fn queued_second_process_preempts_maintenance_before_writer_admission() {
 
 #[test]
 fn second_process_fifo_interrupts_after_first_real_maintenance_delete() {
-    use baleyg::index_coordinator::{self, IndexJobCoordinator};
     use std::sync::mpsc;
+    use trellis::index_coordinator::{self, IndexJobCoordinator};
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
     let data = dir.path().join("state");
@@ -1290,7 +1290,7 @@ fn second_process_fifo_interrupts_after_first_real_maintenance_delete() {
 
 #[test]
 fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
-    use baleyg::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
+    use trellis::store::topology::{GcStage, TopologyRoots, WorkspaceIdentity};
     let dir = tempfile::tempdir().unwrap();
     let current_root = dir.path().join("current");
     let candidate_root = dir.path().join("candidate");
@@ -1322,7 +1322,7 @@ fn gc_queued_before_candidate_yields_and_daily_stamp_defers_rescan() {
         if stage == GcStage::BeforeCandidate {
             reached += 1;
             let _id = external_maintenance_request(&current_root, &state);
-            assert_ne!(probe.check(), baleyg::store::MaintenanceQueueState::Clear);
+            assert_ne!(probe.check(), trellis::store::MaintenanceQueueState::Clear);
             anyhow::bail!("maintenance deferred for publication");
         }
         Ok(())

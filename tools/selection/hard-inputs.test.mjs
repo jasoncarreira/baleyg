@@ -90,7 +90,7 @@ test('human audit rejects missing evidence/internal symbols and classifies exter
 });
 
 test('offline script output is deterministic and baseline preserves local graph bindings', () => {
-  const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'baleyg-hard-'));
+  const outputRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'trellis-hard-'));
   try {
     const first = prepareHard({ outputRoot });
     const readArtifacts = () => HARD_IDS.flatMap(id => [`inputs/hard-v1/${id}.json`, `outputs/hard-v1/${id}.baseline.json`]).map(file => fs.readFileSync(path.join(outputRoot, file), 'utf8'));

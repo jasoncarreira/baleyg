@@ -42,13 +42,13 @@ test("IDENTITY.VECTORS all 64 full digests, domains and canonical inputs from de
     for (const row of item.digests) {
       const [kind, input, domain] =
         row.label === "syntax"
-          ? ["syntax", syntax, "baleyg.syntax.v1\0"]
+          ? ["syntax", syntax, "trellis.syntax.v1\0"]
           : row.label === "sibling-group"
-            ? ["siblingGroup", { headers }, "baleyg.sibling-group.v1\0"]
+            ? ["siblingGroup", { headers }, "trellis.sibling-group.v1\0"]
             : [
                 "header",
                 siblingHeaders[Number(row.label.slice(-1))],
-                "baleyg.header.v1\0",
+                "trellis.header.v1\0",
               ];
       assert.equal(
         Buffer.from(domain).toString("hex"),
@@ -103,11 +103,11 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const v2 = Object.freeze({
   contentHash:
     "8026dced2c17cbbfb8563d8a7f07e250a141be61cd497e6ba88caeb52a6de8f2",
-  owner: "sid:v1:6cce6099437ddb2256f7ae368d29c0b5",
+  owner: "sid:v1:7fd250597c82d08fcb73cabd62e89893",
   config1: "e3155b20e134632816c8611c4e9ee5cbd0e00689f7c4c955ee9f896580d02fdb",
   config2: "3e8214adf35212b25f8d669f6bb1416d39e07bacc3d82acfc287218cabbe0712",
-  context1: "f107be5e05433157fa89fe8ad71823d92ed9773210f89cb41c22afbdabb513bc",
-  context2: "c5e91e3fcdb5abd319c3ad99debad41167bed38170ba4512785a49e1ad4c6be6",
+  context1: "b49d85d64bb03f7cf62bd68c08f2a1aa091107769c325315528593d5724b12bc",
+  context2: "1f2a121e20976ce130efa9cafff90f03229eab048982670f3a67fcf6b6b27ded",
 });
 const v2Input = (kind, version, context) => ({
   contentHash: v2.contentHash,
@@ -122,34 +122,34 @@ const v2Occurrences = [
   [
     v2Input("call", "native-test-1", v2.context1),
     `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
-    "de9121457466b75595443402b6e39755043af4b499b85881be1329aff7c8cdc9",
-    "occ:v2:de9121457466b75595443402b6e39755",
+    "38ec6920f23b3e1f7bb35550d019bbb622a70d87072c1bf6aba9c19974237cae",
+    "occ:v2:38ec6920f23b3e1f7bb35550d019bbb6",
   ],
   [
     v2Input("reference", "native-test-1", v2.context1),
     `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"reference","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
-    "e77cc56a31d81733d7de8f42e13f4db1afa22a311c641e3d05494287ef085afb",
-    "occ:v2:e77cc56a31d81733d7de8f42e13f4db1",
+    "3445e26a698a121224048f0b37496cea58bc2d4b3a19a64d56851d57891041dc",
+    "occ:v2:3445e26a698a121224048f0b37496cea",
   ],
   [
     v2Input("call", "native-test-2", v2.context1),
     `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context1}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-2","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
-    "09446fd4270ebdae22d2791d1e8f946c41ed7c86ed603c751ed7beef62e5baac",
-    "occ:v2:09446fd4270ebdae22d2791d1e8f946c",
+    "76c6e398193fe21ee1d9915dbbdee28db8d78c0e88d5c36d601c3b3787a4dd1f",
+    "occ:v2:76c6e398193fe21ee1d9915dbbdee28d",
   ],
   [
     v2Input("call", "native-test-1", v2.context2),
     `{"contentHash":"${v2.contentHash}","extractionContext":"${v2.context2}","kind":"call","nativeProducerId":"native-test","nativeProducerVersion":"native-test-1","ordinal":0,"ownerSyntaxId":"${v2.owner}"}`,
-    "c35ed01ea1015ebaecb6080e7b40e48d2f2c97914fd6a8623039e70d83540742",
-    "occ:v2:c35ed01ea1015ebaecb6080e7b40e48d",
+    "7850439bee41f2d40363662d283ffec3199ee742e3bbcf8c4d25e85968da6394",
+    "occ:v2:7850439bee41f2d40363662d283ffec3",
   ],
 ];
 test("IDENTITY.EXTRACTION_CONTEXT Decision 0003 vectors: capture digests, canonical bytes and SHA-256", () => {
   assert.equal(sha256("config-v1"), v2.config1);
   assert.equal(sha256("config-v2"), v2.config2);
   assert.equal(
-    Buffer.from("baleyg.extraction-context.v1\0").toString("hex"),
-    "62616c6579672e65787472616374696f6e2d636f6e746578742e763100",
+    Buffer.from("trellis.extraction-context.v1\0").toString("hex"),
+    "7472656c6c69732e65787472616374696f6e2d636f6e746578742e763100",
   );
   for (const [hash, literal, full] of [
     [
@@ -174,8 +174,8 @@ test("IDENTITY.EXTRACTION_CONTEXT Decision 0003 vectors: capture digests, canoni
 });
 test("IDENTITY.OCCURRENCE Decision 0003 occ:v2 vectors byte for byte", () => {
   assert.equal(
-    Buffer.from("baleyg.occurrence.v2\0").toString("hex"),
-    "62616c6579672e6f6363757272656e63652e763200",
+    Buffer.from("trellis.occurrence.v2\0").toString("hex"),
+    "7472656c6c69732e6f6363757272656e63652e763200",
   );
   for (const [input, literal, full, id] of v2Occurrences) {
     assert.equal(canonicalBytes(input).toString("utf8"), literal);
@@ -188,7 +188,7 @@ test("IDENTITY.OCCURRENCE Decision 0003 occ:v2 vectors byte for byte", () => {
   assert.equal(new Set([call, reference, version, config]).size, 4);
 });
 test("IDENTITY.OCCURRENCE withdrawn revision-bound occ:v1 input and values are rejected", () => {
-  // The withdrawn v1 r1/call row: domain baleyg.occurrence.v1\0 over
+  // The withdrawn v1 r1/call row: domain trellis.occurrence.v1\0 over
   // {kind,ordinal,ownerSyntaxId,revisionId}, recomputed here independently.
   const v1Input = {
     revisionId: "r1",
@@ -198,11 +198,11 @@ test("IDENTITY.OCCURRENCE withdrawn revision-bound occ:v1 input and values are r
   };
   const v1Full = sha256(
     Buffer.concat([
-      Buffer.from("baleyg.occurrence.v1\0"),
+      Buffer.from("trellis.occurrence.v1\0"),
       canonicalBytes(v1Input),
     ]),
   );
-  assert.ok(v1Full.startsWith("ccc4d599"));
+  assert.ok(v1Full.startsWith("959c5606"));
   for (const bad of [
     v1Input,
     { ...v2Occurrences[0][0], revisionId: "r1" },
@@ -245,7 +245,7 @@ test("IDENTITY.OCCURRENCE same document, producer and context share an ID; any i
     empty,
     sha256(
       Buffer.concat([
-        Buffer.from("baleyg.extraction-context.v1\0"),
+        Buffer.from("trellis.extraction-context.v1\0"),
         Buffer.from('{"components":[],"language":"javascript"}'),
       ]),
     ),

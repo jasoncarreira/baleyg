@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const seed = "baleyg-synthetic-cohorts-v1";
+const seed = "trellis-synthetic-cohorts-v1";
 const here = dirname(fileURLToPath(import.meta.url));
 const languages = [["java", "java"], ["rust", "rs"], ["python", "py"], ["javascript", "js"]];
 const sizes = [["small", 25, 1677722], ["medium", 250, 16777216], ["large", 2500, 134217728]];

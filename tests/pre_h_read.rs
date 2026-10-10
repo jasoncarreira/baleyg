@@ -1,12 +1,12 @@
 mod common;
-use baleyg::{
-    indexer::{self, IndexOptions},
-    model::CancelFlag,
-    store::{EvidenceFencePolicy, PreHReadPermit, Store},
-};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use trellis::{
+    indexer::{self, IndexOptions},
+    model::CancelFlag,
+    store::{EvidenceFencePolicy, PreHReadPermit, Store},
 };
 
 fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Store) {
@@ -195,7 +195,7 @@ fn released_head() -> (
     tempfile::TempDir,
     Store,
     PreHReadPermit,
-    baleyg::model::IndexPin,
+    trellis::model::IndexPin,
 ) {
     let (state, work, store) = fixture();
     std::fs::write(work.path().join("a.js"), "function oldHead() {}\n").unwrap();

@@ -41,7 +41,7 @@ test('Jev request includes visible candidate identity in instructions and separa
  assert.throws(()=>parseResponse(packet,{model:'jev-1.13.0',answers}));
 });
 test('budget fails closed on concurrent lock, repeated reservation, excess spend and unknown costs',()=>{
- const dir=fs.mkdtempSync(path.join(os.tmpdir(),'baleyg-budget-')),ledger=path.join(dir,'ledger.json');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'trellis-budget-')),ledger=path.join(dir,'ledger.json');
  try {
   reserve(ledger,{id:'a',provider:'test',maxUsd:2});
   assert.throws(()=>reserve(ledger,{id:'a',provider:'test',maxUsd:1}));

@@ -42,7 +42,7 @@ function inventory(root) {
 function verify(root, manifestBytes) {
   const manifest = JSON.parse(manifestBytes);
   assert.equal(manifest.version, 1);
-  assert.equal(manifest.seed, "baleyg-synthetic-cohorts-v1");
+  assert.equal(manifest.seed, "trellis-synthetic-cohorts-v1");
   assert.equal(manifest.hashAlgorithm, "sha256");
   assert.deepEqual(Object.keys(manifest.totals), Object.keys(expected));
   for (const [size, values] of Object.entries(expected))
@@ -92,7 +92,7 @@ function verify(root, manifestBytes) {
 }
 
 test("CLI demands a fresh explicit destination", () => {
-  const temp = mkdtempSync(join(tmpdir(), "baleyg-cohorts-args-"));
+  const temp = mkdtempSync(join(tmpdir(), "trellis-cohorts-args-"));
   try {
     assert.notEqual(run([]).status, 0);
     assert.notEqual(run(["--unknown", join(temp, "wrong")]).status, 0);
@@ -104,8 +104,8 @@ test("CLI demands a fresh explicit destination", () => {
 });
 
 test("two cohorts match pinned bytes, hashes, inventory and exact per-language totals", { timeout: 300000 }, () => {
-  const a = mkdtempSync(join(tmpdir(), "baleyg-cohort-a-"));
-  const b = mkdtempSync(join(tmpdir(), "baleyg-cohort-b-"));
+  const a = mkdtempSync(join(tmpdir(), "trellis-cohort-a-"));
+  const b = mkdtempSync(join(tmpdir(), "trellis-cohort-b-"));
   try {
     const first = join(a, "corpus");
     const second = join(b, "corpus");

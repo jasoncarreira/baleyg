@@ -279,7 +279,7 @@ impl CompletionOutcome {
                 // A terminal row intentionally retains only a stable error code.
                 // Opt-in diagnostics preserve the cause in either process's log
                 // without letting a broken stderr change the terminal outcome.
-                if std::env::var("BALEYG_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
+                if std::env::var("TRELLIS_INDEX_DIAGNOSTICS").as_deref() == Ok("1") {
                     use std::io::Write;
                     let _ = writeln!(std::io::stderr(), "index-phase request_failure={error:#}");
                 }

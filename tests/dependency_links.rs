@@ -1,20 +1,20 @@
 mod common;
-fn test_pin(n: u64) -> baleyg::model::IndexPin {
-    baleyg::model::IndexPin {
+fn test_pin(n: u64) -> trellis::model::IndexPin {
+    trellis::model::IndexPin {
         index_generation: uuid::Uuid::from_u128(0x00000000000040008000000000000001),
         index_revision: n,
     }
 }
-use baleyg::{
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
     behavior::{Participant, SequenceStep, SequenceView, build_sequence},
     dependencies::{Catalog, CatalogSymbol, Package},
     dependency_links::annotate,
     indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::*,
-};
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
 };
 
 fn fixture(source: &str) -> (Graph, SequenceView) {

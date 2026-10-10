@@ -12,7 +12,7 @@ fn readiness_stderr_category(sample: &[u8]) -> &'static str {
         "other_startup_error"
     } else if text.contains("Evidence unavailable at startup:") {
         "index_startup_unavailable"
-    } else if text.contains("Baleyg: http://") {
+    } else if text.contains("Trellis: http://") {
         "server_banner_present"
     } else {
         "no_allowlisted_marker"
@@ -96,7 +96,7 @@ fn readiness_stderr_category_never_copies_secret_or_temp_path() {
     assert!(!category.contains("Bearer"));
     assert!(!category.contains("/private"));
     assert!(!category.contains("0123456789abcdef"));
-    let mixed = b"Baleyg: http://127.0.0.1:7331/\nEvidence unavailable at startup: /private/tmp/secret\nError: failed after banner; Bearer 0123456789abcdef\n";
+    let mixed = b"Trellis: http://127.0.0.1:7331/\nEvidence unavailable at startup: /private/tmp/secret\nError: failed after banner; Bearer 0123456789abcdef\n";
     let fatal = readiness_stderr_category(mixed);
     assert_eq!(fatal, "other_startup_error");
     assert!(!fatal.contains("Bearer"));
@@ -202,7 +202,7 @@ impl Drop for FixtureDaemon {
                     socket = path
                         .parent()
                         .and_then(std::path::Path::parent)
-                        .map(|data| baleyg::daemon::SocketPaths::new(data).socket);
+                        .map(|data| trellis::daemon::SocketPaths::new(data).socket);
                     break;
                 }
                 if path.is_dir() {
@@ -227,7 +227,7 @@ impl Drop for FixtureDaemon {
                 .ok()?;
             (output.status.success()
                 && String::from_utf8_lossy(&output.stdout).trim()
-                    == format!("{} daemon", env!("CARGO_BIN_EXE_baleyg")))
+                    == format!("{} daemon", env!("CARGO_BIN_EXE_trellis")))
             .then_some(connection)
         };
         let Some(connection) = owned() else {
@@ -255,7 +255,7 @@ impl Drop for FixtureDaemon {
 }
 
 fn isolated_command(home: &std::path::Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baleyg"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_trellis"));
     // ProjectDirs uses inherited XDG roots before HOME on Linux.
     cmd.env("HOME", home)
         .env_remove("XDG_CACHE_HOME")
@@ -291,7 +291,7 @@ fn unchanged_serve_reuses_selected_versions_but_changed_bytes_and_corruption_do_
             listener.local_addr().unwrap()
         });
         let child = command(root, home, "serve")
-            .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+            .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
             .arg("--bind")
             .arg(address.to_string())
             .stdout(std::process::Stdio::null())
@@ -727,9 +727,9 @@ fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
     let pin =
         serde_json::from_slice::<Value>(&indexed.stdout).unwrap()["publishedRevision"].clone();
     let indexes = home.join(if cfg!(target_os = "macos") {
-        "Library/Caches/dev.odin.baleyg/indexes"
+        "Library/Caches/dev.squashmerge.trellis/indexes"
     } else {
-        ".cache/baleyg/indexes"
+        ".cache/trellis/indexes"
     });
     let dir = fs::read_dir(&indexes)
         .unwrap()
@@ -814,7 +814,7 @@ fn status_only_observes_existing_index_and_refuses_busy_without_writes() {
     assert!(obsolete.stdout.is_empty());
     assert_eq!(snapshot(&[&root, &home]), obsolete_bytes);
     // Corrupting or removing the Git marker cannot repair it via Status.
-    let marker = root.join(".git/baleyg/workspace-id");
+    let marker = root.join(".git/trellis/workspace-id");
     fs::write(&marker, b"not-a-marker").unwrap();
     let tampered = snapshot(&[&root, &home]);
     let invalid = command(&root, &home, "status").output().unwrap();
@@ -879,9 +879,9 @@ fn cli_helper_uses_isolated_home_instead_of_inherited_xdg_roots() {
     assert_eq!(status["stats"]["files"], 0);
     assert_eq!(status["revision"]["indexRevision"], 2);
     let cache = home.join(if cfg!(target_os = "macos") {
-        "Library/Caches/dev.odin.baleyg"
+        "Library/Caches/dev.squashmerge.trellis"
     } else {
-        ".cache/baleyg"
+        ".cache/trellis"
     });
     assert!(cache.exists());
 }
@@ -913,9 +913,9 @@ function boundary() {}
     let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     assert_eq!(indexed["status"]["stats"]["files"], 1);
     let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
-        home.join(".cache/baleyg/indexes")
+        home.join(".cache/trellis/indexes")
     };
     let db_path = fs::read_dir(indexes)
         .unwrap()
@@ -1013,9 +1013,9 @@ fn standalone_takeover_replays_original_relative_presentation_from_another_cwd()
     let initial: Value = serde_json::from_slice(&indexed.stdout).unwrap();
     assert_eq!(initial["publishedRevision"]["indexRevision"], 2);
     let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
-        home.join(".cache/baleyg/indexes")
+        home.join(".cache/trellis/indexes")
     };
     let index_db = fs::read_dir(indexes)
         .unwrap()
@@ -1177,7 +1177,7 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
     let stderr_path = temp.path().join("serve-ingress-stderr.log");
     let stderr_file = fs::File::create(&stderr_path).unwrap();
     let child = isolated_command(&home)
-        .env("BALEYG_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
+        .env("TRELLIS_TEST_DAEMON_PID_FILE", home.join("auto-daemon.pid"))
         .arg("serve")
         .arg("--workspace")
         .arg(&root)
@@ -1199,8 +1199,8 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         loop {
             let log = fs::read(&stderr_path).unwrap();
             if log
-                .windows(b"Baleyg:".len())
-                .any(|window| window == b"Baleyg:")
+                .windows(b"Trellis:".len())
+                .any(|window| window == b"Trellis:")
             {
                 break log;
             }
@@ -1299,9 +1299,9 @@ async fn serve_ingress_persists_relative_presentation_paths_before_cross_cwd_tak
         .unwrap();
     assert_eq!(f["displayLabel"], original_label);
     let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
-        home.join(".cache/baleyg/indexes")
+        home.join(".cache/trellis/indexes")
     };
     let index_db = fs::read_dir(indexes)
         .unwrap()
@@ -1359,9 +1359,9 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         String::from_utf8_lossy(&indexed.stderr)
     );
     let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
-        home.join(".cache/baleyg/indexes")
+        home.join(".cache/trellis/indexes")
     };
     let index_db = fs::read_dir(indexes)
         .unwrap()
@@ -1379,7 +1379,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
             |row| row.get(0),
         )
         .unwrap();
-    let mut previous: baleyg::indexer::ReconcileOptions = serde_json::from_str(&raw).unwrap();
+    let mut previous: trellis::indexer::ReconcileOptions = serde_json::from_str(&raw).unwrap();
     previous.scip_path = Some("index.scip".into());
     previous.manifest_path = Some("manifest.json".into());
     db.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -1415,7 +1415,7 @@ fn standalone_read_refuses_legacy_relative_recorded_presentation_options() {
         "no cwd-rebound evidence may escape"
     );
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("run explicit baleyg index"),
+        String::from_utf8_lossy(&rejected.stderr).contains("run explicit trellis index"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
@@ -1453,9 +1453,9 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
     let indexes = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
     } else {
-        home.join(".cache/baleyg/indexes")
+        home.join(".cache/trellis/indexes")
     };
     let dir = fs::read_dir(&indexes)
         .unwrap()
@@ -1485,7 +1485,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
             "{sub} emitted unverified evidence"
         );
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("explicit baleyg index"),
+            String::from_utf8_lossy(&refused.stderr).contains("explicit trellis index"),
             "{sub}: {}",
             String::from_utf8_lossy(&refused.stderr)
         );
@@ -1529,7 +1529,7 @@ fn explicit_cli_index_recreates_corruption_but_bounded_reads_refuse_unknown_opti
 
 #[tokio::test]
 async fn corrupted_daemon_startup_uses_configured_options_and_does_not_fallback_when_busy() {
-    use baleyg::store::topology::UseGuard;
+    use trellis::store::topology::UseGuard;
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("source");
@@ -1697,7 +1697,7 @@ fn cli_round_trip_uses_persistent_store_and_never_executes_workspace() {
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(fs::read(root.join("flow.js")).unwrap(), before);
     assert!(!root.join("SHOULD_NOT_EXIST").exists());
-    assert!(!root.join(".baleyg").exists());
+    assert!(!root.join(".trellis").exists());
 }
 #[test]
 fn cli_refuses_remote_bind_and_invalid_limits() {
@@ -1716,7 +1716,7 @@ fn cli_refuses_remote_bind_and_invalid_limits() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    let output = Command::new(env!("CARGO_BIN_EXE_baleyg"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trellis"))
         .arg("--help")
         .output()
         .unwrap();
@@ -1867,9 +1867,9 @@ fn fixed_locations_and_removed_flag() {
         4
     );
     let cache = home.join(if cfg!(target_os = "macos") {
-        "Library/Caches/dev.odin.baleyg"
+        "Library/Caches/dev.squashmerge.trellis"
     } else {
-        ".cache/baleyg"
+        ".cache/trellis"
     });
     assert!(
         cache.exists(),
@@ -1901,7 +1901,7 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.js"), "function seed() {}\n").unwrap();
     let quiet = command(&root, &home, "index")
-        .env_remove("BALEYG_INDEX_DIAGNOSTICS")
+        .env_remove("TRELLIS_INDEX_DIAGNOSTICS")
         .output()
         .unwrap();
     assert!(
@@ -1921,7 +1921,7 @@ fn cli_index_diagnostics_are_opt_in_without_changing_publication() {
         2
     );
     let diagnostic = command(&root, &home, "index")
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
         .unwrap();
     assert!(
@@ -1962,7 +1962,7 @@ fn index_forwards_pair_and_reports_pair() {
     assert!(absent.stdout.is_empty());
     assert!(!home.exists(), "Status may not create an index");
     let result = command(&root, &home, "index")
-        .env("BALEYG_INDEX_DIAGNOSTICS", "1")
+        .env("TRELLIS_INDEX_DIAGNOSTICS", "1")
         .output()
         .unwrap();
     assert!(
@@ -2143,7 +2143,7 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
         .output()
         .unwrap();
     assert!(!serve.status.success());
-    assert!(!root.join(".git/baleyg/workspace-id").exists());
+    assert!(!root.join(".git/trellis/workspace-id").exists());
     assert!(!token.exists());
     let output = root.join("graph.json");
     let export = command(&root, &home, "export")
@@ -2153,7 +2153,7 @@ fn external_destinations_are_rejected_before_git_marker_creation() {
         .unwrap();
     assert!(!export.status.success());
     assert!(!output.exists());
-    assert!(!root.join(".git/baleyg/workspace-id").exists());
+    assert!(!root.join(".git/trellis/workspace-id").exists());
 }
 
 #[test]
@@ -2164,11 +2164,14 @@ fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
             let home = temp.path().join("home");
             let (cache, data) = if cfg!(target_os = "macos") {
                 (
-                    home.join("Library/Caches/dev.odin.baleyg"),
-                    home.join("Library/Application Support/dev.odin.baleyg"),
+                    home.join("Library/Caches/dev.squashmerge.trellis"),
+                    home.join("Library/Application Support/dev.squashmerge.trellis"),
                 )
             } else {
-                (home.join(".cache/baleyg"), home.join(".local/share/baleyg"))
+                (
+                    home.join(".cache/trellis"),
+                    home.join(".local/share/trellis"),
+                )
             };
             let workspace = if fixed == "cache" { &cache } else { &data };
             fs::create_dir_all(workspace.join(".git")).unwrap();
@@ -2187,7 +2190,7 @@ fn overlapping_git_workspace_refuses_before_marker_or_managed_entries() {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(
-                !workspace.join(".git/baleyg/workspace-id").exists(),
+                !workspace.join(".git/trellis/workspace-id").exists(),
                 "{fixed} {sub}"
             );
             assert!(!cache.join("indexes").exists(), "{fixed} {sub}");
@@ -2246,7 +2249,7 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
             let root = temp.path().join(format!("sorted-index-{n}"));
             fs::create_dir(&root).unwrap();
             let identity =
-                baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+                trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
             (identity.root_key, root)
         })
         .collect::<Vec<_>>();
@@ -2285,7 +2288,7 @@ fn gc_cli_reports_multiple_indexes_in_sorted_order() {
 
 #[test]
 fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
-    use baleyg::{
+    use trellis::{
         model::SavedView,
         store::topology::{DurableRecords, TopologyRoots, UseGuard, WorkspaceIdentity},
     };
@@ -2294,9 +2297,9 @@ fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
     let root = temp.path().join("work");
     fs::create_dir(&root).unwrap();
     let data = home.join(if cfg!(target_os = "macos") {
-        "Library/Application Support/dev.odin.baleyg"
+        "Library/Application Support/dev.squashmerge.trellis"
     } else {
-        ".local/share/baleyg"
+        ".local/share/trellis"
     });
     let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
     let identity = WorkspaceIdentity::discover(Some(&root), &root).unwrap();
@@ -2344,7 +2347,7 @@ fn forget_cli_requires_confirmation_and_preserves_unrelated_state() {
 
 #[test]
 fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
-    use baleyg::{
+    use trellis::{
         model::SavedView,
         store::topology::{DurableRecords, TopologyRoots, WorkspaceIdentity},
     };
@@ -2353,9 +2356,9 @@ fn forget_yes_refuses_unknown_sqlite_schema_without_removing_state() {
     let work = temp.path().join("work");
     fs::create_dir(&work).unwrap();
     let data = home.join(if cfg!(target_os = "macos") {
-        "Library/Application Support/dev.odin.baleyg"
+        "Library/Application Support/dev.squashmerge.trellis"
     } else {
-        ".local/share/baleyg"
+        ".local/share/trellis"
     });
     let roots = TopologyRoots::isolated_for_tests(home.join("cache"), data);
     let identity = WorkspaceIdentity::discover(Some(&work), &work).unwrap();
@@ -2635,7 +2638,7 @@ fn real_export(root: &std::path::Path, home: &std::path::Path) -> Value {
 #[derive(Clone)]
 struct LegacyClient {
     app: axum::Router,
-    state: std::sync::Arc<baleyg::http::DaemonState>,
+    state: std::sync::Arc<trellis::http::DaemonState>,
 }
 impl Drop for LegacyClient {
     fn drop(&mut self) {
@@ -2661,7 +2664,7 @@ impl LegacyClient {
         max_file_bytes: u64,
         retain_session: bool,
     ) -> Self {
-        use baleyg::{
+        use trellis::{
             http,
             indexer::IndexOptions,
             store::{
@@ -2671,11 +2674,14 @@ impl LegacyClient {
         };
         let (cache, data) = if cfg!(target_os = "macos") {
             (
-                home.join("Library/Caches/dev.odin.baleyg"),
-                home.join("Library/Application Support/dev.odin.baleyg"),
+                home.join("Library/Caches/dev.squashmerge.trellis"),
+                home.join("Library/Application Support/dev.squashmerge.trellis"),
             )
         } else {
-            (home.join(".cache/baleyg"), home.join(".local/share/baleyg"))
+            (
+                home.join(".cache/trellis"),
+                home.join(".local/share/trellis"),
+            )
         };
         let roots = TopologyRoots::isolated_for_tests(cache, data);
         let identity = WorkspaceIdentity::discover(Some(root), root).unwrap();
@@ -2691,9 +2697,9 @@ impl LegacyClient {
                 Ok(follower) => follower,
                 Err(_) => {
                     let leader = store.leader_session().unwrap();
-                    let cancel: baleyg::model::CancelFlag =
+                    let cancel: trellis::model::CancelFlag =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let (graph, native, capture) = baleyg::indexer::index_workspace_bundle(
+                    let (graph, native, capture) = trellis::indexer::index_workspace_bundle(
                         &options,
                         store.root_id(),
                         &cancel,
@@ -3351,7 +3357,7 @@ def sink():
             "{name}: identical bytes must reproduce graph"
         );
         let root_id =
-            baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+            trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
                 .unwrap()
                 .record_id;
         assert_eq!(native_after["sourceSet"]["rootId"], root_id, "{name}");
@@ -3669,17 +3675,17 @@ def sink():
             assert_eq!(step["path"], file, "{name}");
             assert_eq!(step["range"], call["range"], "{name}");
             assert_eq!(source.get(expected_start..expected_end), Some("sink()"));
-            let expected_seed: baleyg::model::Symbol =
+            let expected_seed: trellis::model::Symbol =
                 serde_json::from_value(measured_seed.clone()).unwrap();
-            let expected_file: baleyg::model::SourceFile =
+            let expected_file: trellis::model::SourceFile =
                 serde_json::from_value(graph_files[0].clone()).unwrap();
-            let expected_calls: Vec<baleyg::model::CallSite> = graph_calls
+            let expected_calls: Vec<trellis::model::CallSite> = graph_calls
                 .iter()
                 .map(|call| serde_json::from_value(call.clone()).unwrap())
                 .collect();
-            let expected_pin: baleyg::model::IndexPin =
+            let expected_pin: trellis::model::IndexPin =
                 serde_json::from_value(pin.clone()).unwrap();
-            let expected_sequence = baleyg::behavior::build_sequence(
+            let expected_sequence = trellis::behavior::build_sequence(
                 expected_pin,
                 &expected_seed,
                 &expected_file,
@@ -4173,7 +4179,7 @@ async fn real_daemon_post_capture_busy_preserves_pair_and_retries_same_accepted_
         native_after["sourceSet"]["id"]
     );
     let root_id =
-        baleyg::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
+        trellis::store::topology::WorkspaceIdentity::discover_unattached(Some(&root), &root)
             .unwrap()
             .record_id;
     assert_eq!(native_after["sourceSet"]["rootId"], root_id);
@@ -4262,12 +4268,12 @@ fn index_process_holds_leader_while_stdout_is_blocked() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("flow.js"), "function start() {}\n").unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
+        trellis::store::topology::WorkspaceIdentity::discover(Some(&root), &root).unwrap();
     let index_dir = if cfg!(target_os = "macos") {
-        home.join("Library/Caches/dev.odin.baleyg/indexes")
+        home.join("Library/Caches/dev.squashmerge.trellis/indexes")
             .join(&identity.root_key)
     } else {
-        home.join(".cache/baleyg/indexes").join(&identity.root_key)
+        home.join(".cache/trellis/indexes").join(&identity.root_key)
     };
 
     let mut fds = [0; 2];

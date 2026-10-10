@@ -1,4 +1,4 @@
-# Baleyg view-selection tools
+# Trellis view-selection tools
 
 Compare a deterministic graph baseline, Jev typed relevance decisions, and a Claude
 agent reached through ACP with graph tools exposed over MCP. This is a controlled

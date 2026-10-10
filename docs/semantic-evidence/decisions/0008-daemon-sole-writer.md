@@ -1,5 +1,7 @@
 # Decision 0008: the user daemon is the only writer
 
+> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
+
 - **Status:** owner-approved 2026-10-10. Ratified when this record merges. It governs #122, the follow-up to #107 (PR #117).
 - **What it amends:**
   - Decision 0007 §1: standalone CLI, and the daemon as follower;
@@ -16,7 +18,7 @@
 
 ## Background
 
-#16 was designed before the daemon existed: any Baleyg process (CLI, MCP server, `serve`) could index a checkout, and a per-checkout leader lock elected one. Decision 0007 added the user daemon but kept that model. CLI commands still work standalone when the daemon isn't running, and the daemon stays a follower for a checkout whose lock a standalone CLI holds.
+#16 was designed before the daemon existed: any Trellis process (CLI, MCP server, `serve`) could index a checkout, and a per-checkout leader lock elected one. Decision 0007 added the user daemon but kept that model. CLI commands still work standalone when the daemon isn't running, and the daemon stays a follower for a checkout whose lock a standalone CLI holds.
 
 Two writers can therefore still compete for a checkout, and every handoff between them needs dedicated machinery:
 - leader election and incarnation markers;
@@ -33,7 +35,7 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
 ### 1. One writer
 
 - **The user daemon is the only process that writes** a checkout's derived index (`index.db`) and request queue (`requests.db`). It is also the only process that runs watchers, mandatory H, publication, retention, release and GC.
-- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `baleyg mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser writes such as saved views and notes.
+- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `trellis mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser writes such as saved views and notes.
 - **There is no standalone fallback**, for reads or writes, so there is one read path.
   - Connect-or-start is bounded. If the daemon can't be reached or started within that bound, the command fails with a typed `daemon_unavailable` error. It never opens the index itself.
   - Commands that touch no index data, such as `--help` and `--version`, don't start the daemon.
@@ -48,7 +50,7 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
   - takeover and successor handoff.
 - Checkout ownership becomes **in-process state** in the daemon's registry.
 - **Per-checkout use locks** may be removed only after both of these:
-  1. every **Baleyg-controlled** out-of-process `Store` or SQLite opener is removed or blocked (external tools are unsupported; see Consequences);
+  1. every **Trellis-controlled** out-of-process `Store` or SQLite opener is removed or blocked (external tools are unsupported; see Consequences);
   2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot, every retained SQLite handle and every new opener, and stay held from GC's eligibility check through the unlink.
 
   A registry lookup alone isn't enough to protect GC. Decision 0006 §2's nonblocking exclusive use lock stays until this gate is proved; the gate then supersedes only that lock mechanism, not GC eligibility.
@@ -85,7 +87,7 @@ A crash at any point simply repeats these steps on the next activation. No **dur
 
 ### 5. SQLite access
 
-Only the daemon opens these databases, so no other supported Baleyg process contends for them. The daemon's own connections can still contend with each other: reader snapshots against writer transactions, and maintenance against publication.
+Only the daemon opens these databases, so no other supported Trellis process contends for them. The daemon's own connections can still contend with each other: reader snapshots against writer transactions, and maintenance against publication.
 - **Contention stays typed and retried** (`storage_busy`, bounded) as AGENTS.md requires. Reduce it where that's simple, for example by serializing writers per checkout. Durability is unchanged (DELETE journal, FULL sync).
 - **Keep the retained-FD rule** from #67: never close a separate file descriptor on a live SQLite inode. Retire only the parts of the handle cache that are provably unused.
 
@@ -93,5 +95,5 @@ Only the daemon opens these databases, so no other supported Baleyg process cont
 
 - **Much less code.** Leader election, follower mode, takeover, root-loss owner leases and cross-process busy and retry paths are deleted. The cross-process handoff read permits are deleted and replaced by daemon-local admission of the validated prior head. The implementing PR must show a clear net reduction in production code.
 - **The daemon is required.** Every data command needs a daemon, started automatically; if it can't start, the command fails with `daemon_unavailable`. A daemon crash briefly interrupts every session until clients restart it; accepted queue rows survive (Decision 0007 already accepts this).
-- **Tests change.** Tests that simulate two competing Baleyg processes on one checkout are replaced by daemon-restart and crash-recovery tests.
-- **External tools.** Opening a live daemon index with an external tool such as the `sqlite3` CLI is **unsupported**. It may still physically succeed, so it isn't excluded. §2's gate covers Baleyg-controlled openers only; external access while the daemon runs is unsupported and may observe or disturb in-progress state.
+- **Tests change.** Tests that simulate two competing Trellis processes on one checkout are replaced by daemon-restart and crash-recovery tests.
+- **External tools.** Opening a live daemon index with an external tool such as the `sqlite3` CLI is **unsupported**. It may still physically succeed, so it isn't excluded. §2's gate covers Trellis-controlled openers only; external access while the daemon runs is unsupported and may observe or disturb in-progress state.

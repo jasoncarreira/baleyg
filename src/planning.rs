@@ -112,7 +112,7 @@ pub struct QuestionPreview {
 
 fn packet_id(packet: &QuestionPacket) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
-        "baleyg-question-v1",
+        "trellis-question-v1",
         &packet.request,
         packet.revision,
         &packet.context,

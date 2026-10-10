@@ -5,7 +5,7 @@ installation/startup, project import, repository build or provider call is autho
 
 ## Why both SCIP and LSP?
 
-SCIP gives Baleyg a repeatable semantic artifact tied to a published source snapshot. LSP is a
+SCIP gives Trellis a repeatable semantic artifact tied to a published source snapshot. LSP is a
 live request/response protocol for interactive navigation and diagnostics, with optional richer
 capabilities. Keep both behind language-aware evidence adapters; neither replaces the syntax
 extractors that measure call sites, evaluation order, control scopes and deferred callbacks.
@@ -30,7 +30,7 @@ language/JDK versions, packaging, license, resource use and build behavior befor
 | Java | [Eclipse JDT LS](https://github.com/eclipse-jdtls/eclipse.jdt.ls) | Correct JDK, source roots, ordered classpath, generated sources and build import policy |
 | Rust | [rust-analyzer](https://rust-analyzer.github.io/book/) | Cargo configuration, features/target, build scripts, proc macros and server-version settings |
 | Python | [Pyright](https://github.com/microsoft/pyright) | Interpreter/import roots, stubs, environment identity and limits of dynamic inference |
-| JavaScript/TypeScript | [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) over tsserver | Project config and plugins; TypeScript extraction remains separate unsupported work in Baleyg |
+| JavaScript/TypeScript | [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) over tsserver | Project config and plugins; TypeScript extraction remains separate unsupported work in Trellis |
 
 Start with Java because its current same-class navigation candidates leave clear cross-class gaps.
 Continue the [Java investigation](java-semantic-indexing-plan.md); JDT LS acquisition remains

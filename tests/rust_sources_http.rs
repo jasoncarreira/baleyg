@@ -4,20 +4,20 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
+use serde_json::Value;
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
+use trellis::{
     http,
     indexer::{IndexOptions, index_workspace_bundle},
     store::Store,
 };
-use serde_json::Value;
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 fn setup() -> (
     tempfile::TempDir,
     Store,
     Router,
-    Arc<baleyg::store::topology::LeaderSession>,
+    Arc<trellis::store::topology::LeaderSession>,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
@@ -337,7 +337,7 @@ fn descriptor_is_pinned_and_exact_size_bound_is_accepted() {
     let root = temp.path().join("library");
     std::fs::create_dir(&root).unwrap();
     std::fs::write(root.join("ok.rs"), vec![b' '; 2 * 1024 * 1024]).unwrap();
-    let directory = baleyg::file_tree::SourceDir::open(&root).unwrap();
+    let directory = trellis::file_tree::SourceDir::open(&root).unwrap();
     let moved = temp.path().join("moved");
     std::fs::rename(&root, &moved).unwrap();
     std::fs::create_dir(&root).unwrap();

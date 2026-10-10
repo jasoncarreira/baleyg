@@ -45,7 +45,7 @@ No autoindex/modelcalls. Puremethodclick never callsquestions/ACP/Jev.
 UIworker owns web/app.js web/index.html web/style.css tests/browse-ui.test.cjs (existingquestionUITestsreadonly).
 Implement actual SVG sequence diagram (noCDN/externalfonts/network renderer). Lifelines, directionalcallarrows,
 selfcalls, branch/loop/tryfragments visible; preservehierarchy, don'tflattenalternativesintostraighttimeline.
-Renderer module web/sequence.js plainbrowserJS window.BaleygSequence={render(container,view,onSource)};
+Renderer module web/sequence.js plainbrowserJS window.TrellisSequence={render(container,view,onSource)};
 root/backendworker serves /sequence.js CSPself. UIworker ownsrenderer too.
 Safe DOMtextContent/createElementNS no userHTML/mermaid stringinjection. Every step keyboard-clickable source
 location through existing showSource helper; horizontaloverflowcontaineddiagramnotpage. Sourceaccessiblelist

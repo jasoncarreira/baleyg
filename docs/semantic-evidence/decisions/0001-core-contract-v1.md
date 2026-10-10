@@ -1,5 +1,7 @@
 # Decision 0001: prospective semantic-evidence core contract v1
 
+> The project was renamed from Baleyg to Trellis on 2026-10-10 (#125). This record uses the new name.
+
 - **Status:** proposed for ratification by the independent integrated review
 - **Date:** 2026-09-23
 - **Scope:** documentation-only Stage 1A contract
@@ -7,7 +9,7 @@
 
 ## Context
 
-Baleyg needs a language-neutral description of measured syntax, semantic evidence, durable declaration identity, and bounded rooted graph answers before later implementation and corpus work can be judged consistently. Current Java, Rust, Python, and JavaScript importers and IDs differ. Current production behavior is useful implementation context, but it is not proof of this contract.
+Trellis needs a language-neutral description of measured syntax, semantic evidence, durable declaration identity, and bounded rooted graph answers before later implementation and corpus work can be judged consistently. Current Java, Rust, Python, and JavaScript importers and IDs differ. Current production behavior is useful implementation context, but it is not proof of this contract.
 
 The central safety problem is avoiding stronger claims than the evidence supports. Syntax, a symbol binding, a reference, a measured invocation, and a possible dispatch target are different facts. Freshness and coverage are also independent. The answer is a static, source-ordered view over a pinned snapshot, never an execution trace or runtime-complete call graph.
 

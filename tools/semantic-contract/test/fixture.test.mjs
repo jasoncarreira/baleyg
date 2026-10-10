@@ -26,7 +26,7 @@ const fixturesRoot = process.env.SEMANTIC_FIXTURES_ROOT
   ? resolve(process.env.SEMANTIC_FIXTURES_ROOT)
   : defaultRoot;
 async function copyExample() {
-  const root = await mkdtemp(join(tmpdir(), "baleyg-fixture-discovery-"));
+  const root = await mkdtemp(join(tmpdir(), "trellis-fixture-discovery-"));
   await cp(join(defaultRoot, "example"), join(root, "example"), {
     recursive: true,
   });

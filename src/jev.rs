@@ -152,7 +152,7 @@ pub fn request_for(packet: &QuestionPacket) -> Result<Value> {
             }
         }));
     }
-    let body = json!({"model": MODEL, "state": {"encoding": "baleyg-evidence-tables-v1", "instructions": INSTRUCTIONS, "packet": evidence, "identities": identities, "identityPaths": IDENTITY_PATHS, "rangeColumns": RANGE_COLUMNS}, "questions": questions});
+    let body = json!({"model": MODEL, "state": {"encoding": "trellis-evidence-tables-v1", "instructions": INSTRUCTIONS, "packet": evidence, "identities": identities, "identityPaths": IDENTITY_PATHS, "rangeColumns": RANGE_COLUMNS}, "questions": questions});
     ensure!(
         serde_json::to_vec(&body)?.len() <= MAX_REQUEST_BYTES,
         "Jev request exceeds 176000 bytes; reduce evidence scope without truncating source files"

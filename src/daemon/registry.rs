@@ -1964,7 +1964,7 @@ mod selection_tests {
             registry.select(17, &identity, &foreign).unwrap_err(),
             SelectionError::DifferentRepository
         );
-        assert!(!foreign.join(".git/baleyg/workspace-id").exists());
+        assert!(!foreign.join(".git/trellis/workspace-id").exists());
         assert_eq!(
             registry
                 .select(17, &identity, Path::new("relative"))

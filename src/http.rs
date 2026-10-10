@@ -5620,7 +5620,7 @@ mod exceptional_recovery_tests {
     #[test]
     fn independent_shared_reader_process() {
         use std::io::{Read, Write};
-        let Some(path) = std::env::var_os("BALEYG_TEST_INDEX_USE_SH") else {
+        let Some(path) = std::env::var_os("TRELLIS_TEST_INDEX_USE_SH") else {
             return;
         };
         let guard = crate::store::topology::UseGuard::acquire_existing(
@@ -5770,7 +5770,7 @@ mod exceptional_recovery_tests {
                     "http::exceptional_recovery_tests::independent_shared_reader_process",
                     "--nocapture",
                 ])
-                .env("BALEYG_TEST_INDEX_USE_SH", &lock_path)
+                .env("TRELLIS_TEST_INDEX_USE_SH", &lock_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -7165,7 +7165,7 @@ async fn provisioned_core(
     if identity.verify_readonly().is_err() {
         let outcome = response
             .headers()
-            .get("X-Baleyg-Mutation-Outcome")
+            .get("X-Trellis-Mutation-Outcome")
             .and_then(|value| value.to_str().ok());
         response = match outcome {
             Some(outcome) => selected_mutation_error(
@@ -7181,10 +7181,10 @@ async fn provisioned_core(
         };
     }
     if let Ok(value) = root.parse() {
-        response.headers_mut().insert("X-Baleyg-Workspace", value);
+        response.headers_mut().insert("X-Trellis-Workspace", value);
     }
     response.headers_mut().insert(
-        "X-Baleyg-Catching-Up",
+        "X-Trellis-Catching-Up",
         if catching_up { "true" } else { "false" }.parse().unwrap(),
     );
     response
@@ -7367,7 +7367,7 @@ fn selected_mutation_error(error: ApiError, outcome: &str) -> Response {
         .into_response();
     response
         .headers_mut()
-        .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+        .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
     response
 }
 
@@ -7410,10 +7410,10 @@ async fn selected_mutation<T: IntoResponse + Send + 'static>(
                 "unknown",
             ),
         };
-        if !answer.headers().contains_key("X-Baleyg-Mutation-Outcome") {
+        if !answer.headers().contains_key("X-Trellis-Mutation-Outcome") {
             answer
                 .headers_mut()
-                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+                .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
         }
         Ok::<_, anyhow::Error>((answer, catching_up))
     })
@@ -7470,7 +7470,7 @@ async fn provisioned_core_answer(
             };
             response
                 .headers_mut()
-                .insert("X-Baleyg-Mutation-Outcome", "committed".parse().unwrap());
+                .insert("X-Trellis-Mutation-Outcome", "committed".parse().unwrap());
             Ok((response, catching_up))
         }
         _ if method == Method::POST
@@ -7538,7 +7538,7 @@ async fn provisioned_core_answer(
                 };
                 response
                     .headers_mut()
-                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                    .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
                 Ok((response, catching_up))
             } else {
                 let provider = state.acp.clone().ok_or(ApiError(
@@ -7568,7 +7568,7 @@ async fn provisioned_core_answer(
                 };
                 response
                     .headers_mut()
-                    .insert("X-Baleyg-Mutation-Outcome", outcome.parse().unwrap());
+                    .insert("X-Trellis-Mutation-Outcome", outcome.parse().unwrap());
                 Ok((response, catching_up))
             }
         }

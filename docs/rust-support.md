@@ -32,7 +32,7 @@ The larger example had69 steps. Desktop1440px and mobile390px had no page-level 
 
 ## Deployed validation
 
-Inspector port8877 now uses the existing Baleyg workspace/state and token. Revision3 contains
+Inspector port8877 now uses the existing Trellis workspace/state and token. Revision3 contains
 74files (39Rust +35JavaScript),2158symbols and11176 lexical calls, with zero parse errors.
 172 Rust tests and104 UI tests pass; formatting, clippy and build pass. Remote CI was not run.
 Saved views/notes and provider status were preserved. Providers remain disabled for this

@@ -10,7 +10,7 @@ fixture pinned the valid v4 workspace marker
 never depend on the random temporary directory.
 
 Two separate captures used
-`BALEYG_CAPTURE_CLASS_GOLDENS=<run-local-artifact-directory> cargo test --locked --test classes -- --test-threads=1`.
+`TRELLIS_CAPTURE_CLASS_GOLDENS=<run-local-artifact-directory> cargo test --locked --test classes -- --test-threads=1`.
 Both passed 23/23 tests and had identical bytes for all 24 files, with manifest
 SHA-256 `e878dc22a7c3c65fe894e26a556d8a309f24961118f4f1fa1ff8a64a636671f7`.
 Four outputs have intentional per-file truncation and warnings. The original

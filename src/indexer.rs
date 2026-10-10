@@ -882,7 +882,7 @@ pub fn measure_document_fingerprint(
         "coverage":stable_fact(coverage)?,"declarations":declarations,"calls":calls,"regions":regions,
     });
     let native_hash = crate::native_ids::digest(
-        b"baleyg.local-native-fingerprint.v1\0",
+        b"trellis.local-native-fingerprint.v1\0",
         &crate::native_ids::canonical(&native_value),
     );
     let labels = measured_display_labels(options, capture, native);
@@ -907,7 +907,7 @@ pub fn measure_document_fingerprint(
     Ok(DocumentFingerprint {
         native: native_hash,
         projection: crate::native_ids::digest(
-            b"baleyg.local-graph-fingerprint.v1\0",
+            b"trellis.local-graph-fingerprint.v1\0",
             &crate::native_ids::canonical(&projection_value),
         ),
     })
@@ -1518,7 +1518,7 @@ mod local_classification_tests {
                 "{:x}",
                 Sha256::digest(fs::read(corpus.join("manifest.json")).unwrap())
             ),
-            "8b8deea8592cfd069a1500bcad9d634a8b4d343477e769b2f2aed0dd61bee046"
+            "03faaaa04c61ba7c18051e12386201898cd31625758c36a0202ff8da65da8882"
         );
         let mut paths = 0;
         for size in ["medium", "large"] {

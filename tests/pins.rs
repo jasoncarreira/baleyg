@@ -1,13 +1,13 @@
 mod common;
-use baleyg::{
+use serde_json::json;
+use std::sync::{Arc, atomic::AtomicBool};
+use trellis::{
     indexer::{IndexOptions, index_workspace, index_workspace_bundle},
     model::{CancelFlag, IndexPin, ViewQuery},
     store::Store,
 };
-use serde_json::json;
-use std::sync::{Arc, atomic::AtomicBool};
 
-fn fixture() -> (tempfile::TempDir, Store, baleyg::model::Graph, String) {
+fn fixture() -> (tempfile::TempDir, Store, trellis::model::Graph, String) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -30,8 +30,8 @@ fn fixture() -> (tempfile::TempDir, Store, baleyg::model::Graph, String) {
 }
 fn publish(
     store: &Store,
-    graph: &baleyg::model::Graph,
-    leader: &baleyg::store::topology::LeaderGuard,
+    graph: &trellis::model::Graph,
+    leader: &trellis::store::topology::LeaderGuard,
     expected: IndexPin,
     root: &std::path::Path,
 ) -> IndexPin {
@@ -167,7 +167,7 @@ fn current_store_producer_matrix() {
     assert_eq!(store.symbols_at("run", 10).unwrap().0, pin);
     let query: ViewQuery = serde_json::from_value(json!({"seed":id})).unwrap();
     assert_eq!(store.query_view(&query).unwrap().unwrap().revision, pin);
-    let mut items = baleyg::file_tree::SourceDir::open(&temp.path().join("workspace"))
+    let mut items = trellis::file_tree::SourceDir::open(&temp.path().join("workspace"))
         .unwrap()
         .list("", 0, 10)
         .unwrap()

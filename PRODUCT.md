@@ -1,4 +1,4 @@
-# Baleyg product context
+# Trellis product context
 
 Audience: developers trying to understand a repository without reading every helper.
 Primary action: expand a file in the tree, choose a method beneath it, and inspect its static sequence diagram.
@@ -10,7 +10,7 @@ rows, source links, and deliberate per-branch expansion. Distinguish callers fro
 do not label an outgoing-only implementation as bidirectional. Question-focused selection
 is a separate mode, not a substitute for deterministic navigation.
 
-The approved visual direction is the user-provided `~/Downloads/Baleyg UI.html` reference:
+The approved visual direction is the user-provided `~/Downloads/Trellis UI.html` reference:
 a diagram-first charcoal/flame-orange application shell, compact explorer, large canvas,
 and selected-call inspector. See DESIGN.md. Use local fonts, readable spacing, secondary
 path metadata, explicit loading/error/stale states, and collapsed detailed evidence.

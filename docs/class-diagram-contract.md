@@ -49,7 +49,7 @@ request validation/auth/routes/error mapping. Serve /classes.js and /classes.css
 Coordinate on core DTOs. No opaque snapshots outside cache or graph export changes.
 
 Frontend owner: web/classes.js, web/classes.css, tests/classes-ui.test.cjs only. Vanilla self-contained
-window.BaleygClasses controller with init({request,readSource,selectMethod,currentRevision,currentSession}),
+window.TrellisClasses controller with init({request,readSource,selectMethod,currentRevision,currentSession}),
 open({seed?,path?}), reset(). root adds UI IDs classes-panel,classes-state,classes-query,classes-search,
 classes-results,classes-diagram,classes-unmatched. request(path,options) existing authenticated JSON helper;
 root wraps current session invalidation. open uses GET class lookup for path or seed then POST diagram;

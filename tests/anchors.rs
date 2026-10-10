@@ -1,6 +1,6 @@
 mod common;
 
-use baleyg::{
+use trellis::{
     model::{AnchorReason, AnchorStatus},
     native_evidence::{Declaration, DocumentKey, Header, Key, Range},
     store::anchors::{ContinuityState, GroupContinuity, audit_anchor, capture_anchor},
@@ -53,11 +53,11 @@ fn worked_audit_vectors() {
     let anchor = capture_anchor(&old, std::slice::from_ref(&old)).unwrap();
     assert_eq!(
         anchor.header_hash,
-        "4d0e96c70ccf4bcb926126d35c124bc412341b3040a25c54719a4ba1586396a2"
+        "322c20d2dc7cf143c8f2a70efc3e7031e5f802ac81ae0fd2389b868819434054"
     );
     assert_eq!(
         anchor.sibling_group_hash,
-        "73647a072adc42d17950fc2419ffb2d878c09de37277d1d2bd21264ec72a58e8"
+        "76757e1401a672fa2a0c84315ef4b99e8dc502df5cecdcbb6e0fb8ff8cb0067c"
     );
     let same = audit_anchor(
         &anchor,
@@ -171,9 +171,9 @@ fn invalid_cross_revision_witness_is_rejected() {
 
 #[test]
 fn generated_semantic_contract_anchors_are_the_rust_golden() {
-    use baleyg::{model::DurableAnchor, native_evidence::Declaration};
+    use trellis::{model::DurableAnchor, native_evidence::Declaration};
     let records: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/semantic-evidence/v1/example/generated/bundles/8381c629d0225ac5173515bf353b1cf73d7f39fe9fed599741059236cd55d396/records.json"
+        "fixtures/semantic-evidence/v1/example/generated/bundles/5a6bbd7a86c3c9b63311ee557c5f98bd718f04cd755d687820d97d87362a5c1b/records.json"
     )).unwrap();
     let declarations: Vec<Declaration> =
         serde_json::from_value(records["declarations"].clone()).unwrap();
@@ -207,7 +207,7 @@ fn authored_semantic_contract_cases_execute_through_production_audit() {
     ))
     .unwrap();
     let records: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/semantic-evidence/v1/example/generated/bundles/8381c629d0225ac5173515bf353b1cf73d7f39fe9fed599741059236cd55d396/records.json"
+        "fixtures/semantic-evidence/v1/example/generated/bundles/5a6bbd7a86c3c9b63311ee557c5f98bd718f04cd755d687820d97d87362a5c1b/records.json"
     )).unwrap();
     let declarations: Vec<Declaration> =
         serde_json::from_value(records["declarations"].clone()).unwrap();
@@ -482,15 +482,15 @@ fn invalid_document_revision_and_continuity_associations_fail_closed() {
 
 #[test]
 fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{Position, SavedView, ViewQuery},
-        store::Store,
-    };
     use std::{
         collections::BTreeMap,
         fs,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{Position, SavedView, ViewQuery},
+        store::Store,
     };
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
@@ -557,15 +557,15 @@ fn capture_from_native_snapshot_includes_unnamed_and_ignores_live_source_edits()
 
 #[test]
 fn production_duplicate_cross_revision_is_never_inferred_unchanged() {
-    use baleyg::{
-        indexer::{IndexOptions, index_workspace_bundle},
-        model::{AnnotationRequest, SavedView, ViewQuery},
-        store::Store,
-    };
     use std::{
         collections::BTreeMap,
         fs,
         sync::{Arc, atomic::AtomicBool},
+    };
+    use trellis::{
+        indexer::{IndexOptions, index_workspace_bundle},
+        model::{AnnotationRequest, SavedView, ViewQuery},
+        store::Store,
     };
     let state = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();

@@ -4,16 +4,16 @@ use axum::{
     body::{Body, to_bytes},
     http::Request,
 };
-use baleyg::{
+use serde_json::{Value, json};
+use std::sync::{Arc, atomic::AtomicBool};
+use tower::ServiceExt;
+use trellis::{
     dependencies::CatalogOptions,
     http,
     indexer::{IndexOptions, index_workspace_bundle},
     model::Graph,
     store::Store,
 };
-use serde_json::{Value, json};
-use std::sync::{Arc, atomic::AtomicBool};
-use tower::ServiceExt;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 struct Fixture {
@@ -21,7 +21,7 @@ struct Fixture {
     store: Store,
     state: Arc<http::DaemonState>,
     app: Router,
-    session: Arc<baleyg::store::topology::LeaderSession>,
+    session: Arc<trellis::store::topology::LeaderSession>,
 }
 fn setup(enabled: bool) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
@@ -523,7 +523,7 @@ async fn sources_keep_pinned_roots_and_reject_symlink_replacement() {
 
 #[tokio::test]
 async fn workspace_generation_reuse() {
-    use baleyg::store::topology::UseGuard;
+    use trellis::store::topology::UseGuard;
     let Fixture {
         temp,
         store,

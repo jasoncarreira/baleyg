@@ -1,12 +1,12 @@
-use baleyg::{
-    indexer::{IndexOptions, index_workspace_bundle},
-    model::{CancelFlag, IndexPin},
-    store::Store,
-};
 use rusqlite::Connection;
 use std::{
     fs,
     sync::{Arc, atomic::AtomicBool},
+};
+use trellis::{
+    indexer::{IndexOptions, index_workspace_bundle},
+    model::{CancelFlag, IndexPin},
+    store::Store,
 };
 
 // Pin every SQL tamper to the admitted revision. Historical versions and
@@ -97,7 +97,7 @@ fn publish(
     root: &std::path::Path,
     cancel: &CancelFlag,
     expected: IndexPin,
-    leader: &baleyg::store::topology::LeaderGuard,
+    leader: &trellis::store::topology::LeaderGuard,
 ) -> anyhow::Result<IndexPin> {
     let (graph, native, capture) = index_workspace_bundle(
         &IndexOptions::new(root.to_owned()),
@@ -144,7 +144,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
         Some("terminal-native-graph-v1")
     );
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -152,7 +152,7 @@ fn four_languages_normalized_rows_and_pinned_bytes_are_coherent() {
         .join(&identity.root_key)
         .join("index.db");
     let before_gc = fs::read(&path).unwrap();
-    let roots = baleyg::store::topology::TopologyRoots::isolated_for_tests(
+    let roots = trellis::store::topology::TopologyRoots::isolated_for_tests(
         state.path().join("cache"),
         state.path().join("data"),
     );
@@ -295,7 +295,7 @@ fn invalid_native_and_conflict_never_change_published_pair() {
         .path()
         .join("cache/indexes")
         .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
                 .unwrap()
                 .root_key,
         )
@@ -336,7 +336,7 @@ fn invalid_native_and_conflict_never_change_published_pair() {
     assert_eq!(fs::read(&path).unwrap(), before);
     let mut value = serde_json::to_value(&native).unwrap();
     value["calls"][0]["target"] = serde_json::json!("unmeasured");
-    assert!(serde_json::from_value::<baleyg::native_evidence::Artifact>(value).is_err());
+    assert!(serde_json::from_value::<trellis::native_evidence::Artifact>(value).is_err());
     assert_eq!(store.index_baseline().unwrap(), pin);
     assert_eq!(store.status().unwrap().revision, pin);
     assert_eq!(store.graph().unwrap(), graph);
@@ -371,7 +371,7 @@ fn empty_workspace_has_native_pair_without_document_rows() {
             .path()
             .join("cache/indexes")
             .join(
-                baleyg::store::topology::WorkspaceIdentity::discover(
+                trellis::store::topology::WorkspaceIdentity::discover(
                     Some(root.path()),
                     root.path(),
                 )
@@ -421,19 +421,19 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
         .path()
         .join("cache/indexes")
         .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
                 .unwrap()
                 .root_key,
         )
         .join("index.db");
     let db = Connection::open(path).unwrap();
     let source_set_id = format!("source-set:v1:{}", store.root_id());
-    let unaffected = baleyg::native_evidence::DocumentKey {
+    let unaffected = trellis::native_evidence::DocumentKey {
         source_set_id: source_set_id.clone(),
         language: "java".into(),
         path: "flow.java".into(),
     };
-    let corrupted = baleyg::native_evidence::DocumentKey {
+    let corrupted = trellis::native_evidence::DocumentKey {
         source_set_id,
         language: "rust".into(),
         path: "flow.rs".into(),
@@ -535,7 +535,7 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
         .path()
         .join("cache/indexes")
         .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
                 .unwrap()
                 .root_key,
         )
@@ -558,7 +558,7 @@ fn status_many_documents_only_checks_paired_metadata_not_every_blob() {
     for _ in 0..64 {
         assert_eq!(store.status().unwrap().revision, pin);
     }
-    let key = baleyg::native_evidence::DocumentKey {
+    let key = trellis::native_evidence::DocumentKey {
         source_set_id: format!("source-set:v1:{}", store.root_id()),
         language: "javascript".into(),
         path: "source63.js".into(),
@@ -648,7 +648,7 @@ fn index_from_another_native_producer_version_is_rebuilt_not_served() {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert!(!calls.is_empty() && calls.iter().all(|id| id.starts_with("occ:v2:")));
-        let old_key = baleyg::native_evidence::DocumentKey {
+        let old_key = trellis::native_evidence::DocumentKey {
             source_set_id: format!("source-set:v1:{}", store.root_id()),
             language: "javascript".into(),
             path: "flow.js".into(),
@@ -667,7 +667,7 @@ fn published_db(state: &std::path::Path, root: &std::path::Path) -> std::path::P
     state
         .join("cache/indexes")
         .join(
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root), root)
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root), root)
                 .unwrap()
                 .root_key,
         )
@@ -687,7 +687,7 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
-    let key = baleyg::native_evidence::DocumentKey {
+    let key = trellis::native_evidence::DocumentKey {
         source_set_id: format!("source-set:v1:{}", store.root_id()),
         language: "javascript".into(),
         path: "flow.js".into(),
@@ -803,7 +803,7 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
                 && error.to_string().contains(expected),
             "{table}.{column}: {error:#}"
         );
-        let java = baleyg::native_evidence::DocumentKey {
+        let java = trellis::native_evidence::DocumentKey {
             source_set_id: key.source_set_id.clone(),
             language: "java".into(),
             path: "flow.java".into(),
@@ -832,7 +832,7 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
     )
     .unwrap();
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
-    let key = baleyg::native_evidence::DocumentKey {
+    let key = trellis::native_evidence::DocumentKey {
         source_set_id: format!("source-set:v1:{}", store.root_id()),
         language: "javascript".into(),
         path: "flow.js".into(),
@@ -926,7 +926,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
             |r| r.get(0),
         )
         .unwrap();
-    let key = baleyg::native_evidence::DocumentKey {
+    let key = trellis::native_evidence::DocumentKey {
         source_set_id: format!("source-set:v1:{}", store.root_id()),
         language: "javascript".into(),
         path: "flow.js".into(),
@@ -1011,7 +1011,7 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
     let closed = coverage_clone
         .native_coverage_at(
             pin,
-            &baleyg::native_evidence::DocumentKey {
+            &trellis::native_evidence::DocumentKey {
                 source_set_id: key.source_set_id,
                 language: "java".into(),
                 path: "flow.java".into(),
@@ -1046,7 +1046,7 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
             |r| r.get(0),
         )
         .unwrap();
-    let query: baleyg::model::ViewQuery =
+    let query: trellis::model::ViewQuery =
         serde_json::from_value(serde_json::json!({"seed":owner})).unwrap();
     assert!(!store.query_view(&query).unwrap().unwrap().calls.is_empty());
     assert!(store.sequence_at(&owner, pin, true).unwrap().is_some());
@@ -1112,7 +1112,7 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
             |r| r.get(0),
         )
         .unwrap();
-    let unaffected: baleyg::model::ViewQuery =
+    let unaffected: trellis::model::ViewQuery =
         serde_json::from_value(serde_json::json!({"seed":java})).unwrap();
     for closed in [
         sequence_clone.query_view(&unaffected).unwrap_err(),
@@ -1478,7 +1478,7 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
 fn assert_retained_native_family_parity(
     store: &Store,
     pin: IndexPin,
-    measured: &baleyg::native_evidence::Artifact,
+    measured: &trellis::native_evidence::Artifact,
 ) {
     use std::collections::BTreeSet;
 
@@ -1559,7 +1559,7 @@ fn assert_retained_native_family_parity(
 
 #[test]
 fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc() {
-    use baleyg::native_evidence::DocumentKey;
+    use trellis::native_evidence::DocumentKey;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     // Independent full-rewrite measurements, separate from publish()'s capture.
@@ -1655,7 +1655,7 @@ fn retained_full_rewrite_pins_survive_edits_delete_release_and_reference_safe_gc
     );
 
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db_path = state
         .path()
@@ -1765,7 +1765,7 @@ fn malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corrup
     fs::write(root.path().join("flow.js"), "function next() { next(); }\n").unwrap();
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -1775,11 +1775,11 @@ fn malformed_and_foreign_release_pins_do_not_write_and_header_gaps_remain_corrup
     let before = fs::read(&path).unwrap();
     for pin in [
         r2,
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: uuid::Uuid::new_v4(),
             index_revision: r1.index_revision,
         },
-        baleyg::model::IndexPin {
+        trellis::model::IndexPin {
             index_generation: r1.index_generation,
             index_revision: r2.index_revision + 1,
         },
@@ -1874,7 +1874,7 @@ fn retained_graph_header_preserves_distinct_stats_and_diagnostics_and_matches_li
     assert_eq!(store.graph_at(Some(r1)).unwrap(), graph1);
     assert_eq!(store.graph_at(None).unwrap(), graph2);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db = Connection::open(
         state
@@ -1908,7 +1908,7 @@ fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidec
     fs::write(root.path().join("flow.js"), "function changed() {}\n").unwrap();
     let r2 = publish(&store, root.path(), &cancel, r1, &leader).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -1951,8 +1951,8 @@ fn invalid_retained_header_json_refuses_old_pin_without_mutating_sqlite_or_sidec
 
 #[test]
 fn predecessor_stamps_cover_full_and_unchanged_publications() {
-    use baleyg::index_coordinator::IndexJobCoordinator;
     use std::sync::Mutex;
+    use trellis::index_coordinator::IndexJobCoordinator;
     let (state, root, store, cancel) = fixture();
     let options = IndexOptions::new(root.path().to_owned());
     let session = store.leader_session().unwrap();
@@ -1977,7 +1977,7 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
             .any(|mode| mode == "mode:unchanged")
     );
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2006,7 +2006,7 @@ fn predecessor_stamps_cover_full_and_unchanged_publications() {
     .unwrap();
     let r3 = run(Some(r2), &modes);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db = Connection::open(
         state
@@ -2064,7 +2064,7 @@ fn prior_v8_additive_maintenance_keeps_inode_generation_and_unfinished_fifo() {
     drop(leader);
     drop(store);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2114,7 +2114,7 @@ fn prior_v8_retention_layout_adds_self_fk_indexes_without_replacing_pin() {
     drop(leader);
     drop(store);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2173,13 +2173,13 @@ fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
         store
             .graph_at(Some(old))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
     drop(leader);
     drop(store);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2220,7 +2220,7 @@ fn prior_v8_released_tombstone_upgrades_without_losing_generation_or_pin() {
         reopened
             .graph_at(Some(old))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
 }
@@ -2245,7 +2245,7 @@ fn released_supersession_never_reenters_retained_due_inventory() {
     store.set_retention_clock_for_tests(1_901, 901);
     store.maintain_revisions(&leader).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2305,7 +2305,7 @@ fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced
     let r3 = publish(&store, root.path(), &cancel, r2, &leader).unwrap();
     let retained = store.source_at("flow.js", Some(r2)).unwrap().unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db = Connection::open(
         state
@@ -2347,7 +2347,7 @@ fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced
     let expired = store.source_at("flow.js", Some(r1)).unwrap_err();
     assert!(
         expired
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some(),
         "{expired:#}"
     );
@@ -2405,7 +2405,7 @@ fn retention_boundary_preserves_younger_manifests_and_collects_only_unreferenced
         store
             .source_at("flow.js", Some(foreign))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_none()
     );
 }
@@ -2447,7 +2447,7 @@ fn future_supersession_rollback_cannot_expire_unaged_pin() {
         store
             .graph_at(Some(first))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
     assert!(store.graph_at(Some(head)).is_ok());
@@ -2482,7 +2482,7 @@ fn backward_step_keeps_young_pin_and_restart_uses_persisted_utc() {
         reopened
             .graph_at(Some(first))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
 }
@@ -2503,7 +2503,7 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
     drop(leader);
     drop(store);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2541,7 +2541,7 @@ fn failed_publication_after_additive_v8_upgrade_preserves_old_pin() {
 
 #[test]
 fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
-    use baleyg::native_evidence::DocumentKey;
+    use trellis::native_evidence::DocumentKey;
     let (_state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -2574,7 +2574,7 @@ fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
         ($label:expr, $result:expr) => {{
             let error = $result.unwrap_err();
             assert!(
-                error.downcast_ref::<baleyg::store::PinExpired>().is_some(),
+                error.downcast_ref::<trellis::store::PinExpired>().is_some(),
                 "{}: {error:#}",
                 $label
             );
@@ -2625,7 +2625,7 @@ fn expired_pin_rejects_each_selected_store_consumer_before_lookup() {
             error.to_string().starts_with("revision conflict"),
             "{error:#}"
         );
-        assert!(error.downcast_ref::<baleyg::store::PinExpired>().is_none());
+        assert!(error.downcast_ref::<trellis::store::PinExpired>().is_none());
     }
 }
 
@@ -2649,12 +2649,12 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
     let error = store.release_revision(old, &leader).unwrap_err();
     assert!(
         error
-            .downcast_ref::<baleyg::store::SqliteContention>()
+            .downcast_ref::<trellis::store::SqliteContention>()
             .is_some(),
         "blocked due release must return typed retryable contention: {error:#}"
     );
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db = Connection::open(
         state
@@ -2684,7 +2684,7 @@ fn due_release_blocked_by_maintenance_admission_must_not_report_success() {
 
 #[test]
 fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_tombstone() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     for number in 0..65 {
         fs::write(
@@ -2714,7 +2714,7 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
     );
     let id = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2771,7 +2771,7 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
         store
             .graph_at(Some(old))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
     assert_eq!(store.status().unwrap().revision, head);
@@ -2815,8 +2815,8 @@ fn v8_pending_partial_manifest_is_strict_and_pin_expired_then_replays_to_exact_t
 
 #[test]
 fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() {
-    use baleyg::store::MaintenanceOutcome;
     use std::sync::atomic::Ordering;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -2853,7 +2853,7 @@ fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() 
     );
     assert!(priority.load(Ordering::Acquire));
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2888,8 +2888,8 @@ fn maintenance_first_delete_priority_change_rolls_back_to_whole_pending_state() 
 
 #[test]
 fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_leaked_handler() {
-    use baleyg::store::MaintenanceOutcome;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -2913,7 +2913,7 @@ fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_lea
         MaintenanceOutcome::Progress
     );
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -2982,8 +2982,8 @@ fn maintenance_first_delete_callback_panic_defers_without_partial_release_or_lea
 
 #[test]
 fn v8_noop_retention_uses_covering_indexes_and_never_opens_writer() {
-    use baleyg::store::MaintenanceOutcome;
     use std::sync::atomic::Ordering;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -2998,7 +2998,7 @@ fn v8_noop_retention_uses_covering_indexes_and_never_opens_writer() {
     store.set_retention_clock_for_tests(1_001, 1);
     publish(&store, root.path(), &cancel, old, &leader).unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -3063,7 +3063,7 @@ fn v8_noop_retention_uses_covering_indexes_and_never_opens_writer() {
 
 #[test]
 fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     for mutation in [
         "DELETE FROM native_revision_release_debt WHERE revision_id=?1",
         "UPDATE revision_capture_inputs SET payload='invalid' WHERE revision_id=?1 AND input_key='__pending_release:v1'",
@@ -3096,7 +3096,7 @@ fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
         drop(leader);
         drop(store);
         let identity =
-            baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+            trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
                 .unwrap();
         let path = state
             .path()
@@ -3119,7 +3119,7 @@ fn v8_rejects_missing_debt_wrong_payload_and_dual_release_markers() {
 
 #[test]
 fn maintenance_index_writer_busy_defers_and_counts_only_confirmed_sqlite_busy() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -3135,7 +3135,7 @@ fn maintenance_index_writer_busy_defers_and_counts_only_confirmed_sqlite_busy() 
     publish(&store, root.path(), &cancel, old, &leader).unwrap();
     store.set_retention_clock_for_tests(1_901, 901);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -3184,13 +3184,13 @@ fn publication_gate_is_shared_by_clones_and_independent_same_root_stores() {
         .unwrap();
     assert_eq!(
         permit.wait_reason(),
-        baleyg::store::PublicationWaitReason::None
+        trellis::store::PublicationWaitReason::None
     );
 }
 
 #[test]
 fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generation() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     store.set_retention_clock_for_tests(1_000, 0);
     let leader = store.leader().unwrap();
@@ -3220,7 +3220,7 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     reopened.set_retention_clock_for_tests(1_901, 0);
     let session = reopened.leader_session().unwrap();
-    let next = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
+    let next = trellis::index_coordinator::IndexJobCoordinator::prepare_with_session(
         &reopened,
         None,
         session.clone(),
@@ -3234,7 +3234,7 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
         reopened
             .graph_at(Some(old))
             .unwrap_err()
-            .downcast_ref::<baleyg::store::PinExpired>()
+            .downcast_ref::<trellis::store::PinExpired>()
             .is_some()
     );
     assert_eq!(
@@ -3257,7 +3257,7 @@ fn compatible_pending_debt_replays_after_verified_leader_restart_in_same_generat
         .maintain_revisions(session.leader_guard().unwrap())
         .unwrap();
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -3296,7 +3296,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
     drop(leader);
     drop(store);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -3331,7 +3331,7 @@ fn newer_disposable_schema_is_refused_without_rebuild_or_deletion() {
 
 #[test]
 fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     let source = root.path().join("large.js");
     let body: String = (0..20_000)
@@ -3353,7 +3353,7 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
     let head = publish(&store, root.path(), &cancel, old, &leader).unwrap();
     let key = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let path = state
         .path()
@@ -3421,7 +3421,7 @@ fn maintenance_releases_thousands_of_js_facts_without_permanent_deferral() {
 
 #[test]
 fn large_revision_releases_in_batched_units_while_edits_continue() {
-    use baleyg::store::MaintenanceOutcome;
+    use trellis::store::MaintenanceOutcome;
     let (state, root, store, cancel) = fixture();
     for n in 0..400 {
         fs::write(
@@ -3470,7 +3470,7 @@ fn large_revision_releases_in_batched_units_while_edits_continue() {
     let head = publish(&store, root.path(), &cancel, middle, &leader).unwrap();
     let key = format!("pin:v1:{}:{}", old.index_generation, old.index_revision);
     let identity =
-        baleyg::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
+        trellis::store::topology::WorkspaceIdentity::discover(Some(root.path()), root.path())
             .unwrap();
     let db = Connection::open(
         state

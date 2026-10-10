@@ -6,9 +6,9 @@ const LANGUAGES = ["java", "rust", "python", "javascript"];
 const KINDS = ["module", "namespace", "type", "implementation", "function", "method",
   "constructor", "field", "variable", "parameter", "typeParameter", "alias", "anonymousFunction"];
 const DOMAINS = new Set([
-  Buffer.from("baleyg.syntax.v1\0").toString("hex"),
-  Buffer.from("baleyg.header.v1\0").toString("hex"),
-  Buffer.from("baleyg.sibling-group.v1\0").toString("hex"),
+  Buffer.from("trellis.syntax.v1\0").toString("hex"),
+  Buffer.from("trellis.header.v1\0").toString("hex"),
+  Buffer.from("trellis.sibling-group.v1\0").toString("hex"),
 ]);
 const ENUMS = {
   language: LANGUAGES,

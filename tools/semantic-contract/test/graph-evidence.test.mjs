@@ -945,7 +945,7 @@ test("admitted failed/omitted refresh selects source-backed declaration proofs, 
       (options.changed ? "// changed bytes\n" : "");
     const extractionContext = contentHash(
       Buffer.from(
-        'baleyg.extraction-context.v1\0{"components":[],"language":"javascript"}',
+        'trellis.extraction-context.v1\0{"components":[],"language":"javascript"}',
       ),
     );
 const expectedCall = occurrenceId({
