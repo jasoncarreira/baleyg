@@ -799,31 +799,134 @@ async fn long_home_socket_names_are_private_distinct_connectable_and_recover_aft
     assert!(UnixStream::connect(&paths[0].socket).is_ok());
     assert!(UnixStream::connect(&paths[1].socket).is_ok());
     // SIGKILL does not run SocketOwner::drop; election must recover the stale socket.
-    let old_inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&paths[0].socket).unwrap());
+    use std::os::unix::fs::MetadataExt;
+    let old_metadata = fs::symlink_metadata(&paths[0].socket).unwrap();
+    let old_identity = (old_metadata.dev(), old_metadata.ino());
     owners[0].0.kill().unwrap();
     owners[0].0.wait().unwrap();
-    assert!(paths[0].socket.exists());
+    let stale_metadata = fs::symlink_metadata(&paths[0].socket).unwrap();
+    assert!(stale_metadata.file_type().is_socket());
+    assert_eq!((stale_metadata.dev(), stale_metadata.ino()), old_identity);
+    assert!(
+        UnixStream::connect(&paths[0].socket).is_err(),
+        "killed daemon's stale socket still accepts connections"
+    );
+    let proof_root = temp.path().join("recovered-socket-proof");
+    fs::create_dir(&proof_root).unwrap();
+    let pid_file = homes[0].join("recovered-daemon.pid");
     let mut command = cli(&homes[0]);
-    command.arg("daemon");
+    command
+        .arg("daemon")
+        .env("BALEYG_TEST_DAEMON_PID_FILE", &pid_file);
     let mut recovered = detached(command);
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(metadata) = fs::metadata(&paths[0].socket)
-            && std::os::unix::fs::MetadataExt::ino(&metadata) != old_inode
-            && UnixStream::connect(&paths[0].socket).is_ok()
+    assert!(recovered.0.try_wait().unwrap().is_none());
+    let mut recovered_socket = loop {
+        if let Ok(metadata) = fs::symlink_metadata(&paths[0].socket)
+            && metadata.file_type().is_socket()
+            && metadata.permissions().mode() & 0o777 == 0o600
+            && fs::metadata(paths[0].socket.parent().unwrap())
+                .is_ok_and(|parent| parent.permissions().mode() & 0o777 == 0o700)
+            && let Ok(stream) = UnixStream::connect(&paths[0].socket)
         {
-            break;
+            break stream;
         }
+        let recovered_status = recovered.0.try_wait().unwrap();
         assert!(
-            recovered.0.try_wait().unwrap().is_none(),
-            "crash recovery daemon exited"
+            recovered_status.is_none(),
+            "crash recovery daemon pid={} exited: {recovered_status:?}; {}",
+            recovered.0.id(),
+            fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
         );
-        assert!(
-            Instant::now() < deadline,
-            "stale long-HOME socket not recovered"
-        );
+        if Instant::now() >= deadline {
+            let current = fs::symlink_metadata(&paths[0].socket);
+            let current_detail = current
+                .as_ref()
+                .map(|metadata| {
+                    format!(
+                        "dev={}, ino={}, socket={}, mode={:o}",
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.file_type().is_socket(),
+                        metadata.mode() & 0o777
+                    )
+                })
+                .unwrap_or_else(|error| format!("metadata error: {error}"));
+            let parent_mode = fs::metadata(paths[0].socket.parent().unwrap())
+                .map(|metadata| metadata.permissions().mode() & 0o777);
+            let independent_connect = UnixStream::connect(&paths[0].socket)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            panic!(
+                "stale long-HOME socket not recovered: old (dev, ino)={old_identity:?}, current={current_detail}, parent mode={parent_mode:?}, independent connect={independent_connect:?}, recovered pid={}, status={recovered_status:?}; {}",
+                recovered.0.id(),
+                fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
+            );
+        }
         tokio::time::sleep(Duration::from_millis(40)).await;
-    }
+    };
+    // A reused inode is not an endpoint identity; prove this owned child serves
+    // a framed request without attaching a checkout or writing its marker.
+    assert!(
+        recovered.0.try_wait().unwrap().is_none(),
+        "recovered daemon exited before protocol proof: {}",
+        fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
+    );
+    use baleyg::daemon::protocol;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .expect("recovered socket connected after the original 10-second deadline");
+    recovered_socket.set_read_timeout(Some(remaining)).unwrap();
+    recovered_socket.set_write_timeout(Some(remaining)).unwrap();
+    let proof_id = 0x107_5a1e_u64;
+    protocol::write_frame(
+        &mut recovered_socket,
+        &protocol::Request {
+            id: proof_id,
+            operation: "socket-recovery-proof".into(),
+            payload: serde_json::json!({"workspace": proof_root}),
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "recovered socket protocol write failed: {error}; {}",
+            fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
+        )
+    });
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .expect("recovered socket write exceeded the original 10-second deadline");
+    recovered_socket.set_read_timeout(Some(remaining)).unwrap();
+    let reply: protocol::Reply =
+        protocol::read_frame(&mut recovered_socket).unwrap_or_else(|error| {
+            panic!(
+                "recovered socket protocol read failed: {error}; {}",
+                fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
+            )
+        });
+    assert!(
+        Instant::now() < deadline,
+        "recovered socket reply exceeded the original 10-second deadline"
+    );
+    assert_eq!(reply.id, proof_id);
+    assert_eq!(
+        reply.payload,
+        serde_json::json!({"error": "unknown daemon operation"})
+    );
+    assert_eq!(
+        fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        recovered.0.id(),
+        "socket response came from a different elected daemon"
+    );
+    assert!(
+        recovered.0.try_wait().unwrap().is_none(),
+        "recovered daemon exited after protocol reply: {}",
+        fixture_daemon_diagnostic(&homes[0], &paths[0].socket)
+    );
     assert!(
         UnixStream::connect(&paths[1].socket).is_ok(),
         "unrelated HOME was displaced"
