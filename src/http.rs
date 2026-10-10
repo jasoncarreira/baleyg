@@ -587,6 +587,28 @@ impl DaemonState {
         })
     }
 
+    // Read freshness without borrowing FIFO claim or mutation authority. Each call
+    // drops the short serving-session lock before watcher and durable queue probes.
+    // The caller samples on both sides of Store::status so an owner replacement
+    // cannot make an old committed head look locally settled.
+    fn status_freshness_snapshot(
+        &self,
+    ) -> (Option<Arc<crate::store::topology::LeaderSession>>, bool) {
+        let owner = self.serving_session.lock().unwrap().clone();
+        let unsettled = self.checkout_runtime_stopped.load(Ordering::Acquire)
+            || owner
+                .as_ref()
+                .is_none_or(|session| !session.is_leader() || session.verify().is_err())
+            || !self.store.root_path_replaced().is_ok_and(|lost| !lost)
+            || self.checkout_watch_pending()
+            || !self.pending_requests.lock().unwrap().is_empty()
+            || !self
+                .store
+                .earliest_unfinished_request()
+                .is_ok_and(|row| row.is_none());
+        (owner, unsettled)
+    }
+
     /// Offline snapshot fixtures opt out of the daemon's queue and maintenance ticks.
     /// See #111 for the separate read-during-reconciliation product fix.
     #[doc(hidden)]
@@ -2772,7 +2794,21 @@ async fn status(
     if uri.query().is_some() {
         return Err(invalid());
     }
-    Ok(Json(db(s, |s| s.status()).await?))
+    let state = s.clone();
+    Ok(Json(
+        db(s, move |store| {
+            let (before_owner, before_pending) = state.status_freshness_snapshot();
+            let mut status = store.status()?;
+            let (after_owner, after_pending) = state.status_freshness_snapshot();
+            let same_owner = before_owner
+                .as_ref()
+                .zip(after_owner.as_ref())
+                .is_some_and(|(before, after)| Arc::ptr_eq(before, after));
+            status.catching_up = before_pending || after_pending || !same_owner;
+            Ok(status)
+        })
+        .await?,
+    ))
 }
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

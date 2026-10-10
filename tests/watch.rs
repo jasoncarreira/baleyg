@@ -1238,20 +1238,48 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
         successor.0.try_wait().unwrap().is_none(),
         "successor died after binding"
     );
-    assert!(
-        code == reqwest::StatusCode::SERVICE_UNAVAILABLE
-            && body.pointer("/error/code").and_then(|value| value.as_str())
-                == Some("index_not_ready"),
-        "failed mandatory H must refuse selected evidence with index_not_ready: old_pin={:?} selected_pin={:?} old_marker={:?} new_marker={:?} http_status={code} body={body:?} startup_stderr={stderr:?}",
-        old["revision"],
-        selected["revision"],
-        String::from_utf8_lossy(&prior_marker),
-        String::from_utf8_lossy(&new_marker)
+    assert_eq!(code, reqwest::StatusCode::OK, "{body:?} {stderr:?}");
+    assert_eq!(
+        body["revision"], old["revision"],
+        "failed H must not publish"
+    );
+    assert_eq!(body["workspaceRoot"], old["workspaceRoot"]);
+    assert_eq!(
+        body["catchingUp"], true,
+        "failed H is readable but not settled"
+    );
+    let prior_source = reqwest::Client::new()
+        .get(format!("http://{address}/api/source"))
+        .bearer_auth(token)
+        .query(&[
+            ("path", "a.js"),
+            (
+                "indexGeneration",
+                old["revision"]["indexGeneration"].as_str().unwrap(),
+            ),
+            (
+                "indexRevision",
+                &old["revision"]["indexRevision"]
+                    .as_u64()
+                    .unwrap()
+                    .to_string(),
+            ),
+        ])
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prior_source.status(), reqwest::StatusCode::OK);
+    let prior_source: serde_json::Value = prior_source.json().await.unwrap();
+    assert_eq!(prior_source["revision"], old["revision"]);
+    assert_eq!(
+        prior_source["file"]["text"], "a=0;\n",
+        "failed-H source must remain the committed predecessor, not the oversized workspace input"
     );
 
     // Repair the *same persisted-option input* without POST, CLI index, restart,
     // or a new daemon. A failed first H must trigger a bounded, request-free
-    // takeover. The initial HTTP 503 and a valid prior head do not prove H.
+    // takeover. Readable prior evidence and catchingUp=true do not prove H.
     let queue = request_db_under(&home).unwrap();
     type DurableRow = (i64, String, String, Option<String>, Option<i64>);
     let durable_rows =
@@ -1333,7 +1361,18 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
         );
         let prior_revision = old["revision"]["indexRevision"].as_u64().unwrap();
         match body["revision"]["indexRevision"].as_u64() {
-            Some(revision) if revision > prior_revision => break body,
+            Some(revision) if revision > prior_revision && body["catchingUp"] == false => {
+                break body;
+            }
+            Some(revision) if revision > prior_revision => {
+                assert_eq!(body["catchingUp"], true, "new pin has unsettled work");
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "new H committed but watcher/FIFO never settled: body={body:?} rows={:?}",
+                    durable_rows()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             Some(revision) if revision == prior_revision => {
                 // A repaired successor can serve the authenticated prior head
                 // before mandatory H commits. Prove a new live EX before
