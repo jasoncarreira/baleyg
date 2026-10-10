@@ -1430,6 +1430,15 @@ impl CheckoutRuntime {
         if matches!(phase, RuntimePhase::HOwned(_)) {
             return;
         }
+        // After root loss, scheduler may have already retired its serving
+        // reference. The registry's Ready Arc is still an exact old EX: never
+        // drop it in an ordinary phase refresh before a serialized terminal
+        // COMMIT has proved that no accepted old-root FIFO work remains.
+        if matches!(phase, RuntimePhase::Ready(owner) if owner.is_leader())
+            && !resources.store.root_path_replaced().is_ok_and(|lost| !lost)
+        {
+            return;
+        }
         match resources.scheduler.checkout_serving_owner() {
             Some(owner) => {
                 if !matches!(phase, RuntimePhase::Ready(previous) if Arc::ptr_eq(previous, &owner))
@@ -1441,13 +1450,60 @@ impl CheckoutRuntime {
         }
     }
 
-    /// A root-loss H owner cannot be released or counted idle because a
-    /// read-only SELECT misses a second writer's uncommitted FIFO row.
+    /// A moved-root Ready owner is not idle just because the scheduler has
+    /// dropped its separate reference. The scheduler's retirement snapshot is
+    /// only quiescence; this exact Arc must serialize a terminal old-root
+    /// BEGIN IMMEDIATE/COMMIT before the registry can drop its last EX.
     fn unsettled_root_loss_owner(&self, resources: &ActiveResources) -> bool {
-        let phase = self.phase.lock().unwrap();
-        matches!(&*phase,
-            RuntimePhase::HOwned(owner) | RuntimePhase::Ready(owner) if owner.is_leader())
-            && !resources.store.root_path_replaced().is_ok_and(|lost| !lost)
+        let mut phase = self.phase.lock().unwrap();
+        let (owner, ready) = match &*phase {
+            RuntimePhase::HOwned(owner) if owner.is_leader() => (owner.clone(), false),
+            RuntimePhase::Ready(owner) if owner.is_leader() => (owner.clone(), true),
+            _ => return false,
+        };
+        match resources.store.root_path_replaced() {
+            Ok(false) => return false,
+            Err(_) => return true, // Unknown root identity cannot release EX.
+            Ok(true) => {}
+        }
+        if !ready
+            || !resources.scheduler.checkout_root_loss_retired()
+            || self.active_reads.load(Ordering::Acquire) != 0
+        {
+            return true;
+        }
+        let orphan = resources.store.orphan_root_loss_owner();
+        if orphan
+            .as_ref()
+            .is_some_and(|other| !Arc::ptr_eq(other, &owner))
+        {
+            return true;
+        }
+        if resources
+            .store
+            .complete_uncertain_use_transition(&owner)
+            .is_err()
+            || resources.store.fail_changed_root_requests(&owner).is_err()
+            || !resources.store.root_path_replaced().is_ok_and(|lost| lost)
+        {
+            // BUSY, ambiguous COMMIT, or unstable root proof preserves Ready
+            // and every copy of its exact leader EX for the next lifecycle tick.
+            return true;
+        }
+        // A different orphan could appear while the serialized queue proof
+        // ran. Never discard this Ready EX or another Store-owned lease then.
+        let orphan = resources.store.orphan_root_loss_owner();
+        if orphan
+            .as_ref()
+            .is_some_and(|other| !Arc::ptr_eq(other, &owner))
+        {
+            return true;
+        }
+        if orphan.is_some() {
+            resources.store.clear_orphan_root_loss_owner_if_same(&owner);
+        }
+        *phase = RuntimePhase::Reconciling;
+        false
     }
 
     /// Never open a second index-use SH while our exact H owner may still
