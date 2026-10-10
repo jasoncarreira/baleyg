@@ -8,7 +8,7 @@
   - `../../mcp-readonly-pilot-contract.md`: the eligibility table.
 - **What it leaves unchanged:**
   - per-checkout indexes, pins and revisions;
-  - retention and GC policy (Decision 0006);
+  - retention, and GC eligibility (Decision 0006). Only GC's lock mechanism may change, as §2 sets out;
   - the #67 request queue and its ordering;
   - the evidence contracts;
   - per-call workspace selection and idle timeouts (Decision 0007 §2–3).
@@ -48,13 +48,13 @@ PR #117 shows the cost: cross-process ownership transitions contributed substant
   - takeover and successor handoff.
 - Checkout ownership becomes **in-process state** in the daemon's registry.
 - **Per-checkout use locks** may be removed only after both of these:
-  1. every out-of-process `Store` or SQLite opener is removed or blocked;
+  1. every **Baleyg-controlled** out-of-process `Store` or SQLite opener is removed or blocked (external tools are unsupported; see Consequences);
   2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot, every retained SQLite handle and every new opener, and stay held from GC's eligibility check through the unlink.
 
-  A registry lookup alone isn't enough to protect GC (Decision 0006 §2).
+  A registry lookup alone isn't enough to protect GC. Decision 0006 §2's nonblocking exclusive use lock stays until this gate is proved; the gate then supersedes only that lock mechanism, not GC eligibility.
 - **The separate durable-record lock** (saved views, notes, ledgers) stays unless its removal gets its own proof of safety.
 
-### 3. Recovery is one case: a new daemon instance
+### 3. Recovery: a new daemon instance, or a live root replacement
 
 When a daemon instance activates a checkout, **or a running daemon detects that a checkout's root was replaced at the same path**, it does the following, in order, before any new-root H or claim:
 1. **Open the queue.** SQLite rolls back any write a crashed instance left half-finished (hot journal) when the file is opened.
@@ -67,8 +67,9 @@ When a daemon instance activates a checkout, **or a running daemon detects that 
 A crash at any point simply repeats these steps on the next activation. No **durable** cross-process handoff or quarantine state is kept, and no owner lease. A live daemon still blocks H and claims until the queue outcome is verified, or until recovery restarts.
 
 **What a crash guarantees:**
-- **Every accepted request ID reaches exactly one durable terminal result** (`done` or `failed`) **for as long as its queue exists.**
-- The queue (`requests.db`) lives in the derived index directory. When GC deletes an eligible index under Decision 0006 §2 (root missing or replaced, or 30 days unopened), any request still pending in that queue is abandoned with it. A later lookup of that ID returns a typed `not_found`. Decision 0006's GC policy is unchanged; in practice, those requests could never run (root gone) or have had no waiter for 30 days.
+- **Every accepted request ID in a retained queue that the daemon activates or services reaches exactly one durable terminal result** (`done` or `failed`).
+- A queue with no activating client is not serviced. Its rows stay pending until the daemon next activates that checkout, or until eligible GC deletes the index.
+- The queue (`requests.db`) lives in the derived index directory. When GC deletes an eligible index under Decision 0006 §2 (root missing or replaced, or 30 days unopened), any request still pending in that queue is abandoned with it. A fresh lookup of that ID afterwards returns a typed `not_found`. A client already waiting with a captured root that is now lost still gets `root_changed` (T04). Decision 0006's GC policy is unchanged; in practice, those requests could never run (root gone) or have had no waiter for 30 days.
 - This is not a promise of one execution or one revision: a crash between committing an index revision and completing the queue row can redo the work, which can produce an additional revision.
 - FIFO order and pin correctness still hold. A completed row's pin names a committed, validated revision, and no row is claimed out of order.
 
@@ -93,4 +94,4 @@ Only the daemon opens these databases, so other processes can no longer contend 
 - **Much less code.** Leader election, follower mode, takeover, root-loss owner leases and cross-process busy and retry paths are deleted. The cross-process handoff read permits are deleted and replaced by daemon-local admission of the validated prior head. The implementing PR must show a clear net reduction in production code.
 - **The daemon is required.** Every data command needs a daemon, started automatically; if it can't start, the command fails with `daemon_unavailable`. A daemon crash briefly interrupts every session until clients restart it; accepted queue rows survive (Decision 0007 already accepts this).
 - **Tests change.** Tests that simulate two competing Baleyg processes on one checkout are replaced by daemon-restart and crash-recovery tests.
-- **External tools.** Opening a live daemon index with an external tool such as the `sqlite3` CLI is **unsupported**. It may still physically succeed, so this is not a guarantee that no outside process opens the index: §2's use-lock conditions still apply.
+- **External tools.** Opening a live daemon index with an external tool such as the `sqlite3` CLI is **unsupported**. It may still physically succeed, so it isn't excluded. §2's gate covers Baleyg-controlled openers only; external access while the daemon runs is unsupported and may observe or disturb in-progress state.
