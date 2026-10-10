@@ -1046,7 +1046,7 @@ fn changed_claimed_source_uses_native_fallback_not_unchanged() {
 }
 
 #[test]
-fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
+fn preclaim_corrupt_pair_refuses_without_ack_or_changing_selected_pair() {
     use baleyg::index_coordinator::{drain_requests, reconcile_workspace};
     use std::sync::{Arc, atomic::AtomicBool};
     let state = tempfile::tempdir().unwrap();
@@ -1054,25 +1054,77 @@ fn claimed_unchanged_guard_failure_never_acks_or_changes_selected_pair() {
     fs::write(workspace.path().join("a.js"), "function a() {}\n").unwrap();
     let store = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     let options = IndexOptions::new(workspace.path().to_owned());
-    let (head, leader) =
+    let (_head, leader) =
         reconcile_workspace(&store, &options, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
     let request = store.enqueue_request(&options, None).unwrap();
-    let db =
-        rusqlite::Connection::open(store.request_db_path().with_file_name("index.db")).unwrap();
-    db.execute(
-        "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
-        [b"function b() {}\n".as_slice()],
-    )
-    .unwrap();
-    drop(db);
-    assert_eq!(drain_requests(&store, &leader).unwrap(), 1);
-    let row = store.request_by_id(&request.id).unwrap().unwrap();
-    assert_eq!(row.state, "failed", "guard failure must not ACK done");
-    assert!(row.revision.is_none());
+    assert_eq!(request.state, "queued");
+    let index_path = store.request_db_path().with_file_name("index.db");
+    let db = rusqlite::Connection::open(&index_path).unwrap();
+    let original_source: Vec<u8> = db
+        .query_row(
+            "SELECT source_bytes FROM document_versions WHERE path='a.js'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let forged_source = b"function b() {}\n";
+    assert_ne!(original_source, forged_source);
     assert_eq!(
-        store.index_baseline().unwrap(),
-        head,
-        "selected pair must remain unchanged"
+        db.execute(
+            "UPDATE document_versions SET source_bytes=?1 WHERE path='a.js'",
+            [forged_source.as_slice()],
+        )
+        .unwrap(),
+        1
+    );
+    let persisted_source: Vec<u8> = db
+        .query_row(
+            "SELECT source_bytes FROM document_versions WHERE path='a.js'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_source, forged_source);
+    let control = |db: &rusqlite::Connection| -> (String, i64, Option<String>) {
+        db.query_row(
+            "SELECT index_generation,index_revision,reconciled_incarnation FROM index_metadata WHERE singleton=1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    };
+    let marker_before = control(&db);
+    drop(db);
+    let bytes_before = fs::read(&index_path).unwrap(); // Post-tamper canonical pair, not the pristine pair.
+
+    let error = drain_requests(&store, &leader).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("incompatible_index: manifest source mismatch"),
+        "{error:#}"
+    );
+    let row = store.request_by_id(&request.id).unwrap().unwrap();
+    assert_eq!(
+        (row.id.as_str(), row.seq),
+        (request.id.as_str(), request.seq)
+    );
+    assert_eq!(
+        (row.root_device.as_str(), row.root_inode.as_str()),
+        (request.root_device.as_str(), request.root_inode.as_str())
+    );
+    assert_eq!(
+        row.state, "queued",
+        "claim must refuse before queue UPDATE/COMMIT"
+    );
+    assert!(row.claim_incarnation.is_none());
+    assert!(row.started_at.is_none());
+    assert!(row.finished_at.is_none());
+    assert!(row.error_code.is_none());
+    assert!(row.revision.is_none());
+    let after = rusqlite::Connection::open(&index_path).unwrap();
+    assert_eq!(control(&after), marker_before);
+    drop(after);
+    assert_eq!(
+        fs::read(&index_path).unwrap(),
+        bytes_before,
+        "claim refusal must not change even the corrupted canonical index bytes"
     );
 }
 
