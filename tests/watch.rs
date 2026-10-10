@@ -1248,6 +1248,10 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
         body["catchingUp"], true,
         "failed H is readable but not settled"
     );
+    let prior_revision = old["revision"]["indexRevision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
     let prior_source = reqwest::Client::new()
         .get(format!("http://{address}/api/source"))
         .bearer_auth(token)
@@ -1257,13 +1261,7 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                 "indexGeneration",
                 old["revision"]["indexGeneration"].as_str().unwrap(),
             ),
-            (
-                "indexRevision",
-                &old["revision"]["indexRevision"]
-                    .as_u64()
-                    .unwrap()
-                    .to_string(),
-            ),
+            ("indexRevision", prior_revision.as_str()),
         ])
         .timeout(Duration::from_secs(3))
         .send()
