@@ -919,7 +919,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
     }
     // A bound TCP listener is not an H-ready signal. A coherent predecessor
     // can remain readable while the successor reconciles the lost edit.
-    let mut failure_details = |observed: &serde_json::Value| -> String {
+    let failure_details = |successor: &mut Server, observed: &serde_json::Value| -> String {
         // Failure-only snapshot. Keep the original strict AC1 assertion:
         // a later watcher tick or explicit index cannot turn this RED green.
         let lock_path = leader_lock_under(&home).unwrap();
@@ -1004,14 +1004,14 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
             .unwrap_or_else(|error| {
                 panic!(
                     "successor HTTP status failed: {error}; {}",
-                    failure_details(&old)
+                    failure_details(&mut successor, &old)
                 )
             });
         let code = response.status();
         let body: serde_json::Value = response.json().await.unwrap_or_else(|error| {
             panic!(
                 "successor HTTP status malformed: {error}; {}",
-                failure_details(&old)
+                failure_details(&mut successor, &old)
             )
         });
         // A positive predecessor exists: 503/409 is not a successful H wait.
@@ -1019,19 +1019,24 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
             code,
             reqwest::StatusCode::OK,
             "unexpected successor HTTP readiness response {code} {body:?}; {}",
-            failure_details(&body)
+            failure_details(&mut successor, &body)
         );
         assert_eq!(body["workspaceRoot"], old["workspaceRoot"]);
         assert_eq!(
             body["revision"]["indexGeneration"],
             old["revision"]["indexGeneration"],
             "successor HTTP selected generation differs; {}",
-            failure_details(&body)
+            failure_details(&mut successor, &body)
         );
         match body["revision"]["indexRevision"].as_u64() {
             Some(revision) if revision == prior_revision => {
                 // An interim 200 never proves takeover. Its selected source must
                 // still be the authenticated predecessor, not the lost edit.
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "predecessor source probe began after readiness deadline; {}",
+                    failure_details(&mut successor, &body)
+                );
                 let old_revision = prior_revision.to_string();
                 let source = http_client
                     .get(format!("http://{successor_addr}/api/source"))
@@ -1058,6 +1063,11 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 assert_eq!(
                     source["file"]["text"], "function before() {}\n",
                     "lost edit leaked into predecessor pin"
+                );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "predecessor source arrived after readiness deadline; {}",
+                    failure_details(&mut successor, &body)
                 );
                 if body["catchingUp"] == false {
                     // H may commit after the old status snapshot but before its
@@ -1098,7 +1108,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 assert!(
                     Instant::now() < ready_deadline,
                     "successor never committed H before deadline; {}",
-                    failure_details(&body)
+                    failure_details(&mut successor, &body)
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -1107,7 +1117,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                     assert!(
                         Instant::now() < ready_deadline,
                         "new H pin never settled watcher/FIFO; {}",
-                        failure_details(&body)
+                        failure_details(&mut successor, &body)
                     );
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue;
@@ -1120,6 +1130,11 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                 assert!(
                     successor.0.try_wait().unwrap().is_none(),
                     "successor exited before serving settled new H pin"
+                );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "new H pin settled after readiness deadline; {}",
+                    failure_details(&mut successor, &body)
                 );
                 let new_revision = revision.to_string();
                 let source = http_client
@@ -1148,11 +1163,16 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
                     source["file"]["text"], "function after() {}\n",
                     "successor declared H ready without the lost edit"
                 );
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "repaired source arrived after readiness deadline; {}",
+                    failure_details(&mut successor, &body)
+                );
                 break body;
             }
             _ => panic!(
                 "successor served malformed/stale generation or revision: {body:?}; {}",
-                failure_details(&body)
+                failure_details(&mut successor, &body)
             ),
         }
     };
@@ -1186,7 +1206,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         source_response.status(),
         reqwest::StatusCode::OK,
         "successor pinned source unavailable; {}",
-        failure_details(&ready_status)
+        failure_details(&mut successor, &ready_status)
     );
     let source_body: serde_json::Value = source_response.json().await.unwrap();
     assert_eq!(
@@ -1215,7 +1235,7 @@ async fn killed_leader_reconciles_lost_edits_before_serving() {
         selected["revision"]["indexRevision"].as_u64().unwrap()
             > old["revision"]["indexRevision"].as_u64().unwrap(),
         "mandatory takeover must publish before any explicit request; {}",
-        failure_details(&selected)
+        failure_details(&mut successor, &selected)
     );
     assert_ne!(fs::read(leader_lock_under(&home).unwrap()).unwrap(), marker);
     let exported = cli(&root, &home, "export").output().unwrap();
