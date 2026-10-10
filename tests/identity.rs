@@ -199,16 +199,25 @@ fn injected_sql_failure_after_insert_preserves_previous_revision() {
             .to_string()
             .contains("incompatible_index")
     );
+    let active_error = store.graph().unwrap_err();
+    assert!(
+        active_error.to_string().contains("incompatible_index"),
+        "{active_error:#}"
+    );
     let db = rusqlite::Connection::open(index_db(&state)).unwrap();
     db.execute_batch("DROP TRIGGER abort_second_call").unwrap();
     drop(db);
     assert_eq!(store.index_baseline().unwrap(), revision);
-    for error in [store.status().unwrap_err(), store.graph().unwrap_err()] {
-        assert_eq!(
-            error.to_string(),
-            "incompatible_index: reconciliation required after invalid current index"
-        );
-    }
+    assert_eq!(
+        store.status().unwrap().revision,
+        revision,
+        "the repaired trigger leaves the committed prior A head readable"
+    );
+    assert_eq!(
+        store.graph().unwrap(),
+        first,
+        "the exact old a,b graph survives rollback; uncommitted c,d cannot leak"
+    );
     let next_revision = publish_bundle(
         &store,
         &next,
