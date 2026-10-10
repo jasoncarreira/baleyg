@@ -421,13 +421,20 @@ pub struct LeaderWork {
     last_inventory: std::time::Instant,
     retry_after: Option<std::time::Instant>,
     last_accounted_generation: Option<u64>,
+    #[cfg(feature = "test-causal-witness")]
     last_accounted_pin: Option<IndexPin>,
     options: IndexOptions,
+    #[cfg(feature = "test-causal-witness")]
     witness: Option<Arc<crate::daemon::causal_witness::CausalWitness>>,
+    #[cfg(feature = "test-causal-witness")]
     witness_owner: Option<uuid::Uuid>,
+    #[cfg(feature = "test-causal-witness")]
     witness_epoch: uuid::Uuid,
+    #[cfg(feature = "test-causal-witness")]
     witness_ordinal: u64,
+    #[cfg(feature = "test-causal-witness")]
     witness_ordinal_source: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(feature = "test-causal-witness")]
     witness_reported_generation: Option<u64>,
 }
 
@@ -449,19 +456,27 @@ impl LeaderWork {
             last_inventory: std::time::Instant::now(),
             retry_after: None,
             last_accounted_generation: None,
+            #[cfg(feature = "test-causal-witness")]
             last_accounted_pin: None,
             options: options.clone(),
+            #[cfg(feature = "test-causal-witness")]
             witness: None,
+            #[cfg(feature = "test-causal-witness")]
             witness_owner: None,
+            #[cfg(feature = "test-causal-witness")]
             witness_epoch: uuid::Uuid::nil(),
+            #[cfg(feature = "test-causal-witness")]
             witness_ordinal: 0,
+            #[cfg(feature = "test-causal-witness")]
             witness_ordinal_source: None,
+            #[cfg(feature = "test-causal-witness")]
             witness_reported_generation: None,
         })
     }
 
     /// Bind the optional fixture reporter only after this verified owner installs
     /// the watcher. Generation numbers belong to this exact watch epoch.
+    #[cfg(feature = "test-causal-witness")]
     pub fn attach_causal_witness(
         &mut self,
         reporter: Arc<crate::daemon::causal_witness::CausalWitness>,
@@ -475,6 +490,7 @@ impl LeaderWork {
         self.witness = Some(reporter);
     }
 
+    #[cfg(feature = "test-causal-witness")]
     pub fn causal_lineage(&self) -> Option<crate::daemon::causal_witness::Lineage> {
         Some(crate::daemon::causal_witness::Lineage {
             owner_incarnation: self.witness_owner?,
@@ -489,6 +505,7 @@ impl LeaderWork {
 
     /// Captured while the publication permit still covered the acknowledged
     /// inventory. A later head must not borrow this watch ACK.
+    #[cfg(feature = "test-causal-witness")]
     pub fn accounted_watch_pin(&self) -> Option<IndexPin> {
         self.last_accounted_pin
     }
@@ -602,7 +619,11 @@ impl LeaderWork {
             self.watch = next;
             self.options = options.clone();
             self.last_accounted_generation = None;
-            self.last_accounted_pin = None;
+            #[cfg(feature = "test-causal-witness")]
+            {
+                self.last_accounted_pin = None;
+            }
+            #[cfg(feature = "test-causal-witness")]
             if let Some(source) = &self.witness_ordinal_source {
                 self.witness_epoch = uuid::Uuid::new_v4();
                 self.witness_reported_generation = None;
@@ -616,6 +637,7 @@ impl LeaderWork {
         // Observe each new generation before its capture can acknowledge it.
         // The queue tick holds leader_work across this call; the bounded
         // reporter only try_sends and never opens a socket on this path.
+        #[cfg(feature = "test-causal-witness")]
         if self.witness_reported_generation != Some(batch.generation) {
             if let (Some(reporter), Some(lineage)) = (&self.witness, self.causal_lineage()) {
                 reporter.watch_pending(lineage, batch.generation);
@@ -690,6 +712,7 @@ impl LeaderWork {
                 // Optional witness data must be captured under the same
                 // publication permit as this inventory. An uncertain read
                 // suppresses only the fixture event, not real reconciliation.
+                #[cfg(feature = "test-causal-witness")]
                 let witnessed_pin = self
                     .witness
                     .as_ref()
@@ -698,9 +721,15 @@ impl LeaderWork {
                 let accounted = self.watch.acknowledge(&batch);
                 if accounted {
                     self.last_accounted_generation = Some(batch.generation);
-                    self.last_accounted_pin = witnessed_pin;
+                    #[cfg(feature = "test-causal-witness")]
+                    {
+                        self.last_accounted_pin = witnessed_pin;
+                    }
                 } else {
-                    self.last_accounted_pin = None;
+                    #[cfg(feature = "test-causal-witness")]
+                    {
+                        self.last_accounted_pin = None;
+                    }
                     // A concurrent event is not part of this selected capture.
                     // Keep it dirty for the next tick or successor full takeover.
                     self.watch.require_full();
@@ -1317,7 +1346,41 @@ pub fn establish_serving_session(
     explicit_options: Option<&IndexOptions>,
     cancel: &CancelFlag,
 ) -> Result<Arc<LeaderSession>> {
+    establish_serving_session_observed(store, explicit_options, cancel, None, |_| {})
+}
+
+/// Retain initial-H's EX owner before any fallible root/FIFO or publication
+/// step; failed H must not release a replaced root's unfinished requests.
+pub fn establish_serving_session_observed(
+    store: &Store,
+    explicit_options: Option<&IndexOptions>,
+    cancel: &CancelFlag,
+    retained: Option<Arc<LeaderSession>>,
+    on_owner: impl FnOnce(Arc<LeaderSession>),
+) -> Result<Arc<LeaderSession>> {
     if store.is_recreate_pending() {
+        if let Some(owner) = &retained {
+            // A replaced root owes its old FIFO a terminal outcome under this
+            // exact EX. The worker's root-loss retirement handles that path.
+            if store.root_path_replaced()? {
+                anyhow::bail!("root_changed: initial H must retire old-root requests");
+            }
+            let options = explicit_options.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recovery_required: index options unavailable; run explicit baleyg index"
+                )
+            })?;
+            // The Store converts this SAME owner's protected index-use SH to
+            // EX behind the per-root transition gate, and restores SH before
+            // returning. Never re-elect or release the initial-H leader here.
+            let (_, session) = store.recreate_pending_with_owner(owner, options, cancel)?;
+            ensure!(
+                Arc::ptr_eq(owner, &session),
+                "storage_busy: exceptional H changed leader owner"
+            );
+            on_owner(session.clone());
+            return Ok(session);
+        }
         let options = explicit_options.ok_or_else(|| {
             anyhow::anyhow!(
                 "recovery_required: index options unavailable; run explicit baleyg index"
@@ -1328,8 +1391,9 @@ pub fn establish_serving_session(
         session.verify()?;
         return Ok(session);
     }
-    match store.leader_session() {
+    match retained.map(Ok).unwrap_or_else(|| store.leader_session()) {
         Ok(session) => {
+            on_owner(session.clone());
             store.fail_changed_root_requests(&session)?;
             let publication =
                 store.enter_publication(cancel, std::time::Duration::from_millis(250))?;

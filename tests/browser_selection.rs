@@ -985,6 +985,39 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .unwrap();
         assert_eq!(foreign_cancel.status(), reqwest::StatusCode::NOT_FOUND);
     }
+    // A cancel response is not a proof that native H and the FIFO have settled.
+    // Observe the actual selected runtime state before native DELETE; this does
+    // not retry a failed mutation or turn storage_busy into success.
+    for (key, root) in [(&a_key, &a), (&b_key, &b)] {
+        let expected_workspace = root.canonicalize().unwrap();
+        let mut last_observation = String::new();
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                let status = client
+                    .get(format!("{base}/api/checkouts/{key}/status"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .unwrap();
+                let status_code = status.status();
+                let workspace = status.headers().get("X-Baleyg-Workspace")
+                    .and_then(|value| value.to_str().ok()).unwrap_or("missing").to_owned();
+                let catching_up = status.headers().get("X-Baleyg-Catching-Up")
+                    .and_then(|value| value.to_str().ok()).unwrap_or("missing").to_owned();
+                let status_body = status.text().await.unwrap_or_default();
+                let settled = status_code == reqwest::StatusCode::OK
+                    && workspace == expected_workspace.to_str().unwrap()
+                    && catching_up == "false";
+                if settled { break; }
+                last_observation = format!(
+                    "{key}: status={status_code}, workspace={workspace}, catchingUp={catching_up}, statusBody={status_body}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("selected H/FIFO did not settle before DELETE: {last_observation}"));
+    }
     for suffix in ["views/saved", "annotations/note"] {
         let deleted = client
             .delete(format!("{base}/api/checkouts/{a_key}/{suffix}"))
@@ -1024,9 +1057,19 @@ async fn production_browser_selects_two_real_worktrees_without_global_attachment
             .send()
             .await
             .unwrap();
-        assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+        let selected_workspace = deleted.headers()["X-Baleyg-Workspace"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let status = deleted.status();
+        let body = deleted.text().await.unwrap_or_default();
         assert_eq!(
-            deleted.headers()["X-Baleyg-Workspace"],
+            status,
+            reqwest::StatusCode::NO_CONTENT,
+            "selected B DELETE {suffix} failed: {body}"
+        );
+        assert_eq!(
+            selected_workspace,
             b.canonicalize().unwrap().to_str().unwrap()
         );
     }
@@ -1901,7 +1944,7 @@ async fn cold_selected_native_read_is_not_ready_without_a_fabricated_basis() {
 }
 
 #[tokio::test]
-async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_h() {
+async fn selected_status_serves_committed_head_before_h_and_clears_freshness_after_h() {
     use axum::{
         body::{Body, to_bytes},
         http::Request,
@@ -2040,8 +2083,8 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             changed,
         )
         .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
+        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "storage_busy");
         assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
         let (code, _, body) = selected_json(
             app.clone(),
@@ -2050,8 +2093,8 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             Value::Null,
         )
         .await;
-        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["error"]["code"], "index_not_ready");
+        assert_eq!(code, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "storage_busy");
     }
     let records = baleyg::store::topology::DurableRecords::new(&roots, &identity);
     assert_eq!(
@@ -2133,10 +2176,22 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
     assert_eq!(code, axum::http::StatusCode::OK, "{dependencies}");
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     assert_eq!(dependencies["workspaceRevision"], old_revision);
-    for route in [
-        "dependencies/refresh",
-        "questions/foreign/jev-run",
-        "questions/foreign/acp-answer",
+    for (route, expected_status, expected_code) in [
+        (
+            "dependencies/refresh",
+            axum::http::StatusCode::CONFLICT,
+            "storage_busy",
+        ),
+        (
+            "questions/foreign/jev-run",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+        ),
+        (
+            "questions/foreign/acp-answer",
+            axum::http::StatusCode::NOT_FOUND,
+            "not_found",
+        ),
     ] {
         let (code, headers, error) = selected_json(
             app.clone(),
@@ -2145,15 +2200,8 @@ async fn selected_status_serves_validated_pre_h_head_and_clears_freshness_after_
             serde_json::json!({}),
         )
         .await;
-        assert_eq!(
-            code,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "{route}: {error}"
-        );
-        assert_eq!(
-            error["error"]["code"], "index_not_ready",
-            "{route}: {error}"
-        );
+        assert_eq!(code, expected_status, "{route}: {error}");
+        assert_eq!(error["error"]["code"], expected_code, "{route}: {error}");
         assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
     }
     resume_tx.send(()).unwrap();
@@ -2237,6 +2285,7 @@ async fn provider_routes_use_only_the_selected_checkout() {
     fs::write(b.join("library/source.rs"), "pub fn from_b() {}\n").unwrap();
     let a_id = WorkspaceIdentity::discover(Some(&a), &a).unwrap();
     let b_id = WorkspaceIdentity::discover(Some(&b), &b).unwrap();
+    let a_leader_path = roots.leader_lock(&a_id);
     let runner = temp.path().join("acp-runner");
     fs::write(
         &runner,
@@ -2576,6 +2625,9 @@ async fn provider_routes_use_only_the_selected_checkout() {
             "quote":"function selected_root() { return 1; }"}]}],
         "branches":[],"limitations":[]},"estimatedUsd":0.01});
     fs::write(temp.path().join("acp-response.json"), response.to_string()).unwrap();
+    // ACP spends from its own attempt ledger. A valid exact packet remains
+    // provider-eligible while the native leader marker is no longer H-ready.
+    fs::write(&a_leader_path, "00000000-0000-4000-8000-000000000001").unwrap();
     let (code, _, answer) = selected_json(
         app.clone(),
         "POST",
@@ -2886,7 +2938,7 @@ async fn production_browser_rejects_every_selector_free_checkout_route_without_a
 }
 
 #[tokio::test]
-async fn selected_reads_validated_predecessor_through_owner_handoff() {
+async fn selected_reads_committed_head_through_owner_handoff() {
     use baleyg::{
         daemon::registry::{CheckoutOptions, CheckoutRegistry},
         http::ProvisionedBrowser,
@@ -2983,10 +3035,10 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
         selected_json(pending_browser, "GET", &files_path, Value::Null).await
     });
     // The owner remains paused *before* SQLite metadata validation. A proved
-    // predecessor must answer without waiting for that validation or H.
+    // prior published head must answer without waiting for that validation or H.
     let (code, headers, files) = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
-        .expect("proved predecessor waited for metadata validation")
+        .expect("published head waited for metadata validation")
         .unwrap();
     assert_eq!(code, axum::http::StatusCode::OK, "{files}");
     assert_eq!(headers["X-Baleyg-Catching-Up"], "true");
@@ -3000,14 +3052,14 @@ async fn selected_reads_validated_predecessor_through_owner_handoff() {
     .await;
     assert_eq!(
         mutation_code,
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::http::StatusCode::CONFLICT,
         "{mutation_body}"
     );
-    assert_eq!(mutation_body["error"]["code"], "index_not_ready");
+    assert_eq!(mutation_body["error"]["code"], "storage_busy");
     let owner_paused_at = std::time::Instant::now();
     tokio::time::sleep(Duration::from_millis(310)).await;
     eprintln!(
-        "restricted predecessor served before owner validation; metadata held {:?}",
+        "coherent published head served before owner validation; metadata held {:?}",
         owner_paused_at.elapsed()
     );
     // This request ARRIVES after the old 250ms wait cap, while owner SQLite

@@ -1183,97 +1183,11 @@ async fn serve_preflight_rejects_busy_replaced_root_before_creating_token() {
     assert!(old.evidence_response().is_err());
 }
 
-async fn root_loss_restricted_ex_case(owner_mode: u8) {
-    use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    use std::sync::{Arc, atomic::AtomicU64};
-    let base = tempfile::tempdir().unwrap();
-    let work = base.path().join("work");
-    let moved = base.path().join("moved");
-    fs::create_dir(&work).unwrap();
-    fs::write(work.join("a.js"), "function previous() {}\n").unwrap();
-    let id = identity(&work);
-    let topology = roots(base.path());
-    let requests_db = topology.requests_db(&id);
-    let store = Store::open(topology.clone(), identity(&work)).unwrap();
-    let options = IndexOptions::new(work.clone());
-    let first = establish_serving_session(
-        &store,
-        Some(&options),
-        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
-    let stale_follower = store.follower_session().unwrap();
-    drop(first);
-    let restricted = store.leader_session().unwrap();
-    assert!(store.restricted_owner_associated());
-    let accepted = store.enqueue_request(&options, None).unwrap();
-    let state = http::new(
-        store.clone(),
-        options,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-        "127.0.0.1:7331".parse().unwrap(),
-    )
-    .unwrap();
-    if owner_mode == 1 {
-        state.retain_serving_session_without_tick_for_tests(restricted.clone());
-    } else if owner_mode == 2 {
-        // Retained stale follower must not shadow the separately live H EX.
-        state.retain_serving_session_without_tick_for_tests(stale_follower.clone());
-    }
-    // In modes 0 and 2 only the H worker owns EX. The weak association must
-    // let root loss borrow it until durable FIFO failure completes.
-    let h_worker_owner = (owner_mode != 1).then(|| restricted.clone());
-    drop(restricted);
-    fs::rename(&work, &moved).unwrap();
-    fs::create_dir(&work).unwrap();
-    state.force_root_transition_tick_for_tests().unwrap();
-    let db = rusqlite::Connection::open(requests_db).unwrap();
-    let (result, reason): (String, Option<String>) = db
-        .query_row(
-            "SELECT state,error_code FROM requests WHERE id=?1",
-            [&accepted.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (result.as_str(), reason.as_deref()),
-        ("failed", Some("root_changed"))
-    );
-    drop(db);
-    assert_eq!(
-        state.root_loss_retirement_for_tests(),
-        (false, false, false)
-    );
-    assert!(
-        !store.restricted_owner_associated(),
-        "root-loss retained old restricted EX"
-    );
-    drop(h_worker_owner);
-    fs::remove_dir(&work).unwrap();
-    fs::rename(&moved, &work).unwrap();
-    let fresh = topology
-        .leader(&id)
-        .expect("returned old root can acquire EX promptly");
-    assert!(fresh.verify().is_ok());
-}
-
-#[tokio::test]
-async fn root_loss_drops_restricted_ex_before_old_path_returns() {
-    for mode in [0, 1, 2] {
-        root_loss_restricted_ex_case(mode).await;
-    }
-}
-
 async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
     use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     };
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
@@ -1288,11 +1202,6 @@ async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
     let initial =
         establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
             .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
     drop(initial);
     let accepted = store.enqueue_request(&options, None).unwrap();
     let state = http::new(
@@ -1347,7 +1256,6 @@ async fn failed_metadata_root_fifo_case(block_fifo_write: bool) {
         ("failed", "root_changed")
     );
     drop(db);
-    assert!(!store.restricted_owner_associated());
     assert!(store.orphan_root_loss_owner().is_none());
     fs::remove_dir(&work).unwrap();
     fs::rename(&moved, &work).unwrap();
@@ -1366,10 +1274,7 @@ async fn failed_metadata_admission_disposes_old_root_fifo_before_ex_release() {
 #[tokio::test]
 async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
-    };
+    use std::sync::{Arc, atomic::AtomicBool};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     fs::create_dir(&work).unwrap();
@@ -1383,10 +1288,6 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     let first =
         establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
             .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    let permit = store.pre_h_read_permit(&prior, &first, epoch).unwrap();
-    drop(prior);
     drop(first);
     let restricted = store.leader_session().unwrap();
     let accepted = store.enqueue_request(&options, None).unwrap();
@@ -1400,8 +1301,6 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     drop(db);
     drop(store);
     let recovering = Store::open(topology, identity(&work)).unwrap();
-    recovering.associate_restricted_owner_for_tests(&restricted, permit);
-    assert!(recovering.restricted_owner_associated());
     let state = http::new(
         recovering.clone(),
         options,
@@ -1414,10 +1313,6 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
     state
         .force_root_transition_tick_for_tests()
         .expect("exceptional recreate must finish");
-    assert!(
-        !recovering.restricted_owner_associated(),
-        "exceptional path kept pre-H read slot"
-    );
     let replacement = state
         .retained_serving_session()
         .expect("EX retry must become serving owner");
@@ -1442,10 +1337,7 @@ async fn exceptional_recreate_releases_restricted_owner_before_ex_retry() {
 #[tokio::test]
 async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
     use baleyg::{http, index_coordinator::establish_serving_session, indexer::IndexOptions};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
-    };
+    use std::sync::{Arc, atomic::AtomicBool};
     let base = tempfile::tempdir().unwrap();
     let work = base.path().join("work");
     let moved = base.path().join("old-work");
@@ -1459,11 +1351,6 @@ async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
     let initial =
         establish_serving_session(&store, Some(&options), &Arc::new(AtomicBool::new(false)))
             .unwrap();
-    let prior = store.evidence_response().unwrap();
-    let epoch = Arc::new(AtomicU64::new(1));
-    store.bind_runtime_epoch(epoch.clone());
-    store.remember_read_only_predecessor(&prior, epoch).unwrap();
-    drop(prior);
     drop(initial);
     let accepted = store.enqueue_request(&options, None).unwrap();
     let state = http::new(
@@ -1485,10 +1372,6 @@ async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
     entered_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("takeover never reached H hook");
-    assert!(
-        store.restricted_owner_associated(),
-        "new EX was not associated at H hook"
-    );
     fs::rename(&work, &moved).unwrap();
     fs::create_dir(&work).unwrap();
     resume_tx.send(()).unwrap();
@@ -1506,7 +1389,6 @@ async fn queued_takeover_h_root_loss_fails_fifo_before_last_ex_drops() {
         ("failed", Some("root_changed"))
     );
     drop(db);
-    assert!(!store.restricted_owner_associated());
     assert!(store.orphan_root_loss_owner().is_none());
     fs::remove_dir(&work).unwrap();
     fs::rename(&moved, &work).unwrap();

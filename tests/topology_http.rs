@@ -22,6 +22,18 @@ fn fixture() -> (
     String,
     Arc<LeaderSession>,
 ) {
+    fixture_with_bootstrap(|_, _| {})
+}
+fn fixture_with_bootstrap(
+    before_leader: impl FnOnce(&Store, &str),
+) -> (
+    tempfile::TempDir,
+    Store,
+    Graph,
+    Router,
+    String,
+    Arc<LeaderSession>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -41,6 +53,7 @@ fn fixture() -> (
         .id
         .clone();
     let store = crate::common::open_store(&temp.path().join("state"), &root).unwrap();
+    before_leader(&store, &seed);
     let session = store.leader_session().unwrap();
     let state = http::new(
         store.clone(),
@@ -89,12 +102,9 @@ async fn durable_crud_matrix() {
         call(&app, "GET", "/api/annotations", Value::Null).await.1,
         json!([])
     );
-    assert_eq!(
-        call(&app, "DELETE", "/api/views/absent", Value::Null)
-            .await
-            .0,
-        204
-    );
+    let (status, refused) = call(&app, "DELETE", "/api/views/absent", Value::Null).await;
+    assert_eq!(status, 409, "{refused}");
+    assert_eq!(refused["error"]["code"], "storage_busy");
     assert!(
         !durable.exists(),
         "absent reads/deletes do not create durable records"
@@ -110,6 +120,16 @@ async fn durable_crud_matrix() {
         &Arc::new(AtomicBool::new(false)),
     )
     .unwrap();
+    assert_eq!(
+        call(&app, "DELETE", "/api/views/absent", Value::Null)
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        call(&app, "GET", "/api/views", Value::Null).await.1,
+        json!([])
+    );
     let view = json!({"id":"view","title":"Keep","query":{"seed":seed},"pins":{},"hidden":[]});
     let canonical = serde_json::to_value(
         serde_json::from_value::<baleyg::model::SavedView>(view.clone()).unwrap(),
@@ -667,14 +687,15 @@ async fn missing_anchor_document_keeps_authenticated_saved_routes_listable() {
 }
 
 #[tokio::test]
-async fn schema5_is_not_native_anchor_evidence() {
-    let (_temp, store, _graph, app, seed, _session) = fixture();
+async fn empty_v8_bootstrap_saved_record_has_no_native_anchor_evidence() {
+    let (_temp, store, _graph, app, seed, _session) = fixture_with_bootstrap(|store, seed| {
+        let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
+            "id":"legacy","title":"Legacy","query":{"seed":seed}
+        }))
+        .unwrap();
+        store.put_view(&legacy).unwrap();
+    });
     let legacy_pin = store.index_baseline().unwrap();
-    let legacy: baleyg::model::SavedView = serde_json::from_value(json!({
-        "id":"legacy","title":"Legacy","query":{"seed":seed}
-    }))
-    .unwrap();
-    store.put_view(&legacy).unwrap();
 
     let (status, response) = call(&app, "GET", "/api/views/legacy", Value::Null).await;
     assert_eq!(status, 200, "{response}");

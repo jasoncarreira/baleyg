@@ -208,6 +208,7 @@ impl Peer {
     ) -> Self {
         Self::start_with_fixture_home(tempfile::tempdir().unwrap(), workspace, cwd, phase, None)
     }
+    #[cfg(feature = "test-causal-witness")]
     fn start_with_causal_witness(workspace: Option<&Path>) -> (Self, tokio::net::UnixListener) {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -2283,6 +2284,7 @@ fn capacity_witness_final_drift_refuses_stale_capacity_attribution() {
 }
 
 /// One bounded, read-only causal event per private fixture socket connection.
+#[cfg(feature = "test-causal-witness")]
 async fn next_causal_event(
     listener: &tokio::net::UnixListener,
     deadline: tokio::time::Instant,
@@ -2306,6 +2308,7 @@ async fn next_causal_event(
 
 /// Generation comparisons are valid only within one owner and watcher epoch.
 #[derive(Default)]
+#[cfg(feature = "test-causal-witness")]
 struct CausalReadiness {
     stream_id: Option<String>,
     stream_seq: u64,
@@ -2317,6 +2320,7 @@ struct CausalReadiness {
     announced_generations: std::collections::HashSet<u64>,
 }
 
+#[cfg(feature = "test-causal-witness")]
 fn causal_lineage(event: &Value) -> (String, String) {
     let field = |name| {
         let value = event[name].as_str().expect("missing causal lineage UUID");
@@ -2326,6 +2330,7 @@ fn causal_lineage(event: &Value) -> (String, String) {
     (field("ownerIncarnation"), field("watchEpoch"))
 }
 
+#[cfg(feature = "test-causal-witness")]
 impl CausalReadiness {
     /// Return false for a sequenced but causally retired lineage. Never let an
     /// old epoch's late connection reset a newer owner/watch witness.
@@ -2419,6 +2424,7 @@ impl CausalReadiness {
     }
 }
 
+#[cfg(feature = "test-causal-witness")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_checkout() {
     let temp = tempfile::tempdir().unwrap();
@@ -2552,6 +2558,7 @@ async fn catching_up_reports_pending_work_then_witnessed_readiness_on_same_check
 /// Drive a real same-owner selected-options change through the daemon FIFO.
 /// The fresh H_READY is a Ready snapshot for the replacement watcher; it does
 /// not claim that mandatory H reran when the accepted CLI index changed inputs.
+#[cfg(feature = "test-causal-witness")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
     let temp = tempfile::tempdir().unwrap();
@@ -2689,6 +2696,7 @@ async fn selected_options_replacement_reissues_ready_for_new_watch_epoch() {
 /// Synthetic event ordering checks the fixture collector without a daemon.
 /// Explicit event fields keep each source/epoch transition visible at the call site.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "test-causal-witness")]
 fn causal_fixture_event(
     stream: uuid::Uuid,
     seq: u64,
@@ -2705,6 +2713,7 @@ fn causal_fixture_event(
       "watchGeneration":generation,"queueEmpty":kind == "WATCH_ACK"})
 }
 
+#[cfg(feature = "test-causal-witness")]
 #[test]
 fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
     let stream = uuid::Uuid::new_v4();
@@ -2760,6 +2769,7 @@ fn causal_witness_ignores_late_retired_epoch_and_requires_successor_h() {
     assert!(state.settled());
 }
 
+#[cfg(feature = "test-causal-witness")]
 #[test]
 fn causal_witness_rejects_ack_without_same_lineage_pending() {
     let stream = uuid::Uuid::new_v4();
@@ -2793,6 +2803,7 @@ fn causal_witness_rejects_ack_without_same_lineage_pending() {
     );
 }
 
+#[cfg(feature = "test-causal-witness")]
 #[test]
 fn causal_witness_rejects_missing_or_duplicate_stream_event() {
     let stream = uuid::Uuid::new_v4();

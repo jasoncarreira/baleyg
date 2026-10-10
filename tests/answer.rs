@@ -392,12 +392,35 @@ function helper() {}
     assert_eq!(refused["error"]["code"], "incompatible_index");
     assert!(!refused.to_string().contains("sqlInventedCallee"));
 
+    // A valid unrelated selected projection stays readable. The rejected a.js
+    // preview above does not poison a bounded packet built only from unrelated.js.
     let unrelated = app.clone().oneshot(preview(&other)).await.unwrap();
-    assert_eq!(unrelated.status(), 503);
+    assert_eq!(unrelated.status(), 200);
     let body = to_bytes(unrelated.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap();
-    let refused: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(refused["error"]["code"], "incompatible_index");
-    assert!(!refused.to_string().contains("sqlInventedCallee"));
+    let preview: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(preview["packet"]["revision"], json!(pin));
+    assert_eq!(preview["packet"]["request"]["seed"], other);
+    assert_eq!(preview["packet"]["context"]["revision"], json!(pin));
+    assert_eq!(preview["view"]["selectionSource"], "localPreview");
+    let sources = preview["packet"]["sourceFiles"].as_array().unwrap();
+    assert_eq!(
+        sources.len(),
+        1,
+        "bounded packet needs only the unaffected source"
+    );
+    assert_eq!(sources[0]["path"], "unrelated.js");
+    assert_eq!(sources[0]["text"], "function unaffected() { other(); }\n");
+    for evidence in [&preview["packet"], &preview["view"]] {
+        let rendered = evidence.to_string();
+        assert!(
+            !rendered.contains("a.js"),
+            "forged source must not enter packet/view"
+        );
+        assert!(
+            !rendered.contains("sqlInventedCallee"),
+            "forged call must not leak"
+        );
+    }
 }

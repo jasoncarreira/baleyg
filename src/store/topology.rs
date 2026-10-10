@@ -6,11 +6,13 @@ use std::os::unix::{
     fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt},
     io::AsRawFd,
 };
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use uuid::Uuid;
@@ -147,6 +149,28 @@ impl TopologyRoots {
     pub fn leader_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.index_dir(identity).join("leader.lock")
     }
+    pub fn sidecar_mutation_lock(&self, identity: &WorkspaceIdentity) -> PathBuf {
+        // Stable sibling: GC can remove an obsolete index directory, never
+        // this gate's inode while a sidecar writer or leader still holds it.
+        self.cache
+            .join("indexes")
+            .join(format!("{}.sidecar-mutation.lock", identity.root_key))
+    }
+    /// Sidecar writes share this gate until their durable record commit.
+    /// Missing gate means no leader has established mutation authority.
+    pub fn sidecar_mutation_shared(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        identity.verify()?;
+        UseGuard::acquire_existing(&self.sidecar_mutation_lock(identity), false, true)
+    }
+    pub fn sidecar_mutation_exclusive(&self, identity: &WorkspaceIdentity) -> Result<UseGuard> {
+        self.prepare_index(identity)?;
+        // Prepare the stable transition inode before any exceptional raw-EX
+        // or GC path is allowed to inspect this checkout. Never unlink it.
+        let transition = UseGuard::index_transition_path(&self.index_use_lock(identity))
+            .context("canonical index-use lock expected")?;
+        drop(UseGuard::acquire(&transition, false, true)?);
+        UseGuard::acquire(&self.sidecar_mutation_lock(identity), true, true)
+    }
     pub fn record_dir(&self, identity: &WorkspaceIdentity) -> PathBuf {
         self.data.join("workspaces").join(&identity.record_id)
     }
@@ -260,7 +284,22 @@ impl TopologyRoots {
     ) -> Result<LeaderGuard> {
         identity.verify()?;
         use_guard.belongs_to(&self.index_use_lock(identity), true)?;
-        self.acquire_leader(identity, use_guard, false, || Ok(()), || Ok(()), || Ok(()))
+        let gate = self.sidecar_mutation_exclusive(identity)?;
+        self.leader_under_exclusive_with_gate(identity, use_guard, gate)
+    }
+    pub fn leader_under_exclusive_with_gate(
+        &self,
+        identity: &WorkspaceIdentity,
+        use_guard: UseGuard,
+        gate: UseGuard,
+    ) -> Result<LeaderGuard> {
+        self.acquire_leader(
+            identity,
+            use_guard,
+            gate,
+            false,
+            (|| Ok(()), || Ok(()), || Ok(())),
+        )
     }
     pub fn record_use(&self, identity: &WorkspaceIdentity, exclusive: bool) -> Result<UseGuard> {
         self.prepare_records(identity)?;
@@ -286,25 +325,29 @@ impl TopologyRoots {
         before_write: impl FnOnce() -> Result<()>,
         before_sync: impl FnOnce() -> Result<()>,
     ) -> Result<LeaderGuard> {
+        let gate = self.sidecar_mutation_exclusive(identity)?;
         let use_guard = self.index_use(identity)?;
         self.acquire_leader(
             identity,
             use_guard,
+            gate,
             true,
-            after_open,
-            before_write,
-            before_sync,
+            (after_open, before_write, before_sync),
         )
     }
     fn acquire_leader(
         &self,
         identity: &WorkspaceIdentity,
         use_guard: UseGuard,
+        sidecar_gate: UseGuard,
         create: bool,
-        after_open: impl FnOnce() -> Result<()>,
-        before_write: impl FnOnce() -> Result<()>,
-        before_sync: impl FnOnce() -> Result<()>,
+        hooks: (
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+            impl FnOnce() -> Result<()>,
+        ),
     ) -> Result<LeaderGuard> {
+        let (after_open, before_write, before_sync) = hooks;
         identity.verify()?;
         let path = self.leader_lock(identity);
         let mut hook = Some(after_open);
@@ -344,6 +387,12 @@ impl TopologyRoots {
         file.sync_all().context("incarnation_not_durable")?;
         Ok(LeaderGuard {
             use_guard,
+            sidecar_gate: Mutex::new(Some(sidecar_gate)),
+            transition_exclusive: Mutex::new(None),
+            #[cfg(test)]
+            test_transition_gap: super::TestOneShotHook::default(),
+            #[cfg(test)]
+            test_transition_gap_armed: std::sync::atomic::AtomicBool::new(false),
             file,
             path,
             incarnation,
@@ -1004,7 +1053,16 @@ impl std::error::Error for StorageBusy {}
 pub struct UseGuard {
     file: File,
     path: PathBuf,
+    state: Mutex<UseLockState>,
+    #[cfg(test)]
+    test_after_shared_flock_fault: std::sync::atomic::AtomicBool,
+}
+#[derive(Debug)]
+struct UseLockState {
     exclusive: bool,
+    // Every canonical index-use EX (including GC raw opens) holds transition
+    // SH through its whole lifetime, not just while acquiring the EX flock.
+    transition_shared: Option<Box<UseGuard>>,
 }
 impl UseGuard {
     pub fn acquire(path: &Path, exclusive: bool, nonblocking: bool) -> Result<Self> {
@@ -1036,6 +1094,17 @@ impl UseGuard {
     pub fn acquire_existing_readonly_exclusive(path: &Path) -> Result<Self> {
         Self::acquire_mode(path, true, true, false, true, || Ok(()))
     }
+    fn index_transition_path(path: &Path) -> Option<PathBuf> {
+        let parent = path.parent()?;
+        if parent.file_name()?.to_str()? != "indexes" {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?.strip_suffix(".lock")?;
+        if !lower_hex(name, 64) {
+            return None;
+        }
+        Some(parent.join(format!("{name}.transition.lock")))
+    }
     fn acquire_mode(
         path: &Path,
         exclusive: bool,
@@ -1044,6 +1113,27 @@ impl UseGuard {
         readonly: bool,
         after_open: impl FnOnce() -> Result<()>,
     ) -> Result<Self> {
+        // Central interception: direct raw index-use EX, Store witness
+        // retirement and every GC path all participate in the same gate.
+        let transition_shared = if exclusive {
+            Self::index_transition_path(path)
+                .map(|transition| {
+                    // Erase the closure type here: recursively instantiating
+                    // acquire_mode with a fresh closure exceeds rustc's limit.
+                    Self::acquire_mode(
+                        &transition,
+                        false,
+                        true,
+                        create,
+                        readonly,
+                        (|| Ok(())) as fn() -> Result<()>,
+                    )
+                    .map(Box::new)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let flags = (if exclusive {
             libc::LOCK_EX
         } else {
@@ -1076,10 +1166,18 @@ impl UseGuard {
                 let fd = file.metadata()?;
                 if (m.dev(), m.ino()) == (fd.dev(), fd.ino()) {
                     private_file(path, &file)?;
+                    if let Some(transition) = &transition_shared {
+                        transition.verify()?;
+                    }
                     return Ok(Self {
                         file,
                         path: path.to_owned(),
-                        exclusive,
+                        state: Mutex::new(UseLockState {
+                            exclusive,
+                            transition_shared,
+                        }),
+                        #[cfg(test)]
+                        test_after_shared_flock_fault: std::sync::atomic::AtomicBool::new(false),
                     });
                 }
             } else if !named
@@ -1093,11 +1191,15 @@ impl UseGuard {
         bail!("lock pathname changed repeatedly: {}", path.display())
     }
     pub fn verify(&self) -> Result<()> {
-        private_file(&self.path, &self.file)
+        private_file(&self.path, &self.file)?;
+        if let Some(transition) = &self.state.lock().unwrap().transition_shared {
+            transition.verify()?;
+        }
+        Ok(())
     }
     fn belongs_to(&self, path: &Path, exclusive: bool) -> Result<()> {
         ensure!(
-            self.path == path && self.exclusive == exclusive,
+            self.path == path && self.state.lock().unwrap().exclusive == exclusive,
             "unsafe_index: wrong index use lock path or mode"
         );
         self.verify()
@@ -1105,21 +1207,72 @@ impl UseGuard {
     pub(crate) fn verify_exclusive_path(&self, path: &Path) -> Result<()> {
         self.belongs_to(path, true)
     }
-    fn downgrade_to_shared(&mut self) -> Result<()> {
+    #[cfg(test)]
+    fn test_unlock_shared_under_transition(&self) -> Result<()> {
         ensure!(
-            self.exclusive,
-            "unsafe_index: exclusive use lock required for downgrade"
+            !self.state.lock().unwrap().exclusive,
+            "test requires index-use SH"
         );
         self.verify()?;
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        ensure!(result == 0, "test failed to expose index-use gap");
+        Ok(())
+    }
+    fn try_upgrade_to_exclusive(&self, transition: &UseGuard) -> Result<()> {
+        transition.verify_exclusive_path(&transition.path)?;
+        let mut state = self.state.lock().unwrap();
+        ensure!(
+            !state.exclusive && state.transition_shared.is_none(),
+            "unsafe_index: index-use already exclusive"
+        );
+        private_file(&self.path, &self.file)?;
+        let status = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status != 0 {
+            let error = std::io::Error::last_os_error();
+            let restore =
+                unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+            ensure!(
+                restore == 0,
+                "recovery_required: index-use SH restore unverified: {error}"
+            );
+            private_file(&self.path, &self.file)?;
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(StorageBusy.into());
+            }
+            return Err(error.into());
+        }
+        state.exclusive = true;
+        private_file(&self.path, &self.file)?;
+        Ok(())
+    }
+    fn downgrade_to_shared(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        ensure!(
+            state.exclusive,
+            "unsafe_index: exclusive use lock required for downgrade"
+        );
+        private_file(&self.path, &self.file)?;
         let status = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
         if status != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        self.exclusive = false;
-        self.verify()
+        state.exclusive = false;
+        #[cfg(test)]
+        if self
+            .test_after_shared_flock_fault
+            .swap(false, Ordering::AcqRel)
+        {
+            anyhow::bail!("injected post-SH-flock pathname verification failure");
+        }
+        private_file(&self.path, &self.file)?;
+        state.transition_shared.take();
+        Ok(())
     }
     pub fn remove_last(self) -> Result<()> {
-        ensure!(self.exclusive, "exclusive use lock required for removal");
+        ensure!(
+            self.state.lock().unwrap().exclusive,
+            "exclusive use lock required for removal"
+        );
         self.verify()?;
         fs::remove_file(&self.path)?;
         sync_directory(self.path.parent().context("lock parent missing")?)
@@ -1134,6 +1287,13 @@ impl Drop for UseGuard {
 #[derive(Debug)]
 pub struct LeaderGuard {
     use_guard: UseGuard,
+    sidecar_gate: Mutex<Option<UseGuard>>,
+    // Retained on uncertain SH restoration: no GC EX may enter that gap.
+    transition_exclusive: Mutex<Option<UseGuard>>,
+    #[cfg(test)]
+    test_transition_gap: super::TestOneShotHook,
+    #[cfg(test)]
+    test_transition_gap_armed: std::sync::atomic::AtomicBool,
     file: File,
     path: PathBuf,
     pub incarnation: Uuid,
@@ -1218,11 +1378,96 @@ impl LeaderGuard {
         self.verify_exclusive_use(use_path)?;
         Ok(&self.use_guard)
     }
-    /// Convert the same held use-lock descriptor after activation; keep leader flock.
-    pub fn downgrade_use_to_shared(&mut self) -> Result<()> {
+    /// A previously H-attested owner takes sidecar EX again before exceptional
+    /// mutation, closing follower writes throughout the replacement H.
+    pub(crate) fn reacquire_sidecar_mutation_gate(&self, path: &Path) -> Result<()> {
+        self.verify()?;
+        let mut gate = self.sidecar_gate.lock().unwrap();
+        if gate.is_none() {
+            *gate = Some(UseGuard::acquire_existing(path, true, true)?);
+        }
+        gate.as_ref().unwrap().verify_exclusive_path(path)
+    }
+    /// H was committed for this exact owner. External follower sidecar writes
+    /// may now verify the new marker and take SH until their record commit.
+    pub fn release_sidecar_mutation_gate(&self) -> Result<()> {
+        self.verify()?;
+        self.sidecar_gate.lock().unwrap().take();
+        Ok(())
+    }
+    /// Take transition EX before converting the SAME held index-use SH fd.
+    /// All competing index-use EX attempts own transition SH for their lifetime.
+    pub(crate) fn try_upgrade_use_to_exclusive(&self, use_path: &Path) -> Result<()> {
+        self.belongs_to(&self.path)?;
+        self.use_guard.belongs_to(use_path, false)?;
+        ensure!(
+            self.sidecar_gate.lock().unwrap().is_some(),
+            "recovery_required: sidecar EX needed during exceptional upgrade"
+        );
+        let transition_path = UseGuard::index_transition_path(use_path)
+            .context("unsafe_index: noncanonical index-use lock")?;
+        let mut slot = self.transition_exclusive.lock().unwrap();
+        ensure!(
+            slot.is_none(),
+            "storage_busy: exceptional transition already held"
+        );
+        *slot = Some(UseGuard::acquire_existing(&transition_path, true, true)?);
+        #[cfg(test)]
+        if self.test_transition_gap_armed.swap(false, Ordering::AcqRel) {
+            // Simulate a non-atomic SH->EX flock conversion. The transition
+            // EX alone must exclude every GC index-use EX during this gap.
+            self.use_guard.test_unlock_shared_under_transition()?;
+            self.test_transition_gap.run();
+        }
+        let result = self
+            .use_guard
+            .try_upgrade_to_exclusive(slot.as_ref().unwrap());
+        if result.is_err() && self.use_guard.belongs_to(use_path, false).is_ok() {
+            // SH was restored and its pathname reverified under the gate.
+            slot.take();
+        }
+        result
+    }
+    #[cfg(test)]
+    pub(crate) fn test_pause_transition_gap(&self, hook: impl FnOnce() + Send + 'static) {
+        self.test_transition_gap.set(hook);
+        self.test_transition_gap_armed
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn verify_shared_use(&self, use_path: &Path) -> Result<()> {
+        self.use_guard.belongs_to(use_path, false)?;
+        self.verify()
+    }
+    /// Retry a previously uncertain post-flock verification under the retained
+    /// transition EX; never release it until the held SH pathname is verified.
+    pub(crate) fn complete_use_downgrade(&self, use_path: &Path) -> Result<()> {
+        if self.held_exclusive_use_mode() {
+            self.downgrade_use_to_shared()?;
+        }
+        self.verify_shared_use(use_path)?;
+        self.transition_exclusive.lock().unwrap().take();
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn test_fail_after_shared_flock(&self) {
+        self.use_guard
+            .test_after_shared_flock_fault
+            .store(true, Ordering::Release);
+    }
+    pub(crate) fn held_exclusive_use_mode(&self) -> bool {
+        self.use_guard.state.lock().unwrap().exclusive
+    }
+    pub(crate) fn uncertain_use_transition(&self) -> bool {
+        self.transition_exclusive.lock().unwrap().is_some()
+    }
+    /// Downgrade before queue settlement opens another index-use SH fd. Keep
+    /// transition EX and leader EX if SH restoration is uncertain.
+    pub fn downgrade_use_to_shared(&self) -> Result<()> {
         self.verify()?;
         self.use_guard.downgrade_to_shared()?;
-        self.verify()
+        self.verify()?;
+        self.transition_exclusive.lock().unwrap().take();
+        Ok(())
     }
     pub fn verify(&self) -> Result<()> {
         self.use_guard.verify()?;
@@ -1272,14 +1517,17 @@ impl FollowerGuard {
 #[derive(Debug)]
 pub enum LeaderSession {
     Leader {
-        guard: LeaderGuard,
+        guard: Box<LeaderGuard>,
         identity: Arc<WorkspaceIdentity>,
     },
     Follower(FollowerGuard),
 }
 impl LeaderSession {
     pub fn leader(guard: LeaderGuard, identity: Arc<WorkspaceIdentity>) -> Self {
-        Self::Leader { guard, identity }
+        Self::Leader {
+            guard: Box::new(guard),
+            identity,
+        }
     }
     pub fn follower(guard: FollowerGuard) -> Self {
         Self::Follower(guard)
@@ -1329,6 +1577,12 @@ impl LeaderSession {
             identity.verify().is_err(),
             "root_changed: old-root transition requires root loss"
         );
+        // An exceptional SH restoration may have faulted after flock but
+        // before pathname proof. Resolve that gate BEFORE queue code takes a
+        // second SH or an old-root EX can be retired.
+        if guard.uncertain_use_transition() || guard.held_exclusive_use_mode() {
+            guard.complete_use_downgrade(use_path)?;
+        }
         guard.belongs_to_after_root_loss(leader_path, use_path)
     }
     pub fn belongs_to(&self, identity: &WorkspaceIdentity, leader_path: &Path) -> Result<()> {

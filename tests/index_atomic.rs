@@ -132,12 +132,14 @@ fn first_index_is_invisible_until_validated_and_synced() {
     assert_eq!(staged_files(&dir), vec![staged.clone()]);
     assert!(fs::metadata(&staged).unwrap().len() > 0);
     let rival = Store::open_for_tests(state.path(), workspace.path());
-    assert!(
-        rival.unwrap_err().to_string().starts_with("storage_busy:"),
-        "a concurrent first opener must not read an incomplete index"
-    );
     release.send(()).unwrap();
     let store = opener.join().unwrap().unwrap();
+    let rival = rival.unwrap_err();
+    let refusal = rival.to_string();
+    assert!(
+        refusal == "storage_busy" || refusal.starts_with("storage_busy:"),
+        "a concurrent first opener must refuse while only staging exists: {rival:#}"
+    );
     assert_eq!(store.index_baseline().unwrap().index_revision, 0);
     assert_eq!(staged_files(&dir), Vec::<std::path::PathBuf>::new());
     drop(store);
@@ -1929,11 +1931,11 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
         selected.to_string().contains("incompatible_index"),
         "{selected:#}"
     );
-    assert!(store.status().is_err());
-    assert!(clone.status().is_err());
+    assert_eq!(store.status().unwrap().revision, rebuilt);
+    assert_eq!(clone.status().unwrap().revision, rebuilt);
     assert_eq!(separate.status().unwrap().revision, rebuilt);
     assert!(separate.source_at("one.js", Some(rebuilt)).is_err());
-    assert!(separate.status().is_err());
+    assert_eq!(separate.status().unwrap().revision, rebuilt);
     drop(separate);
 
     let failed_cancel: CancelFlag = Arc::new(AtomicBool::new(true));
@@ -1950,7 +1952,15 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
         .unwrap();
     assert_eq!(malformed, "FF");
     drop(db);
-    assert!(store.status().is_err());
+    assert_eq!(store.status().unwrap().revision, rebuilt);
+    let response = clone.evidence_response().unwrap();
+    let selected = response.source_at("one.js", Some(rebuilt)).unwrap_err();
+    assert!(
+        selected.to_string().contains("incompatible_index"),
+        "{selected:#}"
+    );
+    response.finish(()).unwrap();
+    drop(response); // the later repair needs native EX
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
     failed_cancel.store(false, Ordering::Release);
     let mut recovered =
@@ -1992,7 +2002,7 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
         type_error.to_string().contains("incompatible_index"),
         "{type_error:#}"
     );
-    assert!(store.status().is_err());
+    assert_eq!(store.status().unwrap().revision, recovered);
     failed_cancel.store(true, Ordering::Release);
     let failure =
         IndexJobCoordinator::prepare_with_session(&store, Some(recovered), session.clone())
@@ -2010,7 +2020,14 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
         .unwrap();
     assert_eq!(stored_type, "real");
     drop(db);
-    assert!(store.status().is_err());
+    assert_eq!(store.status().unwrap().revision, recovered);
+    let still_bad = store
+        .native_declarations_at(recovered, "javascript", &lookup_key)
+        .unwrap_err();
+    assert!(
+        still_bad.to_string().contains("incompatible_index"),
+        "{still_bad:#}"
+    );
     failed_cancel.store(false, Ordering::Release);
     let typed_recovered =
         IndexJobCoordinator::prepare_with_session(&store, Some(recovered), session.clone())
@@ -2023,13 +2040,13 @@ fn extractor_and_typed_mismatch_rebuild_in_place_and_failed_rebuild_stays_closed
     recovered = typed_recovered;
     assert_eq!(store.status().unwrap().revision, recovered);
 
-    // A newly acquired writer is a takeover until it completes publication.
-    // The latch is shared by Store clones and remains closed after the guard drops.
+    // A newly acquired writer still needs its own H before mutations.
+    // That pending H does not revoke committed prior-head reads from Store clones.
     let clone = store.clone();
     drop(session);
     drop(store.leader().unwrap());
-    assert!(store.status().is_err());
-    assert!(clone.status().is_err());
+    assert_eq!(store.status().unwrap().revision, recovered);
+    assert_eq!(clone.status().unwrap().revision, recovered);
     // A separately opened Store performs its own full recovery admission.
     let separate = Store::open_for_tests(state.path(), workspace.path()).unwrap();
     assert_eq!(separate.index_baseline().unwrap(), recovered);
@@ -2234,13 +2251,16 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         error.to_string().contains("incompatible_index"),
         "{error:#}"
     );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let selected = response.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        selected.to_string().contains("incompatible_index"),
+        "{selected:#}"
     );
+    response.finish(()).unwrap();
+    drop(response);
 
     // A matching invalid node is selected by the page even when file JSON is valid.
     let (state, _workspace, store, pin, _session) = projection_fixture();
@@ -2256,13 +2276,16 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         error.to_string().contains("incompatible_index"),
         "{error:#}"
     );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let selected = response.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        selected.to_string().contains("incompatible_index"),
+        "{selected:#}"
     );
+    response.finish(()).unwrap();
+    drop(response);
 
     // The methods route types both invalid JSON and valid JSON with bad Symbol shape.
     for payload in ["not-json", r#"{"kind":"function"}"#] {
@@ -2279,13 +2302,16 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
             error.to_string().contains("incompatible_index"),
             "{error:#}"
         );
+        assert_eq!(store.status().unwrap().revision, pin);
+        assert_eq!(clone.status().unwrap().revision, pin);
+        let response = clone.evidence_response().unwrap();
+        let selected = response.methods_at("flow.js", Some(pin)).unwrap_err();
         assert!(
-            clone
-                .status()
-                .unwrap_err()
-                .to_string()
-                .contains("incompatible_index")
+            selected.to_string().contains("incompatible_index"),
+            "{selected:#}"
         );
+        response.finish(()).unwrap();
+        drop(response);
     }
 
     // The selected source's bytes remain the same, but storing them as TEXT
@@ -2313,16 +2339,19 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         error.to_string().contains("incompatible_index"),
         "{error:#}"
     );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let selected = response.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        selected.to_string().contains("incompatible_index"),
+        "{selected:#}"
     );
+    response.finish(()).unwrap();
+    drop(response);
 
     // Tree enrichment evaluates only its visible file and latches its invalid node.
-    let (state, workspace, store, _pin, _session) = projection_fixture();
+    let (state, workspace, store, pin, _session) = projection_fixture();
     let clone = store.clone();
     let db = rusqlite::Connection::open(index_dir(state.path()).join("index.db")).unwrap();
     db.execute(
@@ -2344,13 +2373,26 @@ fn selected_projection_json_failures_latch_only_selected_reads() {
         error.to_string().contains("incompatible_index"),
         "{error:#}"
     );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let response = clone.evidence_response().unwrap();
+    let mut clone_items = vec![baleyg::file_tree::Entry {
+        name: "flow.js".into(),
+        path: "flow.js".into(),
+        kind: "file",
+        indexed_path: None,
+        method_count: None,
+        unindexed_reason: None,
+    }];
+    let selected = response
+        .tree_metadata(&tree_root, &mut clone_items)
+        .unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        selected.to_string().contains("incompatible_index"),
+        "{selected:#}"
     );
+    response.finish(()).unwrap();
+    drop(response);
 
     // Benign absence and a bad pin remain non-latching request outcomes.
     let (_state, _workspace, store, pin, _session) = projection_fixture();
@@ -2398,13 +2440,8 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
         error.to_string().contains("incompatible_index"),
         "{error:#}"
     );
-    assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
-    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
 
     let cancel: CancelFlag = Arc::new(AtomicBool::new(true));
     let failed = IndexJobCoordinator::prepare_with_session(&store, Some(pin), session.clone())
@@ -2416,20 +2453,27 @@ fn selected_projection_rebuild_is_same_inode_and_clears_clones_only_after_commit
         )
         .unwrap_err();
     assert!(failed.to_string().contains("cancelled"), "{failed:#}");
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(clone.status().unwrap().revision, pin);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let bytes: Vec<u8> = db.query_row(
+        "SELECT source_bytes FROM document_versions WHERE id=(SELECT document_version_id FROM revision_documents WHERE path='flow.js')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        bytes,
+        [0xff],
+        "cancelled rebuild must not repair invalid source"
     );
+    drop(db);
+    let response = clone.evidence_response().unwrap();
+    let still_corrupt = response.files_at(Some(pin), 0, 10).unwrap_err();
     assert!(
-        clone
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("incompatible_index")
+        still_corrupt.to_string().contains("incompatible_index"),
+        "{still_corrupt:#}"
     );
+    response.finish(()).unwrap();
+    drop(response); // the successful rebaseline below needs EX
     assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 
     cancel.store(false, Ordering::Release);

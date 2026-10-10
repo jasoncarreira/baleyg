@@ -458,6 +458,8 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     );
     db.execute_batch("ROLLBACK").unwrap();
     assert_eq!(operational_clone.status().unwrap().revision, pin);
+    let java_before = store.native_source_at(pin, &unaffected).unwrap().unwrap();
+    let java_source_before = store.source_at("flow.java", Some(pin)).unwrap().unwrap();
 
     let mut bytes: Vec<u8> = db
         .query_row(
@@ -475,7 +477,6 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
     drop(db);
     // Status is a bounded metadata/pin check; selected reads validate the exact stored BLOB.
     assert_eq!(store.status().unwrap().revision, pin);
-    assert!(store.native_source_at(pin, &unaffected).unwrap().is_some());
     let original_clone = store.clone();
     let selected = store.native_source_at(pin, &corrupted).unwrap_err();
     assert!(
@@ -485,8 +486,28 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
             ),
         "{selected:#}"
     );
-    let closed = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
-    assert_current_corruption(closed);
+    let selected_again = original_clone.source_at("flow.rs", Some(pin)).unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again.to_string().contains("source hash mismatch"),
+        "{selected_again:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(original_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        original_clone
+            .native_source_at(pin, &unaffected)
+            .unwrap()
+            .unwrap(),
+        java_before
+    );
+    assert_eq!(
+        original_clone
+            .source_at("flow.java", Some(pin))
+            .unwrap()
+            .unwrap(),
+        java_source_before
+    );
 
     let reopened = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(reopened.status().unwrap().revision, pin);
@@ -498,12 +519,27 @@ fn metadata_status_and_selected_source_reads_do_not_conflate_other_documents() {
             && selected.to_string().contains("source hash mismatch"),
         "{selected:#}"
     );
-    for closed in [
-        reopened_clone.status().unwrap_err(),
-        reopened.source_at("flow.rs", Some(pin)).unwrap_err(),
-    ] {
-        assert_current_corruption(closed);
-    }
+    assert_eq!(reopened_clone.status().unwrap().revision, pin);
+    let selected_again = reopened.source_at("flow.rs", Some(pin)).unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again.to_string().contains("source hash mismatch"),
+        "{selected_again:#}"
+    );
+    assert_eq!(
+        reopened_clone
+            .native_source_at(pin, &unaffected)
+            .unwrap()
+            .unwrap(),
+        java_before
+    );
+    assert_eq!(
+        reopened_clone
+            .source_at("flow.java", Some(pin))
+            .unwrap()
+            .unwrap(),
+        java_source_before
+    );
 }
 
 #[test]
@@ -713,6 +749,13 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
             .is_empty()
     );
     assert!(store.native_coverage_at(pin, &key).unwrap().is_some());
+    let java_declarations = store.native_declarations_at(pin, "java", "go").unwrap();
+    let java = java_declarations.first().unwrap().document.clone();
+    assert_eq!(
+        (java.language.as_str(), java.path.as_str()),
+        ("java", "flow.java")
+    );
+    let java_before = store.native_source_at(pin, &java).unwrap().unwrap();
     // Every edit preserves row identity, pin, ordinals, ranges and FK constraints.
     let version = live_document_version(&db, "flow.js");
     let revision = live_revision(&db);
@@ -803,13 +846,31 @@ fn selected_typed_rows_reject_constraint_preserving_sql_forgery_at_same_pin() {
                 && error.to_string().contains(expected),
             "{table}.{column}: {error:#}"
         );
-        let java = baleyg::native_evidence::DocumentKey {
-            source_set_id: key.source_set_id.clone(),
-            language: "java".into(),
-            path: "flow.java".into(),
-        };
-        let closed = selected_clone.native_source_at(pin, &java).unwrap_err();
-        assert_current_corruption(closed);
+        let selected_again = match table {
+            "native_version_headers" => selected_clone
+                .native_declarations_at(pin, "javascript", "hello")
+                .map(|_| ()),
+            "native_version_calls" => selected_clone.native_calls_at(pin, &owner).map(|_| ()),
+            "native_version_control_regions" => selected_clone
+                .native_control_regions_at(pin, &owner)
+                .map(|_| ()),
+            _ => selected_clone.native_coverage_at(pin, &key).map(|_| ()),
+        }
+        .unwrap_err();
+        assert!(
+            selected_again.to_string().contains("incompatible_index")
+                && selected_again.to_string().contains(expected),
+            "{table}: {selected_again:#}"
+        );
+        assert_eq!(selected_store.status().unwrap().revision, pin);
+        assert_eq!(selected_clone.status().unwrap().revision, pin);
+        assert_eq!(
+            selected_clone
+                .native_source_at(pin, &java)
+                .unwrap()
+                .unwrap(),
+            java_before
+        );
         db.execute(
             &format!("UPDATE {table} SET {column}=?1 WHERE {key_column}=?2 AND {predicate}"),
             rusqlite::params![old, parent, row_key],
@@ -837,6 +898,14 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
         language: "javascript".into(),
         path: "flow.js".into(),
     };
+    let java_declarations = store.native_declarations_at(pin, "java", "go").unwrap();
+    let java = java_declarations.first().unwrap().document.clone();
+    assert_eq!(
+        (java.language.as_str(), java.path.as_str()),
+        ("java", "flow.java")
+    );
+    let java_native_before = store.native_source_at(pin, &java).unwrap().unwrap();
+    let java_source_before = store.source_at("flow.java", Some(pin)).unwrap().unwrap();
     let (original, bytes) = store.native_source_at(pin, &key).unwrap().unwrap();
     let mut forged = bytes.clone();
     let offset = forged.iter().position(|b| *b == b'o').unwrap();
@@ -859,8 +928,24 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
             && native_error.to_string().contains("selected native"),
         "{native_error:#}"
     );
-    let closed = native_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert_current_corruption(closed);
+    let same_path = native_clone.native_source_at(pin, &key).unwrap_err();
+    assert!(
+        same_path.to_string().contains("incompatible_index")
+            && same_path.to_string().contains("selected native"),
+        "{same_path:#}"
+    );
+    assert_eq!(native_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        native_clone
+            .source_at("flow.java", Some(pin))
+            .unwrap()
+            .unwrap(),
+        java_source_before
+    );
+    assert_eq!(
+        native_clone.native_source_at(pin, &java).unwrap().unwrap(),
+        java_native_before
+    );
 
     let graph_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(graph_store.status().unwrap().revision, pin);
@@ -871,8 +956,19 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
             && graph_error.to_string().contains("selected native"),
         "{graph_error:#}"
     );
-    let closed = graph_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert_current_corruption(closed);
+    let same_path = graph_clone.source_at("flow.js", Some(pin)).unwrap_err();
+    assert!(
+        same_path.to_string().contains("incompatible_index"),
+        "{same_path:#}"
+    );
+    assert_eq!(graph_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        graph_clone
+            .source_at("flow.java", Some(pin))
+            .unwrap()
+            .unwrap(),
+        java_source_before
+    );
 
     db.execute_batch("BEGIN").unwrap();
     db.execute(
@@ -902,8 +998,20 @@ fn selected_sources_bind_paired_hash_bytes_and_graph_path_without_pin_change() {
             && !payload_error.to_string().contains("forged.js"),
         "{payload_error:#}"
     );
-    let closed = payload_clone.source_at("flow.java", Some(pin)).unwrap_err();
-    assert_current_corruption(closed);
+    let same_path = payload_clone.source_at("flow.js", Some(pin)).unwrap_err();
+    assert!(
+        same_path.to_string().contains("incompatible_index")
+            && !same_path.to_string().contains("forged.js"),
+        "{same_path:#}"
+    );
+    assert_eq!(payload_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        payload_clone
+            .source_at("flow.java", Some(pin))
+            .unwrap()
+            .unwrap(),
+        java_source_before
+    );
 }
 
 #[test]
@@ -931,6 +1039,15 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
         language: "javascript".into(),
         path: "flow.js".into(),
     };
+    let java_declarations = store.native_declarations_at(pin, "java", "go").unwrap();
+    let java = java_declarations.first().unwrap().document.clone();
+    assert_eq!(
+        (java.language.as_str(), java.path.as_str()),
+        ("java", "flow.java")
+    );
+    let java_coverage_before = store.native_coverage_at(pin, &java).unwrap().unwrap();
+    let java_declarations_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_declarations_before.is_empty());
     let original_end: i64 = db
         .query_row(
             "SELECT end_byte FROM native_version_declarations WHERE version_id=?1 AND syntax_id=?2",
@@ -954,7 +1071,23 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
                 .contains("selected native declarations differ"),
         "{error:#}"
     );
-    assert_current_corruption(declarations_clone.status().unwrap_err());
+    let selected_again = declarations_clone
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected native declarations differ"),
+        "{selected_again:#}"
+    );
+    assert_eq!(declarations_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        declarations_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_declarations_before
+    );
     db.execute(
         "UPDATE native_version_declarations SET end_byte=?1 WHERE version_id=?2 AND syntax_id=?3",
         rusqlite::params![original_end, live_document_version(&db, "flow.js"), owner],
@@ -983,7 +1116,24 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
             && error.to_string().contains("selected native regions differ"),
         "{error:#}"
     );
-    assert_current_corruption(regions_clone.status().unwrap_err());
+    let selected_again = regions_clone
+        .native_control_regions_at(pin, &owner)
+        .unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected native regions differ"),
+        "{selected_again:#}"
+    );
+    assert_eq!(regions_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        regions_clone
+            .native_coverage_at(pin, &java)
+            .unwrap()
+            .unwrap(),
+        java_coverage_before
+    );
     db.execute(
         "UPDATE native_version_control_regions SET kind=?1 WHERE version_id=?2",
         rusqlite::params![original_kind, live_document_version(&db, "flow.js")],
@@ -1008,17 +1158,22 @@ fn direct_native_ranges_regions_and_coverage_reject_selected_sql_edits() {
                 .contains("selected native coverage differs"),
         "{error:#}"
     );
-    let closed = coverage_clone
-        .native_coverage_at(
-            pin,
-            &baleyg::native_evidence::DocumentKey {
-                source_set_id: key.source_set_id,
-                language: "java".into(),
-                path: "flow.java".into(),
-            },
-        )
-        .unwrap_err();
-    assert_current_corruption(closed);
+    let selected_again = coverage_clone.native_coverage_at(pin, &key).unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected native coverage differs"),
+        "{selected_again:#}"
+    );
+    assert_eq!(coverage_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        coverage_clone
+            .native_coverage_at(pin, &java)
+            .unwrap()
+            .unwrap(),
+        java_coverage_before
+    );
     db.execute(
         "UPDATE revision_documents SET coverage_state=?1,coverage_diagnostic=?2 WHERE revision_id=?3 AND path='flow.js'",
         rusqlite::params![original.0, original.1, live_revision(&db)],
@@ -1050,6 +1205,23 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
         serde_json::from_value(serde_json::json!({"seed":owner})).unwrap();
     assert!(!store.query_view(&query).unwrap().unwrap().calls.is_empty());
     assert!(store.sequence_at(&owner, pin, true).unwrap().is_some());
+    let java: String = db
+        .query_row(
+            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='go'",
+            [live_document_version(&db, "flow.java")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unaffected: baleyg::model::ViewQuery =
+        serde_json::from_value(serde_json::json!({"seed":java})).unwrap();
+    let java_view_before = store.query_view(&unaffected).unwrap().unwrap();
+    let java_sequence_before = store.sequence_at(&java, pin, true).unwrap().unwrap();
+    let baseline =
+        serde_json::to_string(&(java_view_before.clone(), java_sequence_before.clone())).unwrap();
+    assert!(
+        !baseline.contains("flow.js"),
+        "Java baseline must not traverse forged JS path"
+    );
     let call_id: String = db
         .query_row(
             "SELECT id FROM graph_calls WHERE projection_id=?1 ORDER BY id LIMIT 1",
@@ -1090,7 +1262,16 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
                 .contains("graph call differs from measured native row"),
         "{query_error:#}"
     );
-    assert_current_corruption(query_clone.status().unwrap_err());
+    assert_eq!(query_clone.status().unwrap().revision, pin);
+    let selected = query_clone.evidence_response().unwrap();
+    let again = selected.query_view_at(&query, Some(&pin)).unwrap_err();
+    assert!(
+        again.to_string().contains("native_evidence_required")
+            && !again.to_string().contains("fabricatedCallee"),
+        "{again:#}"
+    );
+    selected.finish(()).unwrap();
+    drop(selected);
 
     let sequence_store = Store::open_for_tests(state.path(), root.path()).unwrap();
     assert_eq!(sequence_store.status().unwrap().revision, pin);
@@ -1105,21 +1286,26 @@ fn pinned_graph_call_payload_must_match_native_before_query_and_sequence() {
                 .contains("graph call differs from measured native row"),
         "{sequence_error:#}"
     );
-    let java: String = db
-        .query_row(
-            "SELECT syntax_id FROM native_version_declarations WHERE version_id=?1 AND name='go'",
-            [live_document_version(&db, "flow.java")],
-            |r| r.get(0),
-        )
+    assert_eq!(sequence_clone.status().unwrap().revision, pin);
+    let selected = sequence_clone.evidence_response().unwrap();
+    let again = selected.sequence_at(&owner, pin, true).unwrap_err();
+    assert!(
+        again.to_string().contains("native_evidence_required")
+            && !again.to_string().contains("fabricatedCallee"),
+        "{again:#}"
+    );
+    let java_view_after = selected
+        .query_view_at(&unaffected, Some(&pin))
+        .unwrap()
         .unwrap();
-    let unaffected: baleyg::model::ViewQuery =
-        serde_json::from_value(serde_json::json!({"seed":java})).unwrap();
-    for closed in [
-        sequence_clone.query_view(&unaffected).unwrap_err(),
-        sequence_store.sequence_at(&java, pin, true).unwrap_err(),
-    ] {
-        assert_current_corruption(closed);
-    }
+    let java_sequence_after = selected.sequence_at(&java, pin, true).unwrap().unwrap();
+    assert_eq!(java_view_after, java_view_before);
+    assert_eq!(
+        serde_json::to_value(java_sequence_after).unwrap(),
+        serde_json::to_value(java_sequence_before).unwrap()
+    );
+    selected.finish(()).unwrap();
+    drop(selected);
 }
 
 #[test]
@@ -1134,6 +1320,8 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let original: String = db
@@ -1173,10 +1361,23 @@ fn extra_fk_valid_native_declaration_with_new_lookup_key_cannot_escape_source_wi
                 .contains("incompatible_index: selected evidence decode failed: incompatible_index: selected native declarations differ from source"),
         "{error:#}"
     );
-    let closed = selected_clone
-        .native_declarations_at(pin, "java", "go")
+    let selected_again = selected_clone
+        .native_declarations_at(pin, "javascript", "phantom")
         .unwrap_err();
-    assert_current_corruption(closed);
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected native declarations differ from source"),
+        "{selected_again:#}"
+    );
+    assert_eq!(selected_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        selected_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_before
+    );
 }
 
 #[test]
@@ -1191,6 +1392,8 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
@@ -1224,10 +1427,24 @@ fn amplified_selected_ancillary_rows_refuse_before_typed_materialization() {
             .contains("selected evidence row budget exceeded"),
         "{error:#}"
     );
-    let closed = selected_clone.status().unwrap_err();
-    assert_current_corruption(closed);
-    let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
-    assert_current_corruption(closed);
+    let selected_again = selected_clone
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected evidence row budget exceeded"),
+        "{selected_again:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(selected_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        selected_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_before
+    );
 }
 
 #[test]
@@ -1242,6 +1459,8 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
@@ -1270,10 +1489,24 @@ fn single_oversized_fk_valid_native_child_text_refuses_before_materialization() 
             .contains("selected evidence byte budget exceeded"),
         "{error:#}"
     );
-    let closed = selected_clone.status().unwrap_err();
-    assert_current_corruption(closed);
-    let closed = store.native_declarations_at(pin, "java", "go").unwrap_err();
-    assert_current_corruption(closed);
+    let selected_again = selected_clone
+        .native_declarations_at(pin, "javascript", "hello")
+        .unwrap_err();
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected evidence byte budget exceeded"),
+        "{selected_again:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(selected_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        selected_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_before
+    );
 }
 
 #[test]
@@ -1336,6 +1569,8 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     let owner: String = db
@@ -1373,10 +1608,24 @@ fn selected_native_text_total_budget_is_not_count_times_single_row_limit() {
             .contains("selected evidence byte budget exceeded"),
         "{error:#}"
     );
-    let closed = selected_clone
-        .native_declarations_at(pin, "java", "go")
+    let selected_again = selected_clone
+        .native_declarations_at(pin, "javascript", "hello")
         .unwrap_err();
-    assert_current_corruption(closed);
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected evidence byte budget exceeded"),
+        "{selected_again:#}"
+    );
+    assert_eq!(store.status().unwrap().revision, pin);
+    assert_eq!(selected_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        selected_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_before
+    );
 }
 
 #[test]
@@ -1391,6 +1640,8 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     for table in ["graph_nodes", "graph_calls", "graph_regions"] {
         // These three fixed SQL identifiers are the selected graph row families.
@@ -1417,10 +1668,23 @@ fn graph_node_call_and_region_payloads_each_have_predecode_byte_envelope() {
                 .contains("selected graph row byte budget exceeded"),
             "{table}: {error:#}"
         );
-        let closed = selected_clone
-            .native_declarations_at(pin, "java", "go")
+        let selected_again = selected_clone
+            .native_declarations_at(pin, "javascript", "hello")
             .unwrap_err();
-        assert_current_corruption(closed);
+        assert!(
+            selected_again.to_string().contains("incompatible_index")
+                && selected_again
+                    .to_string()
+                    .contains("selected graph row byte budget exceeded"),
+            "{selected_again:#}"
+        );
+        assert_eq!(selected_clone.status().unwrap().revision, pin);
+        assert_eq!(
+            selected_clone
+                .native_declarations_at(pin, "java", "go")
+                .unwrap(),
+            java_before
+        );
         db.execute(
             &format!("UPDATE {table} SET payload=?1 WHERE projection_id=?2 AND id=?3"),
             rusqlite::params![original, projection, id],
@@ -1441,6 +1705,8 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
         &leader,
     )
     .unwrap();
+    let java_before = store.native_declarations_at(pin, "java", "go").unwrap();
+    assert!(!java_before.is_empty());
     let db = Connection::open(published_db(state.path(), root.path())).unwrap();
     db.pragma_update(None, "foreign_keys", "ON").unwrap();
     db.execute(
@@ -1469,10 +1735,23 @@ fn selected_graph_rows_share_a_source_scoped_aggregate_byte_envelope() {
             .contains("selected graph row byte budget exceeded"),
         "{error:#}"
     );
-    let closed = selected_clone
-        .native_declarations_at(pin, "java", "go")
+    let selected_again = selected_clone
+        .native_declarations_at(pin, "javascript", "hello")
         .unwrap_err();
-    assert_current_corruption(closed);
+    assert!(
+        selected_again.to_string().contains("incompatible_index")
+            && selected_again
+                .to_string()
+                .contains("selected graph row byte budget exceeded"),
+        "{selected_again:#}"
+    );
+    assert_eq!(selected_clone.status().unwrap().revision, pin);
+    assert_eq!(
+        selected_clone
+            .native_declarations_at(pin, "java", "go")
+            .unwrap(),
+        java_before
+    );
 }
 
 fn assert_retained_native_family_parity(

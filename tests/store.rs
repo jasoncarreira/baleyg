@@ -722,9 +722,14 @@ fn live_current_decode_failure_hard_latches_saved_views() {
         stats_clone.view("legacy-view").unwrap_err(),
         stats_clone.views().unwrap_err(),
     ] {
-        assert_eq!(
-            closed.to_string(),
-            "incompatible_index: reconciliation required after invalid current index"
+        assert!(
+            closed
+                .to_string()
+                .contains("incompatible_index: live index decode failed")
+                && closed
+                    .to_string()
+                    .contains("native header/control graph metadata mismatch"),
+            "{closed:#}"
         );
     }
 }
@@ -878,12 +883,15 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
     write_source(&work);
     let captured = bundle(&store, &work);
     let leader = store.leader().unwrap();
-    publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
+    let prior = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
     let saved: SavedView = serde_json::from_value(serde_json::json!({
         "id":"takeover","title":"Takeover","query":{"seed":"missing"}
     }))
     .unwrap();
     store.put_view(&saved).unwrap();
+    let view_before = store.view("takeover").unwrap().unwrap();
+    assert_eq!(view_before.view, saved);
+    assert_eq!(view_before.orphaned_ids, vec!["missing"]);
     drop(leader);
     let failed_takeover = store.leader_session().unwrap();
     let coordinator = baleyg::index_coordinator::IndexJobCoordinator::prepare_with_session(
@@ -902,16 +910,20 @@ fn durable_orphans_after_failed_takeover_but_not_current_marker_corruption() {
         .unwrap_err();
     assert!(error.to_string().contains("cancelled"), "{error:#}");
     drop(failed_takeover);
-    assert!(
-        store
-            .status()
-            .unwrap_err()
-            .to_string()
-            .contains("index_not_ready")
-    );
+    assert_eq!(store.status().unwrap().revision, prior);
     let orphan = store.view("takeover").unwrap().unwrap();
-    assert_eq!(orphan.view, saved);
-    assert_eq!(orphan.orphaned_ids, vec!["missing"]);
+    assert_eq!(orphan, view_before);
+    let response = store.evidence_response().unwrap();
+    assert_eq!(response.status().unwrap().revision, prior);
+    assert_eq!(
+        response
+            .saved_view_at("takeover", Some(prior))
+            .unwrap()
+            .unwrap(),
+        view_before
+    );
+    response.finish(()).unwrap();
+    drop(response);
 
     let (state, work, store) = fixture();
     write_source(&work);
@@ -1188,11 +1200,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
     match active_status {
         Ok(status) => assert_eq!(status.revision, previous),
         Err(error) => {
-            let text = error.to_string();
-            assert!(
-                text.contains("index_not_ready") || text.contains("storage_busy"),
-                "{error:#}"
-            );
+            assert_eq!(error.to_string(), "storage_busy: SQLite lock contention");
         }
     }
     match active_source {
@@ -1204,11 +1212,7 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         }
         Ok(None) => panic!("active DELETE journal hid the prior committed source"),
         Err(error) => {
-            let text = error.to_string();
-            assert!(
-                text.contains("index_not_ready") || text.contains("storage_busy"),
-                "{error:#}"
-            );
+            assert_eq!(error.to_string(), "storage_busy: SQLite lock contention");
         }
     }
     match raw_pair {
@@ -1229,12 +1233,12 @@ fn active_delete_journal_allows_prior_pair_or_busy_and_cold_journal_is_sqlite_ma
         ),
     }
     assert_eq!(store.index_baseline().unwrap(), previous);
-    for error in [
-        store.status().unwrap_err(),
-        store.source_at("a.js", Some(previous)).unwrap_err(),
-    ] {
-        assert!(error.to_string().contains("index_not_ready"), "{error:#}");
-    }
+    assert_eq!(store.status().unwrap().revision, previous);
+    let (pin, source) = store.source_at("a.js", Some(previous)).unwrap().unwrap();
+    assert_eq!(pin, previous);
+    assert_eq!(source.text, captured.0.files[0].text);
+    assert_eq!(source.hash, captured.0.files[0].hash);
+    assert_eq!(source.text.as_bytes(), captured.2.files[0].text.as_bytes());
 
     std::fs::write(&journal, [0u8; 512]).unwrap();
     assert!(
@@ -1254,6 +1258,9 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
     let captured = bundle(&store, &work);
     let leader = store.leader().unwrap();
     let before = publish_bundle(&store, &captured, store.index_baseline().unwrap(), &leader);
+    let graph_before = store.graph_at(Some(before)).unwrap();
+    let source_before = store.source_at("a.js", Some(before)).unwrap().unwrap();
+    assert_eq!(source_before.0, before);
     let clone = store.clone();
     let path = index_db(state.path());
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -1303,18 +1310,13 @@ fn safe_cache_unknown_view_blocks_public_status_and_source_until_owner_intervene
     drop(db);
     drop(leader);
     assert_eq!(store.index_baseline().unwrap(), before);
-    for error in [
-        store.status().unwrap_err(),
-        store.source("a.js").unwrap_err(),
-        store.graph().unwrap_err(),
-        clone.status().unwrap_err(),
-        clone.source("a.js").unwrap_err(),
-        clone.graph().unwrap_err(),
-    ] {
-        assert!(
-            error.to_string().contains("incompatible_index"),
-            "{error:#}"
+    for reader in [&store, &clone] {
+        assert_eq!(reader.status().unwrap().revision, before);
+        assert_eq!(
+            reader.source_at("a.js", Some(before)).unwrap().unwrap(),
+            source_before
         );
+        assert_eq!(reader.graph_at(Some(before)).unwrap(), graph_before);
     }
 }
 

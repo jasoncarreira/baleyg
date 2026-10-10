@@ -409,12 +409,16 @@ async fn timed_release_closes_checkout_handles_and_reattach_runs_h() {
 }
 
 #[tokio::test]
-async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h() {
-    let (_base, id, mut registry, now) = fixture();
+async fn released_checkout_reads_prior_head_during_h_without_claiming_fifo() {
+    let (base, id, mut registry, now) = fixture();
     registry.attach_launch(1, &id).unwrap();
     let old = registry.activate(&id.root_key).unwrap();
     ready(&old).await;
-    old.fail_next_release_permit_for_tests();
+    let (prior, stale) = old.evidence_response().unwrap();
+    assert!(!stale);
+    let prior_revision = prior.status().unwrap().revision;
+    prior.finish(()).unwrap();
+    drop(prior);
     registry.disconnect_at(1, now);
     assert_eq!(
         registry
@@ -425,6 +429,17 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
     );
     assert!(!old.has_active_resources());
     assert!(registry.advance(now + DAEMON_IDLE_DELAY).unwrap().exit);
+
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let store = baleyg::store::Store::open(roots, identity(&id.root)).unwrap();
+    let queued = store
+        .enqueue_request(&baleyg::indexer::IndexOptions::new(id.root.clone()), None)
+        .unwrap();
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "queued"
+    );
     registry.attach_launch(2, &id).unwrap();
     let resumed = registry.activate(&id.root_key).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
@@ -442,22 +457,296 @@ async fn absent_prior_head_permit_does_not_pin_idle_resources_or_skip_reattach_h
     .await
     .expect("mandatory H did not reach pause");
     assert!(resumed.catching_up());
-    // Err carries no CheckoutEvidence, so there is no admitted basis to report.
-    let error = match resumed.evidence_response() {
-        Ok(_) => panic!("a head was admitted without the prior-head permit"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .downcast_ref::<baleyg::store::topology::IndexNotReady>()
-            .is_some(),
-        "{error:#}"
+    let (response, catching_up) = resumed
+        .evidence_response()
+        .expect("valid prior head during H");
+    assert!(catching_up);
+    assert_eq!(response.status().unwrap().revision, prior_revision);
+    response.finish(()).unwrap();
+    drop(response);
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "queued",
+        "H must precede FIFO claim"
     );
     resume_tx.send(()).unwrap();
     ready(&resumed).await;
+    assert_eq!(
+        store.request_by_id(&queued.id).unwrap().unwrap().state,
+        "done"
+    );
     let (response, catching_up) = resumed.evidence_response().unwrap();
     assert!(!catching_up);
     response.finish(()).unwrap();
+}
+
+#[tokio::test]
+async fn initial_h_metadata_failure_keeps_orphan_ex_over_invisible_q1() {
+    let (base, id, mut registry, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let moved = base.path().join("old-work");
+    registry.attach_launch(1, &id).unwrap();
+    let first = registry.activate(&id.root_key).unwrap();
+    ready(&first).await;
+    registry.disconnect_at(1, now);
+    assert!(registry.release(&id.root_key).unwrap());
+    let writer_store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let options = baleyg::indexer::IndexOptions::new(id.root.clone());
+    let (inserted_tx, inserted_rx) = std::sync::mpsc::sync_channel(1);
+    let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(1);
+    let writer = std::thread::spawn(move || {
+        writer_store.enqueue_request_after_insert_for_tests(&options, None, || {
+            inserted_tx.send(()).unwrap();
+            commit_rx.recv().unwrap();
+        })
+    });
+    inserted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    registry.attach_launch(2, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let (lost_tx, lost_rx) = std::sync::mpsc::sync_channel(1);
+    let root = id.root.clone();
+    let gone = moved.clone();
+    runtime.set_leader_before_metadata_hook_for_tests(move || {
+        fs::rename(&root, &gone).unwrap();
+        fs::create_dir(&root).unwrap();
+        lost_tx.send(()).unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while lost_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial H did not lose root after its EX acquisition");
+    // The other SQLite writer's INSERT cannot be seen by a SELECT until it
+    // commits. Failed serialized settlement must retain the original EX.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("root-loss writer BUSY did not reach H retry");
+    let db = rusqlite::Connection::open(roots.requests_db(&id)).unwrap();
+    let visible: i64 = db
+        .query_row("SELECT count(*) FROM requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(visible, 0, "the accepted-looking Q1 is still uncommitted");
+    drop(db);
+    fs::remove_dir(&id.root).unwrap();
+    fs::rename(&moved, &id.root).unwrap();
+    id.verify().unwrap();
+    assert!(
+        roots.leader(&id).is_err(),
+        "an empty SELECT must not release the orphaned exact EX"
+    );
+    fs::rename(&id.root, &moved).unwrap();
+    fs::create_dir(&id.root).unwrap();
+    commit_tx.send(()).unwrap();
+    assert!(
+        writer.join().unwrap().is_err(),
+        "late Q1 ACK cannot belong to moved root"
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let db = rusqlite::Connection::open(roots.requests_db(&id)).unwrap();
+            let row: (String, Option<String>) = db
+                .query_row(
+                    "SELECT state,error_code FROM requests ORDER BY seq LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            if row.0 == "failed" {
+                assert_eq!(row.1.as_deref(), Some("root_changed"));
+                break;
+            }
+            assert_eq!(row.0, "queued", "Q1 cannot claim before H");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("orphaned EX did not settle late-committed Q1");
+    registry.disconnect(2);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(&id.root_key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("old EX did not release after terminal Q1");
+    fs::remove_dir(&id.root).unwrap();
+    fs::rename(&moved, &id.root).unwrap();
+    roots
+        .leader(&id)
+        .expect("settled old EX allows a new owner");
+}
+
+#[tokio::test]
+async fn initial_h_reclassifies_obsolete_current_head_and_recreates_without_stranding_ex() {
+    let (base, id, mut registry, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    registry.attach_launch(1, &id).unwrap();
+    let first = registry.activate(&id.root_key).unwrap();
+    ready(&first).await;
+    let (prior, _) = first.evidence_response().unwrap();
+    let generation = prior.status().unwrap().revision.index_generation;
+    prior.finish(()).unwrap();
+    drop(prior);
+    registry.disconnect_at(1, now);
+    assert!(registry.release(&id.root_key).unwrap());
+
+    registry.attach_launch(2, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successor did not elect its initial H owner");
+    let index = roots.index_db(&id);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute_batch(
+        "PRAGMA ignore_check_constraints=ON; UPDATE index_metadata SET schema_version=7;",
+    )
+    .unwrap();
+    drop(db);
+    // A read on this activated runtime, not a second Store's private state,
+    // classifies the genuine obsolete on-disk index during its paused H.
+    let error = runtime
+        .evidence_response()
+        .err()
+        .expect("obsolete head refused");
+    assert!(error.to_string().contains("recovery_required"), "{error:#}");
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok((response, catching_up)) = runtime.evidence_response() {
+                let status = response.status();
+                let finished = response.finish(());
+                if !catching_up && finished.is_ok() {
+                    let status = status.unwrap();
+                    assert_ne!(status.revision.index_generation, generation);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("genuine mid-initial-H RecreatePending stranded old EX");
+}
+
+#[tokio::test]
+async fn initial_h_root_loss_keeps_exact_ex_until_old_fifo_is_terminal() {
+    let (base, id, mut registry, now) = fixture();
+    let roots =
+        TopologyRoots::isolated_for_tests(base.path().join("cache"), base.path().join("data"));
+    let moved = base.path().join("old-work");
+    registry.attach_launch(1, &id).unwrap();
+    let first = registry.activate(&id.root_key).unwrap();
+    ready(&first).await;
+    registry.disconnect_at(1, now);
+    assert!(registry.release(&id.root_key).unwrap());
+    let store = baleyg::store::Store::open(roots.clone(), identity(&id.root)).unwrap();
+    let request = store
+        .enqueue_request(&baleyg::indexer::IndexOptions::new(id.root.clone()), None)
+        .unwrap();
+    let requests_db = roots.requests_db(&id);
+    registry.attach_launch(2, &id).unwrap();
+    let runtime = registry.activate(&id.root_key).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+    let resume_rx = std::sync::Mutex::new(resume_rx);
+    runtime.set_pre_h_hook_for_tests(std::sync::Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        resume_rx.lock().unwrap().recv().unwrap();
+    }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entered_rx.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial H did not elect its owner");
+    // The elected owner has not completed H. A committed Q1 must not be
+    // claimed; a blocked old-root queue write must not release the EX either.
+    let writer = rusqlite::Connection::open(&requests_db).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    fs::rename(&id.root, &moved).unwrap();
+    fs::create_dir(&id.root).unwrap();
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while runtime.reconciliation_error().is_none() || !runtime.retry_waiting_for_tests() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("uncertain old-root queue write did not enter H retry");
+    let row: String = writer
+        .query_row(
+            "SELECT state FROM requests WHERE id=?1",
+            [&request.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(row, "queued", "no claim before completed H");
+    // Temporarily put the SAME old inode back at its pathname. That removes
+    // root-path drift as a reason for leader() to fail: only retained old EX
+    // prevents a new owner while Q1 still lacks a terminal result.
+    fs::remove_dir(&id.root).unwrap();
+    fs::rename(&moved, &id.root).unwrap();
+    assert!(id.verify().is_ok());
+    assert!(
+        roots.leader(&id).is_err(),
+        "initial H must retain its exact EX across uncertain Q1 write"
+    );
+    fs::rename(&id.root, &moved).unwrap();
+    fs::create_dir(&id.root).unwrap();
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let db = rusqlite::Connection::open(&requests_db).unwrap();
+            let row: (String, Option<String>) = db
+                .query_row(
+                    "SELECT state,error_code FROM requests WHERE id=?1",
+                    [&request.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            if row.0 == "failed" {
+                assert_eq!(row.1.as_deref(), Some("root_changed"));
+                break;
+            }
+            assert_eq!(row.0, "queued", "no pre-H claim of Q1");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("old Q1 did not become durably terminal under old EX");
+    registry.disconnect(2);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !registry.release(&id.root_key).unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("terminal old-root runtime did not release EX");
+    fs::remove_dir(&id.root).unwrap();
+    fs::rename(&moved, &id.root).unwrap();
+    let replacement_owner = roots.leader(&id).expect("EX only after terminal old Q1");
+    replacement_owner.verify().unwrap();
 }
 
 #[tokio::test]

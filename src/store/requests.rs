@@ -955,29 +955,47 @@ impl Store {
         )
     }
     pub fn claim_request(&self, session: &LeaderSession) -> Result<Option<Request>> {
-        // EX ownership alone is not authority to claim. The same incarnation
-        // must first commit and attest its selected post-acquisition H.
-        self.verify_reconciled_leader_claim(session)?;
+        // The held DELETE-mode index read snapshot freezes the exact FULL H
+        // proof while sidecar SH excludes a successor's exceptional H. Neither
+        // protection applies to FIFO enqueue; Q1 remains admissible during H.
+        let _mutation_gate = self.claim_authority_guard(session)?;
         let (_guard, mut db) = self.request_connection()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        self.verify_leader_session(session)?;
+        #[cfg(test)]
+        self.test_claim_before_snapshot_hook.run();
+        let _claim_snapshot = self.claim_snapshot_authority(session)?;
         let row=tx.query_row(&format!("SELECT {COLUMNS} FROM requests WHERE state IN ('queued','running') ORDER BY seq LIMIT 1"), [],read).optional()?;
         let Some(row) = row else { return Ok(None) };
         self.verify_request_root(&Some(row.clone()))?;
-        // A running request held by this incarnation belongs to another local driver.
         if row.state == "running"
             && row.claim_incarnation.as_deref() == Some(session.incarnation().to_string().as_str())
         {
             return Ok(None);
         }
-        self.verify_reconciled_leader_claim(session)?;
+        // This short cached-H latch linearizes exceptional mark_recovery
+        // visibility against durable claim COMMIT; no SQLite/FS classification
+        // runs while it is held. Rebuild leaves the prior healthy proof intact.
+        let attested = self.reconciled_leader.lock().unwrap();
+        ensure!(
+            !self.is_recreate_pending() && *attested == Some(session.incarnation()),
+            "index_not_ready: exceptional H changed before FIFO claim COMMIT"
+        );
+        self.verify_leader_session(session)?;
         tx.execute("UPDATE requests SET state='running',claim_incarnation=?1,started_at=?2 WHERE seq=?3 AND state IN ('queued','running')", params![session.incarnation().to_string(),now(),row.seq])?;
         let claimed = tx.query_row(
             &format!("SELECT {COLUMNS} FROM requests WHERE seq=?1"),
             [row.seq],
             read,
         )?;
+        #[cfg(test)]
+        self.test_claim_before_commit_hook.run();
+        ensure!(
+            !self.is_recreate_pending() && *attested == Some(session.incarnation()),
+            "index_not_ready: exceptional H changed before FIFO claim COMMIT"
+        );
+        self.verify_leader_session(session)?;
         tx.commit()?;
+        // Snapshot, sidecar SH and attested latch outlive requests.db COMMIT.
         Ok(Some(claimed))
     }
     /// Resolve an operational publish BUSY before retrying an accepted claim.
