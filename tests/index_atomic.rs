@@ -132,6 +132,19 @@ fn first_index_is_invisible_until_validated_and_synced() {
     assert_eq!(staged_files(&dir), vec![staged.clone()]);
     assert!(fs::metadata(&staged).unwrap().len() > 0);
     let rival = Store::open_for_tests(state.path(), workspace.path());
+    match &rival {
+        Ok(candidate) => eprintln!(
+            "first-index rival OK while opener paused: index_exists={}, staged={:?}, status={:?}",
+            dir.join("index.db").exists(),
+            staged_files(&dir),
+            candidate.status()
+        ),
+        Err(error) => eprintln!(
+            "first-index rival refused while opener paused: index_exists={}, staged={:?}, error={error:#}",
+            dir.join("index.db").exists(),
+            staged_files(&dir)
+        ),
+    }
     assert!(
         rival.unwrap_err().to_string().starts_with("storage_busy:"),
         "a concurrent first opener must not read an incomplete index"
