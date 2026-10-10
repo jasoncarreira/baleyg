@@ -1322,6 +1322,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
         "{corrupt:#}"
     );
     response.finish(()).unwrap();
+    drop(response);
 
     // The diagram endpoint independently reports selected class decode corruption.
     let (dir, store, graph, app, _session) = setup();
@@ -1355,6 +1356,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
         "{corrupt:#}"
     );
     response.finish(()).unwrap();
+    drop(response);
 
     // A selected method seed reaches only the resolver's persisted Symbol decode.
     let (dir, store, graph, app, _session) = setup();
@@ -1387,6 +1389,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
         "{corrupt:#}"
     );
     response.finish(()).unwrap();
+    drop(response);
 
     // Valid top-level JSON with a non-object member is refused before clipped JSON1.
     let (dir, store, graph, app, _session) = setup();
@@ -1419,6 +1422,7 @@ async fn selected_class_json_decode_and_clipping_fail_closed_without_retyping_in
         "{corrupt:#}"
     );
     response.finish(()).unwrap();
+    drop(response);
 
     // A genuine request-domain failure stays HTTP 400 and does not close the Store.
     let (_dir, store, graph, app, _session) = setup();
