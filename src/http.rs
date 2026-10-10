@@ -587,6 +587,21 @@ impl DaemonState {
         })
     }
 
+    // Unlike the browser advisory watcher probe, a generic status cannot use
+    // daemon defaults if the recorded options are unreadable: freshness is unknown.
+    fn status_watch_pending(&self) -> bool {
+        let options = match self.store.recorded_index_options() {
+            Ok(Some(recorded)) => recorded,
+            Ok(None) => self.options.clone(),
+            Err(_) => return true,
+        };
+        self.leader_work
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|(_, scheduler)| scheduler.accepted_watch_intent(&options))
+    }
+
     // Read freshness without borrowing FIFO claim or mutation authority. Each call
     // drops the short serving-session lock before watcher and durable queue probes.
     // The caller samples on both sides of Store::status so an owner replacement
@@ -600,7 +615,7 @@ impl DaemonState {
                 .as_ref()
                 .is_none_or(|session| !session.is_leader() || session.verify().is_err())
             || !self.store.root_path_replaced().is_ok_and(|lost| !lost)
-            || self.checkout_watch_pending()
+            || self.status_watch_pending()
             || !self.pending_requests.lock().unwrap().is_empty()
             || !self
                 .store

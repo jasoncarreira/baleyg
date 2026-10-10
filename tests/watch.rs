@@ -1372,20 +1372,26 @@ async fn failed_mandatory_takeover_retries_h_while_serving_valid_prior_head() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Some(revision) if revision == prior_revision => {
-                // A repaired successor can serve the authenticated prior head
-                // before mandatory H commits. Prove a new live EX before
-                // waiting for the new pin; this 200 is not H success.
-                let marker = fs::read(&leader_lock).unwrap();
-                assert_ne!(marker, new_marker, "failed-H incarnation still serves");
-                let probe = fs::OpenOptions::new()
-                    .read(true)
-                    .open(&leader_lock)
-                    .unwrap();
-                assert_ne!(
-                    unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                    0,
-                    "prior head served without successor EX"
+                // A coherent predecessor is readable even before another owner
+                // acquires EX. It must remain catching up until H and work settle.
+                assert_eq!(
+                    body["catchingUp"], true,
+                    "prior pin cannot be fully settled"
                 );
+                let marker = fs::read(&leader_lock).unwrap();
+                if marker != new_marker {
+                    // Once a different successor owns the marker, its EX must
+                    // remain held until mandatory H commits or fails.
+                    let probe = fs::OpenOptions::new()
+                        .read(true)
+                        .open(&leader_lock)
+                        .unwrap();
+                    assert_ne!(
+                        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                        0,
+                        "changed takeover marker without live successor EX"
+                    );
+                }
                 assert!(
                     Instant::now() < ready_deadline,
                     "repaired successor never committed H: prior_pin={:?} body={body:?} rows={:?} stderr={:?}",
