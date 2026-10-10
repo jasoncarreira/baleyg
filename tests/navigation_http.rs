@@ -1242,6 +1242,7 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
 
     // Member selection authenticates the exact node JSON before using its kind.
     let (selected_dir, selected_store, selected_graph, selected_app, _selected_session) = fixture();
+    let selected_pin = selected_store.status().unwrap().revision;
     let selected_clone = selected_store.clone();
     let class_id = id(&selected_graph, "A");
     let selector = member(&selected_dir, class_id, "first", 0);
@@ -1252,7 +1253,7 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
             rusqlite::params![admitted_document(&selected_db, "A.java").1, class_id],
         )
         .unwrap();
-    let (status, invalid) = call(&selected_app, selector).await;
+    let (status, invalid) = call(&selected_app, selector.clone()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{invalid}");
     assert_eq!(invalid["error"]["code"], "incompatible_index");
     assert!(invalid.get("targets").is_none());
@@ -1261,13 +1262,21 @@ async fn navigation_selected_graph_path_is_authenticated_without_scanning_other_
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{closed}");
     assert_eq!(closed["error"]["code"], "incompatible_index");
     assert!(closed.get("targets").is_none());
+    assert_eq!(selected_store.status().unwrap().revision, selected_pin);
+    assert_eq!(selected_clone.status().unwrap().revision, selected_pin);
+    let selected_request: baleyg::navigation::NavigationRequest =
+        serde_json::from_value(selector.clone()).unwrap();
+    let response = selected_clone.evidence_response().unwrap();
+    let selected_again = response.navigation_at(&selected_request).unwrap_err();
     assert!(
-        selected_clone
-            .status()
-            .unwrap_err()
+        selected_again
             .to_string()
-            .contains("incompatible_index")
+            .contains("incompatible_index: selected navigation node JSON invalid"),
+        "{selected_again:#}"
     );
+    assert!(!selected_again.to_string().contains("not-json"));
+    response.finish(()).unwrap();
+    drop(response);
 }
 
 #[tokio::test]
