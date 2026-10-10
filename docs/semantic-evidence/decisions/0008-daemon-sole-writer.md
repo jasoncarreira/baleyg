@@ -26,14 +26,14 @@ Two writers can therefore still compete for a checkout, and every handoff betwee
 - root-loss owner leases;
 - cross-process `storage_busy` handling.
 
-PR #117 shows the cost. Most of its later growth, and most of its CI failures, came from cross-process ownership transitions. One developer, with the daemon starting on demand, doesn't need more than one writer.
+PR #117 shows the cost: cross-process ownership transitions contributed substantial complexity and failures to its later revisions. One developer, with the daemon starting on demand, doesn't need more than one writer.
 
 ## Decision
 
 ### 1. One writer
 
 - **The user daemon is the only process that writes** a checkout's derived index (`index.db`) and request queue (`requests.db`). It is also the only process that runs watchers, mandatory H, publication, retention, release and GC.
-- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `baleyg mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, and browser writes such as saved views and notes.
+- **Every command that touches index or queue data goes through the daemon**, starting it on demand as `baleyg mcp` already does. That covers `index`, `serve`, `mcp`, `status`, `symbols`, `query`, `export`, `gc --report`, and browser writes such as saved views and notes.
 - **There is no standalone fallback**, for reads or writes, so there is one read path.
   - Connect-or-start is bounded. If the daemon can't be reached or started within that bound, the command fails with a typed `daemon_unavailable` error. It never opens the index itself.
   - Commands that touch no index data, such as `--help` and `--version`, don't start the daemon.
@@ -49,14 +49,14 @@ PR #117 shows the cost. Most of its later growth, and most of its CI failures, c
 - Checkout ownership becomes **in-process state** in the daemon's registry.
 - **Per-checkout use locks** may be removed only after both of these:
   1. every out-of-process `Store` or SQLite opener is removed or blocked;
-  2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot and stay held from GC's eligibility check through the unlink.
+  2. a **daemon-local admission gate** replaces the lock. The gate must cover every active snapshot, every retained SQLite handle and every new opener, and stay held from GC's eligibility check through the unlink.
 
   A registry lookup alone isn't enough to protect GC (Decision 0006 §2).
 - **The separate durable-record lock** (saved views, notes, ledgers) stays unless its removal gets its own proof of safety.
 
 ### 3. Recovery is one case: a new daemon instance
 
-When a daemon instance activates a checkout, it does the following, in order:
+When a daemon instance activates a checkout, **or a running daemon detects that a checkout's root was replaced at the same path**, it does the following, in order, before any new-root H or claim:
 1. **Open the queue.** SQLite rolls back any write a crashed instance left half-finished (hot journal) when the file is opened.
 2. **Settle old-root requests.** In one serialized write transaction, mark every accepted (`queued` / `running`) request whose recorded root `(device, inode)` differs from the current verified root as terminal `root_changed`.
    - That COMMIT must be **confirmed** before H or any claim proceeds.
